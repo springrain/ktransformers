@@ -191,6 +191,14 @@ Simply run the install script - it will auto-detect your CPU and optimize for be
 | **AMXINT4/INT8** | AMX | Intel Sapphire Rapids (2023+) | Best performance, requires AMX hardware |
 | **FP8** | AVX512F + AVX512BW + AVX512_BF16 + AVX512_VBMI | Intel Cooper Lake (2020+), Sapphire Rapids (2023+); AMD Zen 4+ (e.g., EPYC 9355) | Native Precision (e.g., DeepSeek V3.2, MiniMax M2.1) |
 | **BF16** | AVX512F + AVX512BW + AVX512_BF16 | Intel Cooper Lake (2020+), Sapphire Rapids (2023+); AMD Zen 4+ (e.g., EPYC 9355) | Native Precision (e.g., Qwen3-235B-A22B, GLM-4.7) |
+| **NEON BF16** | AArch64 (NEON) | Ampere One, Neoverse N/V series | Native ARM64 BF16 MoE; uses BFDOT when available |
+
+**ARM64 (aarch64) notes:**
+- `./install.sh` detects ARM64 hosts, skips all AMX/AVX512 toggles and builds with `-mcpu=native`
+- ARM64 builds additionally expose `NEONBF16_MOE` in `kt_kernel_ext.moe`; the Python `BF16` method falls back AMX -> AVX2 -> NEON automatically
+- Runtime CPU detection reports the `arm` variant (force it with `KT_KERNEL_CPU_VARIANT=arm`)
+- Quantized formats (GGUF/IQK etc.) keep working on ARM64 through the `LLAMAFILE` backend
+- Portable ARM64 builds: `CPUINFER_CPU_INSTRUCT=GENERIC ./install.sh build --manual` (baseline armv8-a), or add `CPUINFER_ARM_CPU=ampere1a` to tune `-mcpu` for a specific microarchitecture
 
 **Software Fallback Support (AVX512 backends):**
 - ✅ VNNI fallback: Uses AVX512BW instructions

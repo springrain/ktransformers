@@ -65,6 +65,10 @@ static const bool _is_plain_ = false;
 #include "operators/avx2/rawint4-moe.hpp"
 #include "operators/avx2/rawint4_avxvnni-moe.hpp"
 #endif
+// ARM NEON backends — always available on aarch64
+#if defined(__aarch64__)
+#include "operators/arm/bf16-moe.hpp"
+#endif
 #if defined(USE_SYCL)
 #include "operators/sycl/gptq_int4_sycl-moe.hpp"
 #endif
@@ -873,6 +877,10 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
                                                                                       "AVXVNNI256GPTQInt4_MOE");
   bind_moe_module<AVXVNNI256_RAW_INT4_MOE_TP<avxvnni_rawint4::GemmKernelAVXVNNI256RawInt4>>(moe_module,
                                                                                             "AVXVNNI256RawInt4_MOE");
+#endif
+// ARM NEON backends — available on all aarch64 hosts (e.g. Ampere One)
+#if defined(__aarch64__)
+  bind_moe_module<NEON_BF16_MOE_TP<armneon::GemmKernelNeonBF16>>(moe_module, "NEONBF16_MOE");
 #endif
 #if defined(USE_SYCL)
   bind_moe_module<SYCL_GPTQ_INT4_MOE_TP<sycl_int4::GemmKernelSYCLGPTQInt4>>(moe_module, "SYCLGPTQInt4_MOE");

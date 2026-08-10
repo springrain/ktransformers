@@ -26,7 +26,7 @@ Example usage:
 
     Check which CPU variant is loaded:
     >>> import kt_kernel
-    >>> print(kt_kernel.__cpu_variant__)  # 'amx', 'avx512', or 'avx2'
+    >>> print(kt_kernel.__cpu_variant__)  # 'amx', 'avx512', 'avx2' (x86) or 'arm' (ARM64)
 
 Environment Variables:
     KT_KERNEL_CPU_VARIANT: Override automatic detection ('amx', 'avx512', 'avx2')

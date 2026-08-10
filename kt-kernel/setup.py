@@ -135,9 +135,38 @@ def detect_parallel_jobs() -> str:
         return "1"
 
 
+try:
+    # Shared arch-aware helpers: single source of truth for x86 vs AArch64
+    # flag choices, multi-variant wheel decisions and ARM -mcpu selection.
+    from build_helpers import (
+        cpu_feature_flags as _bh_cpu_feature_flags,
+        should_build_all_variants as _bh_should_build_all_variants,
+        arm_cmake_args as _bh_arm_cmake_args,
+    )
+
+    _HAS_BUILD_HELPERS = True
+except ImportError:  # pragma: no cover - build_helpers.py missing from layout
+    _HAS_BUILD_HELPERS = False
+
+
 def cpu_feature_flags() -> list[str]:
+    if _HAS_BUILD_HELPERS:
+        return _bh_cpu_feature_flags()
     mode = os.environ.get("CPUINFER_CPU_INSTRUCT", "NATIVE").upper()
+    if platform.machine().lower() not in ("x86_64", "amd64", "i386", "i686", "x86"):
+        # AVX/AVX512 feature modes are x86-only. On ARM/aarch64 and other hosts
+        # fall back to -DLLAMA_NATIVE=ON so CMake composes the right ISA flags.
+        if mode != "NATIVE":
+            print(f"-- CPUINFER_CPU_INSTRUCT={mode} is x86-only; using NATIVE for this host")
+        return ["-DLLAMA_NATIVE=ON"]
     return [tok for tok in CPU_FEATURE_MAP.get(mode, CPU_FEATURE_MAP["NATIVE"]).split() if tok]
+
+
+def should_build_all_variants() -> bool:
+    """Multi-variant wheels are x86-only; single native build on AArch64."""
+    if _HAS_BUILD_HELPERS:
+        return _bh_should_build_all_variants()
+    return _env_get_bool("CPUINFER_BUILD_ALL_VARIANTS", False)
 
 
 ################################################################################
@@ -199,6 +228,10 @@ class CMakeBuild(build_ext):
                     if any(tok in low for tok in ["aarch64", "armv8", "arm cortex", "kunpeng", "kirin", "huawei"]):
                         info["vendor"] = "arm"
 
+                # AArch64 machine implies an ARM CPU regardless of cpuinfo tokens
+                if info["vendor"] == "unknown" and info["arch"] in ("aarch64", "arm64"):
+                    info["vendor"] = "arm"
+
                 # flags collection (x86 uses 'flags', arm uses 'Features')
                 flags = set()
                 for key in ("flags", "Features", "features"):
@@ -228,6 +261,19 @@ class CMakeBuild(build_ext):
                     info["features"].add("AVX512_VBMI")
                 if any(f in flags for f in ["avx512_vpopcntdq", "avx512vpopcntdq"]):
                     info["features"].add("AVX512_VPOPCNTDQ")
+
+                # ARM feature summary (Linux exposes them in the 'Features' line)
+                if info["arch"] in ("aarch64", "arm64"):
+                    for feat, name in (
+                        ("asimd", "NEON"),
+                        ("asimddp", "DOTPROD"),
+                        ("sve", "SVE"),
+                        ("sve2", "SVE2"),
+                        ("i8mm", "I8MM"),
+                        ("bf16", "BF16"),
+                    ):
+                        if feat in flags:
+                            info["features"].add(name)
 
             elif sysname == "Darwin":
                 # macOS: Apple Silicon (arm64) vs Intel
@@ -259,8 +305,8 @@ class CMakeBuild(build_ext):
         Checks if multi-variant build is requested (CPUINFER_BUILD_ALL_VARIANTS=1)
         and routes to the appropriate build method.
         """
-        if _env_get_bool("CPUINFER_BUILD_ALL_VARIANTS", False):
-            # Build all 3 variants (AMX, AVX512, AVX2)
+        if should_build_all_variants():
+            # Build all x86 variants (AMX, AVX512*, AVX2)
             self.build_multi_variants(ext)
         else:
             # Build single variant (original behavior)
@@ -556,9 +602,14 @@ class CMakeBuild(build_ext):
         # CPU feature flags mapping: if user specified CPUINFER_CPU_INSTRUCT, honor it;
         # else auto-pick based on detection (x86 only)
         cmake_args += cpu_feature_flags()
+        if _HAS_BUILD_HELPERS:
+            # AArch64 tuning knob (no-op elsewhere): -DKT_ARM_CPU=<cpu> when
+            # CPUINFER_ARM_CPU is set (e.g. ampere1a for Ampere One)
+            cmake_args += _bh_arm_cmake_args()
         d = self.detect_cpu_info()
         print(f"Detected CPU info: {d}")
         cpu_mode = os.environ.get("CPUINFER_CPU_INSTRUCT", "NATIVE").upper()
+        is_x86_host = d.get("arch") in ("x86_64", "amd64", "i386", "i686", "x86")
 
         # Vendor / feature specific toggles
         # AMD MoE: explicit env overrides; otherwise default ON on AMD CPU
@@ -578,7 +629,7 @@ class CMakeBuild(build_ext):
 
         # AMX: explicit env overrides; else enable if detected
         if not _forward_bool_env(cmake_args, "CPUINFER_ENABLE_AMX", "KTRANSFORMERS_CPU_USE_AMX"):
-            if "AMX" in d["features"]:
+            if is_x86_host and "AMX" in d["features"]:
                 cmake_args.append("-DKTRANSFORMERS_CPU_USE_AMX=ON")
                 print("-- AMX support detected; enabling (-DKTRANSFORMERS_CPU_USE_AMX=ON)")
 
@@ -588,7 +639,11 @@ class CMakeBuild(build_ext):
         #   (NATIVE/FANCY/AVX512). In AVX2 mode we do NOT enable this, so
         #   RAWINT4 / K2 kernels are not compiled.
         if not _forward_bool_env(cmake_args, "CPUINFER_ENABLE_AVX512", "KTRANSFORMERS_CPU_USE_AMX_AVX512"):
-            if cpu_mode in ("NATIVE", "FANCY", "AVX512") and ("AMX" in d["features"] or "AVX512" in d["features"]):
+            if (
+                is_x86_host
+                and cpu_mode in ("NATIVE", "FANCY", "AVX512")
+                and ("AMX" in d["features"] or "AVX512" in d["features"])
+            ):
                 cmake_args.append("-DKTRANSFORMERS_CPU_USE_AMX_AVX512=ON")
                 print("-- Enabling AMX/AVX512 umbrella (-DKTRANSFORMERS_CPU_USE_AMX_AVX512=ON)")
             else:
@@ -598,7 +653,7 @@ class CMakeBuild(build_ext):
         # These are passed to CMake to conditionally add compiler flags
         # Track if any AVX512 extension is enabled
         avx512_extension_enabled = False
-        allow_avx512_ext_auto = cpu_mode in ("NATIVE", "FANCY", "AVX512")
+        allow_avx512_ext_auto = is_x86_host and cpu_mode in ("NATIVE", "FANCY", "AVX512")
 
         if not _forward_bool_env(cmake_args, "CPUINFER_ENABLE_AVX512_VNNI", "LLAMA_AVX512_VNNI"):
             if allow_avx512_ext_auto and "AVX512_VNNI" in d["features"]:
@@ -625,7 +680,12 @@ class CMakeBuild(build_ext):
             avx512_extension_enabled = True
 
         # If any AVX512 extension is enabled, ensure base AVX512 is also enabled
-        if avx512_extension_enabled and cpu_mode in ("NATIVE", "FANCY", "AVX512") and "AVX512" in d["features"]:
+        if (
+            is_x86_host
+            and avx512_extension_enabled
+            and cpu_mode in ("NATIVE", "FANCY", "AVX512")
+            and "AVX512" in d["features"]
+        ):
             if not any("LLAMA_AVX512=ON" in a for a in cmake_args):
                 cmake_args.append("-DLLAMA_AVX512=ON")
                 print("-- AVX512 extensions enabled; also enabling base AVX512F (-DLLAMA_AVX512=ON)")

@@ -39,6 +39,7 @@ AVX2MXFP4_MOE = getattr(_moe_mod, "AVX2MXFP4_MOE", None)
 AVX2MXFP8_MOE = getattr(_moe_mod, "AVX2MXFP8_MOE", None)
 AVXVNNI256GPTQInt4_MOE = getattr(_moe_mod, "AVXVNNI256GPTQInt4_MOE", None)
 AVXVNNI256RawInt4_MOE = getattr(_moe_mod, "AVXVNNI256RawInt4_MOE", None)
+NEONBF16_MOE = getattr(_moe_mod, "NEONBF16_MOE", None)
 SYCLGPTQInt4_MOE = getattr(_moe_mod, "SYCLGPTQInt4_MOE", None)
 
 _HAS_AMXINT4_SUPPORT = AMXInt4_MOE is not None
@@ -58,6 +59,7 @@ _HAS_AVX2_MXFP4_SUPPORT = AVX2MXFP4_MOE is not None
 _HAS_AVX2_MXFP8_SUPPORT = AVX2MXFP8_MOE is not None
 _HAS_AVXVNNI256_GPTQ_INT4_SUPPORT = AVXVNNI256GPTQInt4_MOE is not None
 _HAS_AVXVNNI256_RAW_INT4_SUPPORT = AVXVNNI256RawInt4_MOE is not None
+_HAS_NEON_BF16_SUPPORT = NEONBF16_MOE is not None
 _HAS_SYCL_GPTQ_INT4_SUPPORT = SYCLGPTQInt4_MOE is not None
 _AVXVNNI256_GPTQ_INT4_MAX_GROUP_SIZE = 256
 _AVXVNNI256_RAW_INT4_MAX_GROUP_SIZE = 256
@@ -603,12 +605,13 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 "  - AVX512F + AVX512BW + AVX512_BF16 + AVX512_VBMI\n"
                 "Please recompile kt_kernel_ext with AVX512 + BF16 + VBMI enabled."
             )
-        if method == "BF16" and not _HAS_BF16_SUPPORT and not _HAS_AVX2_BF16_SUPPORT:
+        if method == "BF16" and not (_HAS_BF16_SUPPORT or _HAS_AVX2_BF16_SUPPORT or _HAS_NEON_BF16_SUPPORT):
             raise RuntimeError(
-                "BF16 backend not available. Required ISA:\n"
+                "BF16 backend not available. Required ISA (any one of):\n"
                 "  - AVX512F + AVX512BW + AVX512_BF16 (for AMX backend), or\n"
-                "  - AVX2 + FMA (for AVX2 fallback backend)\n"
-                "Please recompile kt_kernel_ext with AVX512+BF16 or AVX2 enabled."
+                "  - AVX2 + FMA (for AVX2 fallback backend), or\n"
+                "  - AArch64 NEON (arm64 native build, e.g. Ampere One)\n"
+                "Please recompile kt_kernel_ext with AVX512+BF16, AVX2 or ARM64 NEON enabled."
             )
         if method == "GPTQ_INT4" and not (_HAS_AVX2_GPTQ_INT4_SUPPORT or _HAS_AVXVNNI256_GPTQ_INT4_SUPPORT):
             raise RuntimeError(
@@ -890,12 +893,22 @@ class NativeMoEWrapper(BaseMoEWrapper):
             moe_config.quant_config.zero_point = False
             if _HAS_FP8_SUPPORT:
                 self.moe = AMXFP8_MOE(moe_config)
-            else:
+            elif _HAS_AVX2_FP8_SUPPORT:
                 self.moe = AVX2FP8_MOE(moe_config)
+            else:
+                raise RuntimeError(
+                    "FP8 MoE is not available in this build: no AMX FP8 or AVX2 FP8 "
+                    "kernel was compiled in (on ARM64, use method='BF16' instead)."
+                )
         elif self.method == "FP8_PERCHANNEL":
             moe_config.quant_config.bits = 8
             moe_config.quant_config.per_channel = True
             moe_config.quant_config.zero_point = False
+            if not _HAS_FP8_PERCHANNEL_SUPPORT:
+                raise RuntimeError(
+                    "FP8_PERCHANNEL MoE requires AMX/AVX512-BF16 support and is not "
+                    "available in this build (on ARM64, use method='BF16' instead)."
+                )
             self.moe = AMXFP8PerChannel_MOE(moe_config)
         elif self.method == "GPTQ_INT4":
             # GPTQ symmetric INT4: qweight (int32) + scales (fp32)
@@ -921,15 +934,26 @@ class NativeMoEWrapper(BaseMoEWrapper):
             moe_config.quant_config.bits = 4
             moe_config.quant_config.group_size = actual_gs
             moe_config.quant_config.zero_point = False
+            if not _HAS_SYCL_GPTQ_INT4_SUPPORT:
+                raise RuntimeError(
+                    "SYCL_GPTQ_INT4 MoE is not available in this build (SYCL backend not compiled in)."
+                )
             _preflight_sycl_device()
             self.moe = SYCLGPTQInt4_MOE(moe_config)
         elif self.method == "BF16":
             # BF16 has no quantization config needed
-            # Prefer AMX backend, fall back to AVX2
+            # Prefer AMX backend, fall back to AVX2, then ARM NEON
             if _HAS_BF16_SUPPORT:
                 self.moe = AMXBF16_MOE(moe_config)
-            else:
+            elif _HAS_AVX2_BF16_SUPPORT:
                 self.moe = AVX2BF16_MOE(moe_config)
+            elif _HAS_NEON_BF16_SUPPORT:
+                self.moe = NEONBF16_MOE(moe_config)
+            else:
+                raise RuntimeError(
+                    "BF16 MoE is not available in this build: no AMX, AVX2, "
+                    "or ARM NEON (NEONBF16_MOE) kernel was compiled in."
+                )
         t4 = time.time()
 
         self.cpu_infer.submit(self.moe.load_weights_task(physical_to_logical_map_cpu.data_ptr()))

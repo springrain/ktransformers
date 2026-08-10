@@ -2,10 +2,12 @@
 CPU feature detection and optimal kernel loader for kt-kernel.
 
 This module automatically detects CPU capabilities and loads the best available
-kernel variant (AMX, AVX512, or AVX2) at runtime.
+kernel variant (AMX, AVX512, or AVX2 on x86; 'arm' on ARM64 such as Ampere One)
+at runtime.
 
 Environment Variables:
-    KT_KERNEL_CPU_VARIANT: Override automatic detection ('amx', 'avx512', 'avx2')
+    KT_KERNEL_CPU_VARIANT: Override automatic detection (x86: 'amx', 'avx512_bf16', ...,
+                           'avx2'; ARM64: 'arm')
     KT_KERNEL_DEBUG: Enable debug output ('1' to enable)
 
 Example:
@@ -20,7 +22,72 @@ Example:
 
 import os
 import sys
+import platform
 from pathlib import Path
+
+# Host architectures treated as ARM64
+ARM_ARCHES = ("aarch64", "arm64")
+
+# Valid x86 variants, from most to least advanced
+X86_VARIANTS = ["amx", "avx512_bf16", "avx512_vbmi", "avx512_vnni", "avx512_base", "avx2"]
+
+# ARM hosts ship a single native build ("arm" variant, see build_helpers.ARM_VARIANT_NAME)
+ARM_VARIANTS = ["arm"]
+
+# x86 variant requirements in priority order (best to worst).
+# Flag names are matched against /proc/cpuinfo "flags"; names with and
+# without underscores are both accepted (avx512_bf16 vs avx512bf16).
+_X86_VARIANT_REQUIREMENTS = [
+    (
+        "amx",
+        [
+            "amx_tile",
+            "amx_int8",
+            "amx_bf16",
+            "avx512f",
+            "avx512bw",
+            "avx512_vnni",
+            "avx512_vbmi",
+            "avx512_bf16",
+        ],
+    ),
+    ("avx512_bf16", ["avx512f", "avx512bw", "avx512_vnni", "avx512_vbmi", "avx512_bf16"]),
+    ("avx512_vbmi", ["avx512f", "avx512bw", "avx512_vnni", "avx512_vbmi"]),
+    ("avx512_vnni", ["avx512f", "avx512bw", "avx512_vnni"]),
+    ("avx512_base", ["avx512f", "avx512bw"]),
+    ("avx2", ["avx2"]),
+]
+
+
+def _host_arch() -> str:
+    """Return platform.machine().lower(), tolerating exotic environments."""
+    try:
+        return platform.machine().lower()
+    except Exception:
+        return ""
+
+
+def _cpu_flags_from_cpuinfo(cpuinfo: str) -> set:
+    """Extract the x86 'flags' (or ARM 'Features') token set from cpuinfo text."""
+    for line in cpuinfo.lower().split("\n"):
+        if line.startswith("flags") or line.startswith("features"):
+            return set(line.split(":", 1)[1].split())
+    return set()
+
+
+def _detect_x86_variant_from_cpuinfo(cpuinfo: str) -> str:
+    """Select the best x86 variant from the text of /proc/cpuinfo."""
+    cpu_flags = _cpu_flags_from_cpuinfo(cpuinfo)
+    for variant_name, required_flags in _X86_VARIANT_REQUIREMENTS:
+        has_all_flags = True
+        for flag in required_flags:
+            flag_alt = flag.replace("_", "")
+            if flag not in cpu_flags and flag_alt not in cpu_flags:
+                has_all_flags = False
+                break
+        if has_all_flags:
+            return variant_name
+    return "avx2"
 
 
 def detect_cpu_features():
@@ -38,72 +105,42 @@ def detect_cpu_features():
     Returns:
         str: Variant name - one of: 'amx', 'avx512_bf16', 'avx512_vbmi',
              'avx512_vnni', 'avx512_base', 'avx2'
+
+         On ARM64 (aarch64/arm64) hosts: 'arm' is the only variant.
     """
     # Check environment override
     variant = os.environ.get("KT_KERNEL_CPU_VARIANT", "").lower()
-    valid_variants = ["amx", "avx512_bf16", "avx512_vbmi", "avx512_vnni", "avx512_base", "avx2"]
+    on_arm = _host_arch() in ARM_ARCHES
+    valid_variants = ARM_VARIANTS if on_arm else X86_VARIANTS
     if variant in valid_variants:
         if os.environ.get("KT_KERNEL_DEBUG") == "1":
             print(f"[kt-kernel] Using environment override: {variant}")
         return variant
+    if variant and variant not in valid_variants:
+        if os.environ.get("KT_KERNEL_DEBUG") == "1":
+            print(f"[kt-kernel] Ignoring KT_KERNEL_CPU_VARIANT={variant}; not a valid variant on this arch")
+
+    # ARM64 (e.g. Ampere One): single native build, no x86 flag parsing needed.
+    if on_arm:
+        if os.environ.get("KT_KERNEL_DEBUG") == "1":
+            arm_feats = "unknown"
+            try:
+                with open("/proc/cpuinfo", "r") as f:
+                    arm_feats = sorted(_cpu_flags_from_cpuinfo(f.read()) & {"sve", "sve2", "i8mm", "bf16", "asimddp"})
+            except OSError:
+                pass
+            print(f"[kt-kernel] ARM64 host detected; using arm variant (ISA features: {arm_feats})")
+        return "arm"
 
     # Try to read /proc/cpuinfo on Linux
     try:
         with open("/proc/cpuinfo", "r") as f:
             cpuinfo = f.read().lower()
 
-        # Extract CPU flags into a set for fast lookup
-        cpu_flags = set()
-        for line in cpuinfo.split("\n"):
-            if line.startswith("flags"):
-                flags_str = line.split(":", 1)[1]
-                cpu_flags = set(flags_str.split())
-                break
-
-        # Define variant requirements in priority order (best to worst)
-        variant_requirements = [
-            (
-                "amx",
-                [
-                    "amx_tile",
-                    "amx_int8",
-                    "amx_bf16",
-                    "avx512f",
-                    "avx512bw",
-                    "avx512_vnni",
-                    "avx512_vbmi",
-                    "avx512_bf16",
-                ],
-            ),
-            ("avx512_bf16", ["avx512f", "avx512bw", "avx512_vnni", "avx512_vbmi", "avx512_bf16"]),
-            ("avx512_vbmi", ["avx512f", "avx512bw", "avx512_vnni", "avx512_vbmi"]),
-            ("avx512_vnni", ["avx512f", "avx512bw", "avx512_vnni"]),
-            ("avx512_base", ["avx512f", "avx512bw"]),
-            ("avx2", ["avx2"]),
-        ]
-
-        # Find the best matching variant
-        for variant_name, required_flags in variant_requirements:
-            # Check if all required flags are present
-            # Handle flag name variations (e.g., avx512_bf16 vs avx512bf16)
-            has_all_flags = True
-            for flag in required_flags:
-                # Try exact match first, then without underscore
-                flag_alt = flag.replace("_", "")
-                if flag not in cpu_flags and flag_alt not in cpu_flags:
-                    has_all_flags = False
-                    break
-
-            if has_all_flags:
-                if os.environ.get("KT_KERNEL_DEBUG") == "1":
-                    print(f"[kt-kernel] Detected {variant_name} support via /proc/cpuinfo")
-                    print(f"[kt-kernel] Matched flags: {', '.join(required_flags)}")
-                return variant_name
-
-        # Fallback to AVX2 (should be rare on modern CPUs)
+        detected = _detect_x86_variant_from_cpuinfo(cpuinfo)
         if os.environ.get("KT_KERNEL_DEBUG") == "1":
-            print("[kt-kernel] No supported features detected, using AVX2 fallback")
-        return "avx2"
+            print(f"[kt-kernel] Detected {detected} support via /proc/cpuinfo")
+        return detected
 
     except FileNotFoundError:
         # /proc/cpuinfo doesn't exist (not Linux or in container)
@@ -174,9 +211,11 @@ def load_extension(variant):
 
     Fallback chain (each variant falls back to the next in line):
         amx -> avx512_bf16 -> avx512_vbmi -> avx512_vnni -> avx512_base -> avx2 -> single-variant
+        arm (ARM64) -> single-variant -> ImportError
 
     Args:
-        variant (str): One of 'amx', 'avx512_bf16', 'avx512_vbmi', 'avx512_vnni', 'avx512_base', 'avx2'
+        variant (str): One of 'amx', 'avx512_bf16', 'avx512_vbmi', 'avx512_vnni', 'avx512_base', 'avx2',
+                       or 'arm' (ARM64)
 
     Returns:
         module: The loaded extension module
@@ -243,7 +282,8 @@ def load_extension(variant):
             "avx512_vbmi": "avx512_vnni",
             "avx512_vnni": "avx512_base",
             "avx512_base": "avx2",
-            "avx2": None,  # No fallback - terminal variant
+            "avx2": None,    # No fallback - terminal variant
+            "arm": None,     # ARM64 native build - terminal variant
         }
 
         # Get next fallback variant
@@ -272,7 +312,7 @@ def initialize():
     Returns:
         tuple: (extension_module, variant_name)
     - extension_module: The loaded C++ extension module
-            - variant_name: String indicating which variant was loaded ('amx', 'avx512', 'avx2')
+            - variant_name: String indicating which variant was loaded ('amx', 'avx512*', 'avx2' or 'arm')
 
     Example:
         >>> ext, variant = initialize()

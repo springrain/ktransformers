@@ -5,6 +5,7 @@
 include CMakeLists.txt
 include CMakePresets.json
 include setup.py
+include build_helpers.py
 include pyproject.toml
 include requirements.txt
 include README.md

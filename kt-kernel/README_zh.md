@@ -90,6 +90,14 @@ conda activate kt-kernel
 | **LLAMAFILE** | AVX2 | Intel Haswell (2013+)、AMD Zen+ | 通用兼容性 |
 | **RAWINT4** | AVX512F + AVX512BW | Intel Skylake-X (2017+)、Ice Lake、Cascade Lake | 支持 VNNI/BF16 软件回退 |
 | **AMXINT4/INT8** | AMX | Intel Sapphire Rapids (2023+) | 最佳性能，需要 AMX 硬件 |
+| **NEON BF16** | AArch64 (NEON) | Ampere One、Neoverse N/V 系列 | ARM64 原生 BF16 MoE；有 BFDOT 时自动使用 |
+
+**ARM64（aarch64）平台说明：**
+- `./install.sh` 会识别 ARM64 主机并跳过全部 AMX/AVX512 选项，直接使用 `-mcpu=native` 构建
+- ARM64 构建在 `kt_kernel_ext.moe` 中额外提供 `NEONBF16_MOE`；Python 侧 `BF16` 方法的回退链为 AMX → AVX2 → NEON，ARM 机器上无需任何配置
+- 运行时 CPU 检测返回 `arm` 变体（`KT_KERNEL_CPU_VARIANT=arm` 可强制指定）
+- 量化格式（GGUF/IQK 等）在 ARM64 上继续通过 `LLAMAFILE` 后端运行
+- ARM64 可移植构建：`CPUINFER_CPU_INSTRUCT=GENERIC ./install.sh build --manual`（armv8-a 基线）；再加 `CPUINFER_ARM_CPU=ampere1a` 可按微架构（`-mcpu`）调优
 
 **软件回退支持（AVX512 后端）：**
 - ✅ VNNI 回退：使用 AVX512BW 指令

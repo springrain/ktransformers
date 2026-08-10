@@ -20,8 +20,8 @@ BUILD_OPTIONS (for "build" or "all"):
 
 AUTO-DETECTION (Default):
   The script will automatically detect your CPU and use ALL available features:
-  - CPUINFER_CPU_INSTRUCT = NATIVE (uses -march=native)
-  - CPUINFER_ENABLE_AMX   = ON/OFF (based on detection)
+  - CPUINFER_CPU_INSTRUCT = NATIVE (-march=native on x86; -mcpu=native on ARM64)
+  - CPUINFER_ENABLE_AMX   = ON/OFF (auto-detected on x86; AMX does not exist on ARM)
   - CPUINFER_ENABLE_AVX512_VNNI = ON/OFF (with fallback if OFF)
   - CPUINFER_ENABLE_AVX512_BF16 = ON/OFF (with fallback if OFF)
   - CPUINFER_ENABLE_AVX512_VBMI = ON/OFF (required for FP8 MoE)
@@ -36,9 +36,11 @@ MANUAL CONFIGURATION:
   Set these environment variables before running:
 
   CPUINFER_CPU_INSTRUCT   - Target CPU instruction set
-                            Options: AVX512, AVX2, FANCY, NATIVE
+                           Options: AVX512, AVX2, FANCY, NATIVE (x86) | NATIVE, GENERIC (ARM64)
   CPUINFER_ENABLE_AMX     - Enable Intel AMX support
-                            Options: ON, OFF
+                           Options: ON, OFF (x86 only; forced OFF on ARM64)
+  CPUINFER_ARM_CPU        - AArch64 -mcpu target for per-uarch portable builds
+                           Options: native, ampere1/1a/1b, neoverse-n1/n2, neoverse-v1/v2
 
 Distribution examples (portable binaries):
 
@@ -67,6 +69,13 @@ Distribution examples (portable binaries):
     export CPUINFER_ENABLE_AMX=OFF
     $0 build --manual
     # Result: Works on any CPU with AVX2 (2013+)
+
+  Example: Portable build for ARM64 servers (e.g. a fleet of Ampere One)
+    export CPUINFER_CPU_INSTRUCT=GENERIC
+    export CPUINFER_ARM_CPU=ampere1a
+    $0 build --manual
+    # Result: Works on any Ampere One (-mcpu=ampere1a); drop CPUINFER_ARM_CPU
+    #         for a baseline armv8-a binary that runs across 64-bit ARM servers
 
 Optional variables (with defaults):
   CPUINFER_BUILD_TYPE=Release           Build type (Debug/RelWithDebInfo/Release)
@@ -220,12 +229,48 @@ build_step() {
     echo "Skipping clean of $REPO_ROOT/build (requested by --no-clean)"
   fi
 
+  # Host architecture: AVX*/AMX knobs are x86-only; on aarch64 the NEON
+  # kernels handle MoE, so most x86 toggles are skipped or ignored.
+  HOST_ARCH="$(uname -m 2>/dev/null || echo unknown)"
+  if [ "$HOST_ARCH" = "aarch64" ] || [ "$HOST_ARCH" = "arm64" ]; then
+    IS_ARM=1
+  else
+    IS_ARM=0
+  fi
+
   if [ "$MANUAL_MODE" = "0" ]; then
   # Auto-detection mode
   echo "=========================================="
   echo "Auto-detecting CPU capabilities..."
   echo "=========================================="
   echo ""
+
+  if [ "$IS_ARM" = "1" ]; then
+  # ---------------------------------------------------------------
+  # ARM64 hosts (e.g. Ampere One, Kunpeng, Neoverse): AVX*/AMX knobs
+  # are x86-only. Build natively; the NEON kernels handle MoE on CPU.
+  # ---------------------------------------------------------------
+  echo "ARM64 host detected: $HOST_ARCH"
+  echo ""
+  export CPUINFER_CPU_INSTRUCT=NATIVE
+  export CPUINFER_ENABLE_AMX=OFF
+
+  if [ -r /proc/cpuinfo ]; then
+    ARM_FEATURES=$(grep -m1 -iE '^[[:space:]]*Features[[:space:]]*:' /proc/cpuinfo | cut -d: -f2- || true)
+    ARM_KEY_FEATURES=$(echo "$ARM_FEATURES" | tr ' ' '\n' | grep -E '^(sve2|sve|i8mm|bf16|asimddp|asimd)$' | sort -u | tr '\n' ' ' || true)
+    echo "ARM ISA features: ${ARM_KEY_FEATURES:-<unknown>}"
+    echo ""
+  fi
+
+  echo "Configuration: NATIVE (-mcpu=native), ARM NEON kernels enabled"
+  echo "  AMX/AVX512 toggles are x86-only and ignored on this host"
+  echo ""
+  echo "  Tip: binary targets THIS CPU (-mcpu=native). Portable ARM builds:"
+  echo "       CPUINFER_CPU_INSTRUCT=GENERIC $0 build --manual  # baseline armv8-a"
+  echo "       CPUINFER_CPU_INSTRUCT=GENERIC CPUINFER_ARM_CPU=ampere1a $0 build --manual  # per-uarch"
+  echo ""
+
+  else
 
   # detect_cpu_features returns "has_amx has_avx512f has_avx512_vnni has_avx512_bf16 has_avx512_vbmi"
   CPU_FEATURES=$(detect_cpu_features)
@@ -317,38 +362,62 @@ build_step() {
   echo ""
   echo "To use manual configuration instead, run: $0 build --manual"
   echo ""
+
+  fi   # end of aarch64 vs x86 auto-detection split
+
   else
   # Manual mode - validate user configuration (no exports)
-  if [ -z "$CPUINFER_CPU_INSTRUCT" ] || [ -z "$CPUINFER_ENABLE_AMX" ]; then
-    echo "Error: Manual mode requires CPUINFER_CPU_INSTRUCT and CPUINFER_ENABLE_AMX to be set."
+  if [ -z "$CPUINFER_CPU_INSTRUCT" ]; then
+    echo "Error: Manual mode requires CPUINFER_CPU_INSTRUCT to be set."
+    echo ""
+    usage
+  fi
+  if [ "$IS_ARM" != "1" ] && [ -z "$CPUINFER_ENABLE_AMX" ]; then
+    echo "Error: Manual mode on x86 also requires CPUINFER_ENABLE_AMX (ON/OFF) to be set."
     echo ""
     usage
   fi
 
   # Validate CPUINFER_CPU_INSTRUCT
   case "$CPUINFER_CPU_INSTRUCT" in
-    NATIVE|FANCY|AVX512|AVX2)
+    NATIVE)
+      ;;
+    GENERIC)
+      if [ "$IS_ARM" != "1" ]; then
+        echo "Error: CPUINFER_CPU_INSTRUCT=GENERIC is ARM64-only."
+        echo "On x86, portable builds use: AVX2 or AVX512"
+        exit 1
+      fi
+      ;;
+    FANCY|AVX512|AVX2)
+      if [ "$IS_ARM" = "1" ]; then
+        echo "Note: CPUINFER_CPU_INSTRUCT=$CPUINFER_CPU_INSTRUCT is x86-only and ignored on ARM64 (-mcpu=native is used instead)"
+      fi
       ;;
     *)
       echo "Error: Invalid CPUINFER_CPU_INSTRUCT='$CPUINFER_CPU_INSTRUCT'"
-      echo "Must be one of: NATIVE, FANCY, AVX512, AVX2"
+      echo "Must be one of: NATIVE, FANCY, AVX512, AVX2 (x86) | NATIVE, GENERIC (ARM64)"
       exit 1
       ;;
   esac
 
-  # Validate CPUINFER_ENABLE_AMX
-  case "$CPUINFER_ENABLE_AMX" in
-    ON|OFF)
-      ;;
-    *)
-      echo "Error: Invalid CPUINFER_ENABLE_AMX='$CPUINFER_ENABLE_AMX'"
-      echo "Must be either: ON or OFF"
-      exit 1
-      ;;
-  esac
+  # Validate CPUINFER_ENABLE_AMX (x86-only knob; force-disabled on ARM64)
+  if [ "$IS_ARM" = "1" ]; then
+    export CPUINFER_ENABLE_AMX="${CPUINFER_ENABLE_AMX:-OFF}"
+  else
+    case "$CPUINFER_ENABLE_AMX" in
+      ON|OFF)
+        ;;
+      *)
+        echo "Error: Invalid CPUINFER_ENABLE_AMX='$CPUINFER_ENABLE_AMX'"
+        echo "Must be either: ON or OFF"
+        exit 1
+        ;;
+    esac
+  fi
 
-  # Warn about problematic configuration
-  if [ "$CPUINFER_CPU_INSTRUCT" = "NATIVE" ] && [ "$CPUINFER_ENABLE_AMX" = "OFF" ]; then
+  # Warn about problematic configuration (x86 only; ARM64 has no AMX)
+  if [ "$IS_ARM" != "1" ] && [ "$CPUINFER_CPU_INSTRUCT" = "NATIVE" ] && [ "$CPUINFER_ENABLE_AMX" = "OFF" ]; then
     CPU_FEATURES=$(detect_cpu_features)
     HAS_AMX=$(echo "$CPU_FEATURES" | cut -d' ' -f1)
     if [ "$HAS_AMX" = "1" ]; then

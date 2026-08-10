@@ -70,6 +70,17 @@ message(STATUS "========================================")
 message(STATUS "CPU Feature Detection (CMake)")
 message(STATUS "========================================")
 
+# x86 SIMD auto-detection below only applies to x86 hosts. On ARM/aarch64 the
+# ISA flags (NEON/SVE/BF16/...) are configured by the processor section of the
+# top-level CMakeLists, so there is nothing to detect here.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64|arm.*)$")
+    message(STATUS "ARM/aarch64 host detected; skipping x86 SIMD auto-detection")
+    message(STATUS "ARM ISA flags (NEON/SVE/BF16) are handled in CMakeLists.txt")
+    message(STATUS "========================================")
+    message(STATUS "")
+    return()
+endif()
+
 # Check if variables were already set by install.sh/setup.py
 set(FROM_INSTALL_SH OFF)
 if(DEFINED LLAMA_AVX512_VNNI OR DEFINED LLAMA_AVX512_BF16 OR DEFINED LLAMA_AVX512_VBMI)

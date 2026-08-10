@@ -237,18 +237,47 @@ if(CMAKE_OSX_ARCHITECTURES STREQUAL "arm64" OR CMAKE_GENERATOR_PLATFORM_LWR STRE
             # Raspberry Pi 3, 4, Zero 2 (32-bit)
             list(APPEND ARCH_FLAGS -mno-unaligned-access)
         endif()
-        # add_compile_definitions(__ARM_NEON)
-        # list(APPEND ARCH_FLAGS -march=armv8.2-a+fp16+dotprod)
-        # add_compile_definitions(__ARM_FEATURE_DOTPROD)
-        # add_compile_definitions(__aarch64__)
 
-        # add_compile_definitions(__ARM_NEON)
-        list(APPEND ARCH_FLAGS -march=armv8.2-a+fp16+dotprod+sve+bf16)
-        # list(APPEND ARCH_FLAGS -march=armv8-a+dotprod+sha3+sm4+fp16fml+sve+rng+sb+ssbs+i8mm+bf16+flagm+pauth)
-        # add_compile_definitions(__ARM_FEATURE_DOTPROD)
-        # add_compile_definitions(__ARM_FEATURE_SVE)
-        # add_compile_definitions(__ARM_FEATURE_MATMUL_INT8)
-        # add_compile_definitions(__aarch64__)
+
+        # AArch64 ISA selection, three tiers (paired with build_helpers.py):
+        #   LLAMA_NATIVE=ON    -> -mcpu=native        (tuned for THIS host; the setup.py default)
+        #   KT_ARM_CPU=<cpu>   -> -mcpu=<cpu>         (portable across a uarch family,
+        #                                            e.g. ampere1a for Ampere One)
+        #   otherwise          -> generic baseline    (armv8-a)
+        set(KT_ARM_CPU "" CACHE STRING "AArch64 -mcpu target (e.g. ampere1a, neoverse-v2)")
+        if(LLAMA_NATIVE)
+            check_cxx_compiler_flag(-mcpu=native COMPILER_SUPPORTS_MCPU_NATIVE)
+            if(COMPILER_SUPPORTS_MCPU_NATIVE)
+                list(APPEND ARCH_FLAGS -mcpu=native)
+                message(STATUS "ARM tuning: -mcpu=native")
+            else()
+                check_cxx_compiler_flag(-march=native COMPILER_SUPPORTS_MARCH_NATIVE)
+                if(COMPILER_SUPPORTS_MARCH_NATIVE)
+                    list(APPEND ARCH_FLAGS -march=native)
+                    message(STATUS "ARM tuning: -march=native (-mcpu unsupported, fallback)")
+                endif()
+            endif()
+        elseif(KT_ARM_CPU)
+            check_cxx_compiler_flag("-mcpu=${KT_ARM_CPU}" "COMPILER_SUPPORTS_MCPU_${KT_ARM_CPU}")
+            if(COMPILER_SUPPORTS_MCPU_${KT_ARM_CPU})
+                list(APPEND ARCH_FLAGS "-mcpu=${KT_ARM_CPU}")
+                message(STATUS "ARM tuning: -mcpu=${KT_ARM_CPU}")
+            else()
+                message(FATAL_ERROR "Compiler does not support -mcpu=${KT_ARM_CPU}")
+            endif()
+        else()
+            # GENERIC portable build: Armv8-A baseline. Optional dot-product,
+            # FP16 and BF16 instructions are not emitted unless the selected
+            # target enables them, so the binary remains portable across AArch64.
+            set(ARM_MARCH_BASE "armv8-a")
+            check_cxx_compiler_flag("-march=${ARM_MARCH_BASE}" COMPILER_SUPPORTS_ARM_BASELINE)
+            if(COMPILER_SUPPORTS_ARM_BASELINE)
+                list(APPEND ARCH_FLAGS "-march=${ARM_MARCH_BASE}")
+                message(STATUS "ARM tuning: generic baseline -march=${ARM_MARCH_BASE}")
+            else()
+                message(WARNING "Compiler rejected ARM -march flags; building without ISA flags")
+            endif()
+        endif()
     endif()
 elseif(CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR CMAKE_GENERATOR_PLATFORM_LWR MATCHES "^(x86_64|i686|amd64|x64|win32)$" OR
     (NOT CMAKE_OSX_ARCHITECTURES AND NOT CMAKE_GENERATOR_PLATFORM_LWR AND
@@ -454,6 +483,19 @@ message(STATUS "ARCH_FLAGS: ${ARCH_FLAGS}")
 
 add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:${ARCH_FLAGS}>")
 add_compile_options("$<$<COMPILE_LANGUAGE:C>:${ARCH_FLAGS}>")
+
+# Preflight: required submodules must be initialized (set them up with
+#   git submodule update --init --recursive third_party/pybind11 third_party/llama.cpp
+# from the repository root). Fail early with a clear message instead of a
+# cryptic add_subdirectory error (common on fresh ARM machines).
+foreach(_kt_submod third_party/pybind11 third_party/llama.cpp)
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../${_kt_submod}/CMakeLists.txt")
+        message(FATAL_ERROR
+            "Missing submodule '${_kt_submod}'. Run:\n"
+            "  git submodule update --init --recursive ${_kt_submod}\n"
+            "from the repository root, then configure again.")
+    endif()
+endforeach()
 
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/pybind11 ${CMAKE_CURRENT_BINARY_DIR}/third_party/pybind11)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/llama.cpp ${CMAKE_CURRENT_BINARY_DIR}/third_party/llama.cpp)
