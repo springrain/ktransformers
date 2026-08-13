@@ -341,7 +341,15 @@ bool llamafile_sgemm(long m, long n, long k, const void* A, long lda, const void
             return true;
         }
     }
-    if ((Btype == GGML_TYPE_Q8_0 || Btype == GGML_TYPE_Q8_1) && Ctype == GGML_TYPE_F32) {
+    // MOE quantizes activations into standard block_q8_0 rows.  The current
+    // ARM IQK Q80 kernel reads its right-hand operand as block_q8_0_x4, whose
+    // scales and quants have a different layout.  Route this combination to
+    // tinyBLAS_Q0_ARM below, which consumes the standard GGML block layout.
+    const bool standard_q8_0_moe_input =
+        Atype == GGML_TYPE_Q8_0 && Btype == GGML_TYPE_Q8_0;
+    if (!standard_q8_0_moe_input &&
+        (Btype == GGML_TYPE_Q8_0 || Btype == GGML_TYPE_Q8_1) &&
+        Ctype == GGML_TYPE_F32) {
         // assert(QK8_0 == QK8_1 == QK4_0 == QK4_1 == QK5_0 == QK5_1 == 32);
         assert((QK8_0 == 32) && (QK8_1 == 32) && (QK4_0 == 32) && (QK4_1 == 32) && (QK5_0 == 32) && (QK5_1 == 32));
         if (iqk_mul_mat(m, n, k * QK8_0, Atype, A, B, (float*)C, ldc, ith, nth)) {

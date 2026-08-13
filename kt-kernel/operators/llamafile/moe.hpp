@@ -361,12 +361,16 @@ class LLAMA_MOE_TP {
                                                  ggml_blck_size((ggml_type)config_.up_type);
 
             float* up_output_ptr = s_up_output_[act_idx] + ith * config_.m_block;
-            llamafile_sgemm(config_.m_block, 1, config_.hidden_size / ggml_blck_size((ggml_type)config_.up_type),
-                            up_proj_ptr, config_.hidden_size / ggml_blck_size((ggml_type)config_.up_type), up_input_ptr,
-                            config_.hidden_size / ggml_blck_size((ggml_type)config_.up_type), up_output_ptr,
-                            config_.m_block, 0, 1, GGML_TASK_TYPE_COMPUTE, (ggml_type)config_.up_type,
-                            ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type, GGML_TYPE_F32,
-                            GGML_PREC_DEFAULT);
+            ok = llamafile_sgemm(
+                config_.m_block, 1, config_.hidden_size / ggml_blck_size((ggml_type)config_.up_type), up_proj_ptr,
+                config_.hidden_size / ggml_blck_size((ggml_type)config_.up_type), up_input_ptr,
+                config_.hidden_size / ggml_blck_size((ggml_type)config_.up_type), up_output_ptr, config_.m_block, 0, 1,
+                GGML_TASK_TYPE_COMPUTE, (ggml_type)config_.up_type,
+                ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type, GGML_TYPE_F32,
+                GGML_PREC_DEFAULT);
+            if (ok == false) [[unlikely]] {
+              throw std::runtime_error("llamafile up projection not supported");
+            }
 
             for (int i = ith * config_.m_block; i < (ith + 1) * config_.m_block; i++) {
               s_intermediate_fp32_[act_idx][i] = act_fn(s_gate_output_[act_idx][i]) * s_up_output_[act_idx][i];
@@ -424,13 +428,16 @@ class LLAMA_MOE_TP {
                                                                      ggml_blck_size((ggml_type)config_.down_type);
 
             float* down_output_ptr = s_down_output_[expert_idx] + ith * config_.m_block;
-            llamafile_sgemm(
+            auto ok = llamafile_sgemm(
                 config_.m_block, 1, config_.intermediate_size / ggml_blck_size((ggml_type)config_.down_type),
                 down_proj_ptr, config_.intermediate_size / ggml_blck_size((ggml_type)config_.down_type),
                 s_down_input_[expert_idx], config_.intermediate_size / ggml_blck_size((ggml_type)config_.down_type),
                 down_output_ptr, config_.m_block, 0, 1, GGML_TASK_TYPE_COMPUTE, (ggml_type)config_.down_type,
                 ggml_internal_get_type_traits((ggml_type)config_.down_type).vec_dot_type, GGML_TYPE_F32,
                 GGML_PREC_DEFAULT);
+            if (ok == false) [[unlikely]] {
+              throw std::runtime_error("llamafile down projection not supported");
+            }
 
             float expert_weight = 0.0f;
             for (int j = 0; j < k; j++) {
@@ -618,13 +625,16 @@ class LLAMA_MOE_TP {
           //   printf("matrix size: m:%d, n:%d, k:%d\n", m_block, m_local_num_[expert_idx],
           //          config_.hidden_size / ggml_blck_size((ggml_type)config_.gate_type));
           // }
-          llamafile_sgemm(m_block, m_local_num_[expert_idx],
-                          config_.hidden_size / ggml_blck_size((ggml_type)config_.gate_type), gate_proj_ptr,
-                          config_.hidden_size / ggml_blck_size((ggml_type)config_.gate_type), gate_input_ptr,
-                          config_.hidden_size / ggml_blck_size((ggml_type)config_.gate_type), gate_output_ptr,
-                          config_.intermediate_size, 0, 1, GGML_TASK_TYPE_COMPUTE, (ggml_type)config_.gate_type,
-                          ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type, GGML_TYPE_F32,
-                          GGML_PREC_DEFAULT);
+          auto ok = llamafile_sgemm(
+              m_block, m_local_num_[expert_idx], config_.hidden_size / ggml_blck_size((ggml_type)config_.gate_type),
+              gate_proj_ptr, config_.hidden_size / ggml_blck_size((ggml_type)config_.gate_type), gate_input_ptr,
+              config_.hidden_size / ggml_blck_size((ggml_type)config_.gate_type), gate_output_ptr,
+              config_.intermediate_size, 0, 1, GGML_TASK_TYPE_COMPUTE, (ggml_type)config_.gate_type,
+              ggml_internal_get_type_traits((ggml_type)config_.gate_type).vec_dot_type, GGML_TYPE_F32,
+              GGML_PREC_DEFAULT);
+          if (ok == false) [[unlikely]] {
+            throw std::runtime_error("llamafile gate projection not supported");
+          }
           void* up_input_ptr = m_local_up_input_ptr_[expert_idx];
 
           void* up_proj_ptr = (uint8_t*)m_local_up_proj_ + (expert_idx * config_.intermediate_size + ith * m_block) *
@@ -633,12 +643,15 @@ class LLAMA_MOE_TP {
                                                                ggml_blck_size((ggml_type)config_.up_type);
 
           float* up_output_ptr = m_local_up_output_ptr_[expert_idx] + ith * m_block;
-          llamafile_sgemm(
+          ok = llamafile_sgemm(
               m_block, m_local_num_[expert_idx], config_.hidden_size / ggml_blck_size((ggml_type)config_.up_type),
               up_proj_ptr, config_.hidden_size / ggml_blck_size((ggml_type)config_.up_type), up_input_ptr,
               config_.hidden_size / ggml_blck_size((ggml_type)config_.up_type), up_output_ptr,
               config_.intermediate_size, 0, 1, GGML_TASK_TYPE_COMPUTE, (ggml_type)config_.up_type,
               ggml_internal_get_type_traits((ggml_type)config_.up_type).vec_dot_type, GGML_TYPE_F32, GGML_PREC_DEFAULT);
+          if (ok == false) [[unlikely]] {
+            throw std::runtime_error("llamafile up projection not supported");
+          }
           for (int i = 0; i < m_local_num_[expert_idx]; i++) {
             for (int j = ith * m_block; j < (ith + 1) * m_block; j++) {
               m_local_intermediate_fp32_ptr_[expert_idx][i * config_.intermediate_size + j] =
@@ -686,13 +699,17 @@ class LLAMA_MOE_TP {
                                                                    ggml_blck_size((ggml_type)config_.down_type);
 
           float* down_output_ptr = m_local_down_output_ptr_[expert_idx] + ith * m_block;
-          llamafile_sgemm(m_block, m_local_num_[expert_idx],
-                          config_.intermediate_size / ggml_blck_size((ggml_type)config_.down_type), down_proj_ptr,
-                          config_.intermediate_size / ggml_blck_size((ggml_type)config_.down_type), down_input_ptr,
-                          config_.intermediate_size / ggml_blck_size((ggml_type)config_.down_type), down_output_ptr,
-                          config_.hidden_size, 0, 1, GGML_TASK_TYPE_COMPUTE, (ggml_type)config_.down_type,
-                          ggml_internal_get_type_traits((ggml_type)config_.down_type).vec_dot_type, GGML_TYPE_F32,
-                          GGML_PREC_DEFAULT);
+          auto ok = llamafile_sgemm(
+              m_block, m_local_num_[expert_idx],
+              config_.intermediate_size / ggml_blck_size((ggml_type)config_.down_type), down_proj_ptr,
+              config_.intermediate_size / ggml_blck_size((ggml_type)config_.down_type), down_input_ptr,
+              config_.intermediate_size / ggml_blck_size((ggml_type)config_.down_type), down_output_ptr,
+              config_.hidden_size, 0, 1, GGML_TASK_TYPE_COMPUTE, (ggml_type)config_.down_type,
+              ggml_internal_get_type_traits((ggml_type)config_.down_type).vec_dot_type, GGML_TYPE_F32,
+              GGML_PREC_DEFAULT);
+          if (ok == false) [[unlikely]] {
+            throw std::runtime_error("llamafile down projection not supported");
+          }
         },
         nullptr);
 
