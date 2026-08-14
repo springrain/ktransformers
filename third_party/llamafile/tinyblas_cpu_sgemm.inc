@@ -123,12 +123,28 @@ bool llamafile_sgemm_impl(long m, long n, long k, const void* A, long lda, const
             tb.matmul(m, n, task);
             return true;
 #elif defined(__ARM_NEON) && !defined(_MSC_VER)
+            if (Btype == GGML_TYPE_F32) {
+                if (k % 4)
+                    return NOT_SUPPORTED;
+                tinyBLAS<0, 4, float32x4_t, float32x4_t, ggml_bf16_t, float, TC> tb{
+                    k, (const ggml_bf16_t*)A, lda, (const float*)B, ldb, C, ldc, ith, nth};
+                tb.matmul(m, n, task);
+                return true;
+            }
+            if (Btype != GGML_TYPE_BF16)
+                return NOT_SUPPORTED;
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+            if (k % 8 == 0) {
+                tinyBLAS<0, 8, float32x4_t, bfloat16x8_t, ggml_bf16_t, ggml_bf16_t, TC> tb{
+                    k, (const ggml_bf16_t*)A, lda, (const ggml_bf16_t*)B, ldb, C, ldc, ith, nth};
+                tb.matmul(m, n, task);
+                return true;
+            }
+#endif
             if (k % 4)
                 return NOT_SUPPORTED;
-            if (Btype != GGML_TYPE_F32)
-                return NOT_SUPPORTED;
-            tinyBLAS<0, 4, float32x4_t, float32x4_t, ggml_bf16_t, float, TC> tb{
-                k, (const ggml_bf16_t*)A, lda, (const float*)B, ldb, C, ldc, ith, nth};
+            tinyBLAS<0, 4, float32x4_t, float32x4_t, ggml_bf16_t, ggml_bf16_t, TC> tb{
+                k, (const ggml_bf16_t*)A, lda, (const ggml_bf16_t*)B, ldb, C, ldc, ith, nth};
             tb.matmul(m, n, task);
             return true;
 #else
@@ -175,41 +191,29 @@ bool llamafile_sgemm_impl(long m, long n, long k, const void* A, long lda, const
             // } else {
             //     return NOT_SUPPORTED;
             // }
-#elif defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) && !defined(_MSC_VER)
-            if (n < 2 && !FLAG_precise)
-                // TODO(jart): Why is ggml_vec_dot_f16_unroll() so fast at matvec?
-                return NOT_SUPPORTED;
-            if (precision == GGML_PREC_F32) {
+#elif defined(__ARM_NEON) && !defined(_MSC_VER)
+            if (Btype == GGML_TYPE_F32) {
                 if (k % 4)
-                    return NOT_SUPPORTED;
-                if (Btype != GGML_TYPE_F32)
                     return NOT_SUPPORTED;
                 tinyBLAS<0, 4, float32x4_t, float32x4_t, ggml_fp16_t, float, TC> tb{
                     k, (const ggml_fp16_t*)A, lda, (const float*)B, ldb, C, ldc, ith, nth};
                 tb.matmul(m, n, task);
                 return true;
-            } else {
-                if (k % 8)
-                    return NOT_SUPPORTED;
-                if (Btype == GGML_TYPE_F32)
-                    return WANT_QUANTIZATION;
-                if (Btype != GGML_TYPE_F16)
-                    return NOT_SUPPORTED;
+            }
+            if (Btype != GGML_TYPE_F16)
+                return NOT_SUPPORTED;
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+            if (n >= 2 && precision != GGML_PREC_F32 && k % 8 == 0) {
                 tinyBLAS<0, 8, float16x8_t, float16x8_t, ggml_fp16_t, ggml_fp16_t, TC> tb{
                     k, (const ggml_fp16_t*)A, lda, (const ggml_fp16_t*)B, ldb, C, ldc, ith, nth};
                 tb.matmul(m, n, task);
                 return true;
             }
-#elif defined(__ARM_NEON) && !defined(_MSC_VER)
-            if (n < 2 && !FLAG_precise)
-                // TODO(jart): Why is ggml_vec_dot_f16_unroll() so fast at matvec?
-                return NOT_SUPPORTED;
+#endif
             if (k % 4)
                 return NOT_SUPPORTED;
-            if (Btype != GGML_TYPE_F32)
-                return NOT_SUPPORTED;
-            tinyBLAS<0, 4, float32x4_t, float32x4_t, ggml_fp16_t, float, TC> tb{
-                k, (const ggml_fp16_t*)A, lda, (const float*)B, ldb, C, ldc, ith, nth};
+            tinyBLAS<0, 4, float32x4_t, float32x4_t, ggml_fp16_t, ggml_fp16_t, TC> tb{
+                k, (const ggml_fp16_t*)A, lda, (const ggml_fp16_t*)B, ldb, C, ldc, ith, nth};
             tb.matmul(m, n, task);
             return true;
 #else

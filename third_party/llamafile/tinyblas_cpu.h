@@ -264,6 +264,17 @@ inline __m512 madder(__m512bh x, __m512bh y, __m512 z, __m512* _) {
 }
 #endif
 
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC) && defined(__ARM_NEON) && !defined(_MSC_VER)
+template <>
+inline float32x4_t madd(bfloat16x8_t x, bfloat16x8_t y, float32x4_t z) {
+    return vbfdotq_f32(z, x, y);
+}
+template <>
+inline float32x4_t madder(bfloat16x8_t x, bfloat16x8_t y, float32x4_t z, float32x4_t*) {
+    return vbfdotq_f32(z, x, y);
+}
+#endif
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // VECTORIZED HORIZONTAL SUM
 
@@ -336,6 +347,12 @@ template <>
 inline float32x4_t load(const ggml_bf16_t* p) {
     return vreinterpretq_f32_u32(vshll_n_u16(vld1_u16((const unsigned short*)p), 16));
 }
+#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC) && !defined(_MSC_VER)
+template <>
+inline bfloat16x8_t load(const ggml_bf16_t* p) {
+    return vreinterpretq_bf16_u16(vld1q_u16((const uint16_t*)p));
+}
+#endif  // __ARM_FEATURE_BF16_VECTOR_ARITHMETIC
 #if !defined(_MSC_VER)
 template <>
 inline float16x8_t load(const ggml_fp16_t* p) {
