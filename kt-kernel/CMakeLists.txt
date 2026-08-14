@@ -498,9 +498,31 @@ foreach(_kt_submod third_party/pybind11 third_party/llama.cpp)
 endforeach()
 
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/pybind11 ${CMAKE_CURRENT_BINARY_DIR}/third_party/pybind11)
+# The upstream GGML llamafile implementation exports the same symbols as
+# KT's llamafile kernels.  KT owns this dispatch path, so do not build the
+# duplicate upstream implementation.
+set(GGML_LLAMAFILE OFF CACHE BOOL "Disable upstream llamafile; KT supplies its own" FORCE)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/llama.cpp ${CMAKE_CURRENT_BINARY_DIR}/third_party/llama.cpp)
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../third_party)
+
+# llama.cpp keeps its public and private GGML headers in separate directories
+# in the current upstream layout.  KT uses the private quantization headers
+# from the llamafile kernels, so expose both directories explicitly.
+set(KT_LLAMA_CPP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/llama.cpp")
+set(KT_LLAMA_GGML_INCLUDE_DIR "${KT_LLAMA_CPP_DIR}/ggml/include")
+set(KT_LLAMA_GGML_SRC_DIR "${KT_LLAMA_CPP_DIR}/ggml/src")
+if(NOT EXISTS "${KT_LLAMA_GGML_INCLUDE_DIR}/ggml.h" OR
+   NOT EXISTS "${KT_LLAMA_GGML_SRC_DIR}/ggml-impl.h" OR
+   NOT EXISTS "${KT_LLAMA_GGML_SRC_DIR}/ggml-quants.h" OR
+   NOT EXISTS "${KT_LLAMA_GGML_SRC_DIR}/ggml-common.h")
+    message(FATAL_ERROR
+        "The initialized llama.cpp submodule does not match the current upstream layout. "
+        "Update third_party/llama.cpp to ggml-org/llama.cpp master.")
+endif()
+include_directories(${KT_LLAMA_GGML_INCLUDE_DIR} ${KT_LLAMA_GGML_SRC_DIR})
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
+
 if(KTRANSFORMERS_USE_CUDA)
     include(CheckLanguage)
     check_language(CUDA)

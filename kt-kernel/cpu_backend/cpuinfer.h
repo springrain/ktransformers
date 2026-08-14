@@ -29,7 +29,7 @@
 #endif
 
 #include "./vendors/vendor.h"
-#include "llama.cpp/ggml-impl.h"
+#include "ggml-impl.h"
 #include "task_queue.h"
 #include "worker_pool.h"
 

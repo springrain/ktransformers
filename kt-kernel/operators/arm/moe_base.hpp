@@ -34,7 +34,7 @@
 #include "../moe-tp.hpp"
 #include "neon_bf16_gemm.hpp"
 #include "neon_bf16_utils.hpp"
-#include "llama.cpp/ggml.h"
+#include "ggml.h"
 
 template <class T, class Derived>
 class NEON_MOE_BASE {

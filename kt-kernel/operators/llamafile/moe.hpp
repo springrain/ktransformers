@@ -18,8 +18,9 @@
 #include "../../cpu_backend/worker_pool.h"
 #include "../moe-tp.hpp"
 #include "conversion.h"
-#include "llama.cpp/ggml-quants.h"
-#include "llama.cpp/ggml.h"
+#include "ggml-quants.h"
+#include "ggml.h"
+#include "kt_ggml_compat.h"
 #include "llamafile/sgemm.h"
 
 inline void debug_quant(void* input, ggml_type type) {

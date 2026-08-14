@@ -12,8 +12,9 @@
 
 #include <memory.h>
 
-#include "llama.cpp/ggml-quants.h"
-#include "llama.cpp/ggml.h"
+#include "ggml-quants.h"
+#include "ggml.h"
+#include "kt_ggml_compat.h"
 
 inline void to_float(const void* input, float* output, int size, ggml_type type) {
   if (type == ggml_type::GGML_TYPE_F32) {

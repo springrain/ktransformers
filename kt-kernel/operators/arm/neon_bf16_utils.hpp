@@ -21,7 +21,7 @@
 
 #include <cmath>
 
-#include "llama.cpp/ggml.h"
+#include "ggml.h"
 
 namespace armneon {
 

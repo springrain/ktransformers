@@ -9,8 +9,9 @@
 #include <algorithm>
 #include <type_traits>
 
-#include "llama.cpp/ggml-impl.h"
-#include "llama.cpp/ggml-quants.h"
+#include "ggml-impl.h"
+#include "ggml-quants.h"
+#include "kt_ggml_compat.h"
 
 #if defined(__gnu_linux__)
 #include <sys/syscall.h>

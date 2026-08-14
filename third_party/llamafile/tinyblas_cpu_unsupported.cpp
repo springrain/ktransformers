@@ -26,7 +26,7 @@ bool llamafile_sgemm_unsupported(long m, long n, long k, const void* A, long lda
     return false;
 }
 
-bool llamafile_mixmul_unsupported(const struct ggml_compute_params* params,
+bool llamafile_mixmul_unsupported(const struct kt_ggml_compute_params* params,
                                   const struct ggml_tensor* weights,
                                   const struct ggml_tensor* thought,
                                   const struct ggml_tensor* plan,

@@ -22,9 +22,10 @@
 #include <vector>
 
 #include "../../cpu_backend/worker_pool.h"
-#include "llama.cpp/ggml-common.h"
-#include "llama.cpp/ggml-quants.h"
-#include "llama.cpp/ggml.h"
+#include "ggml-common.h"
+#include "ggml-quants.h"
+#include "ggml.h"
+#include "kt_ggml_compat.h"
 
 #define CHUNK_SIZE 32
 

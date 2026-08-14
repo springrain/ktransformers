@@ -11,7 +11,24 @@ extern "C" {
 #endif
 
 struct ggml_tensor;
-struct ggml_compute_params;
+
+enum kt_ggml_task_type {
+    KT_GGML_TASK_TYPE_INIT = 0,
+    KT_GGML_TASK_TYPE_COMPUTE,
+    KT_GGML_TASK_TYPE_FINALIZE,
+};
+
+struct kt_ggml_compute_params {
+    enum kt_ggml_task_type type;
+    int ith;
+    int nth;
+    size_t wsize;
+    void* wdata;
+};
+
+#define GGML_TASK_TYPE_INIT KT_GGML_TASK_TYPE_INIT
+#define GGML_TASK_TYPE_COMPUTE KT_GGML_TASK_TYPE_COMPUTE
+#define GGML_TASK_TYPE_FINALIZE KT_GGML_TASK_TYPE_FINALIZE
 #ifdef __aarch64__
 
 bool iqk_mul_mat(long, long, long, int, const void*, const void*, float*, long, int, int);
@@ -24,7 +41,7 @@ bool iqk_mul_mat_moe_arm82(long, long, long, int, int, const void*, const void*,
 bool iqk_mul_mat_moe_unsupported(long, long, long, int, int, const void*, const void*, float*, long, long, const void*, int, int);
 
 bool llamafile_sgemm(long, long, long, const void*, long, const void*, long, void*, long, int, int, int, int, int, int, int);
-bool llamafile_mixmul(const struct ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
+bool llamafile_mixmul(const struct kt_ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
 size_t llamafile_mixmul_needs(const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*);
 
 bool llamafile_sgemm_unsupported(long, long, long, const void*, long, const void*, long, void*, long, int, int, int, int, int, int, int);
@@ -37,15 +54,15 @@ bool llamafile_sgemm_amd_zen4(long, long, long, const void*, long, const void*, 
 bool llamafile_sgemm_arm80(long, long, long, const void*, long, const void*, long, void*, long, int, int, int, int, int, int, int);
 bool llamafile_sgemm_arm82(long, long, long, const void*, long, const void*, long, void*, long, int, int, int, int, int, int, int);
 
-bool llamafile_mixmul_unsupported(const struct ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
-bool llamafile_mixmul_amd_avx(const struct ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
-bool llamafile_mixmul_amd_fma(const struct ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
-bool llamafile_mixmul_amd_avx2(const struct ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
-bool llamafile_mixmul_amd_avxvnni(const struct ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
-bool llamafile_mixmul_amd_avx512f(const struct ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
-bool llamafile_mixmul_amd_zen4(const struct ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
-bool llamafile_mixmul_arm80(const struct ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
-bool llamafile_mixmul_arm82(const struct ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
+bool llamafile_mixmul_unsupported(const struct kt_ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
+bool llamafile_mixmul_amd_avx(const struct kt_ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
+bool llamafile_mixmul_amd_fma(const struct kt_ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
+bool llamafile_mixmul_amd_avx2(const struct kt_ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
+bool llamafile_mixmul_amd_avxvnni(const struct kt_ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
+bool llamafile_mixmul_amd_avx512f(const struct kt_ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
+bool llamafile_mixmul_amd_zen4(const struct kt_ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
+bool llamafile_mixmul_arm80(const struct kt_ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
+bool llamafile_mixmul_arm82(const struct kt_ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
 bool llamafile_mixmul_iqk(long, long, long, int, int, const void*, const void*, float*, long, long, const void*, int, int);
 
 #else
@@ -61,7 +78,7 @@ bool iqk_mul_mat_moe_arm82(long, long, long, int, int, const void*, const void*,
 bool iqk_mul_mat_moe_unsupported(long, long, long, int, int, const void*, const void*, float*, long, long, const void*, int, int);
 
 bool llamafile_sgemm(long m, long n, long k, const void* a, long lda, const void* b, long ldb, void* c, long ldc, int ith, int nth, int task_type, int a_type, int b_type, int c_type, int precision);
-bool llamafile_mixmul(const struct ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
+bool llamafile_mixmul(const struct kt_ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
 size_t llamafile_mixmul_needs(const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*);
 
 bool llamafile_sgemm_unsupported(long, long, long, const void*, long, const void*, long, void*, long, int, int, int, int, int, int, int);
@@ -74,15 +91,15 @@ bool llamafile_sgemm_amd_zen4(long, long, long, const void*, long, const void*, 
 bool llamafile_sgemm_arm80(long, long, long, const void*, long, const void*, long, void*, long, int, int, int, int, int, int, int);
 bool llamafile_sgemm_arm82(long, long, long, const void*, long, const void*, long, void*, long, int, int, int, int, int, int, int);
 
-bool llamafile_mixmul_unsupported(const struct ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
-bool llamafile_mixmul_amd_avx(const struct ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
-bool llamafile_mixmul_amd_fma(const struct ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
-bool llamafile_mixmul_amd_avx2(const struct ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
-bool llamafile_mixmul_amd_avxvnni(const struct ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
-bool llamafile_mixmul_amd_avx512f(const struct ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
-bool llamafile_mixmul_amd_zen4(const struct ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
-bool llamafile_mixmul_arm80(const struct ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
-bool llamafile_mixmul_arm82(const struct ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
+bool llamafile_mixmul_unsupported(const struct kt_ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
+bool llamafile_mixmul_amd_avx(const struct kt_ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
+bool llamafile_mixmul_amd_fma(const struct kt_ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
+bool llamafile_mixmul_amd_avx2(const struct kt_ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
+bool llamafile_mixmul_amd_avxvnni(const struct kt_ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
+bool llamafile_mixmul_amd_avx512f(const struct kt_ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
+bool llamafile_mixmul_amd_zen4(const struct kt_ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
+bool llamafile_mixmul_arm80(const struct kt_ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
+bool llamafile_mixmul_arm82(const struct kt_ggml_compute_params*, const struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*, struct ggml_tensor*);
 bool llamafile_mixmul_iqk(long, long, long, int, int, const void*, const void*, float*, long, long, const void*, int, int);
 
 #endif

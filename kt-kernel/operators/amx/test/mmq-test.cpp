@@ -11,6 +11,7 @@
 
 #include "ggml-impl.h"
 #include "ggml-quants.h"
+#include "kt_ggml_compat.h"
 #include "mat-test.hpp"
 
 #if defined(__gnu_linux__)

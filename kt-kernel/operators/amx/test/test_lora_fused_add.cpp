@@ -24,7 +24,7 @@
 #include <random>
 #include <string>
 
-#include "llama.cpp/ggml-impl.h"
+#include "ggml-impl.h"
 
 // ============================================================================
 // Reference implementation (scalar)

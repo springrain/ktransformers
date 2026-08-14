@@ -24,8 +24,9 @@
 #include <type_traits>
 #if defined __x86_64__ || defined __aarch64__ || defined(_M_X64)
 
-#include "llama.cpp/ggml-impl.h"
-#include "llama.cpp/ggml-quants.h"
+#include "ggml-impl.h"
+#include "ggml-quants.h"
+#include <immintrin.h>
 #include "sgemm.h"
 
 // For i-quants, I had to explicitely specify which
@@ -43,7 +44,7 @@
 #endif
 
 #define GGML_COMMON_IMPL_C
-#include "llama.cpp/ggml-common.h"
+#include "ggml-common.h"
 
 // clang-format off
 
