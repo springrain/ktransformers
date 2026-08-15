@@ -11,6 +11,7 @@
 #include <chrono>
 
 #include "ggml-impl.h"
+#include "ggml-cpu/simd-mappings.h"
 #include "kvcache.h"
 
 std::string ggml_type_to_string(ggml_type type) {
@@ -787,6 +788,39 @@ void ggml_vec_scale_f32(const int n, float* y, const float v) {
 #if defined(GGML_USE_ACCELERATE)
   vDSP_vsmul(y, 1, &v, y, 1, n);
 #elif defined(GGML_SIMD)
+#if defined(__ARM_FEATURE_SVE)
+  const int sve_register_length = ggml_cpu_get_sve_cnt() * 8;
+  const int ggml_f32_epr = sve_register_length / 32;
+  const int ggml_f32_step = 2 * ggml_f32_epr;
+
+  GGML_F32_VEC vx = GGML_F32_VEC_SET1(v);
+  const int np = (n & ~(ggml_f32_step - 1));
+  svfloat32_t ay1;
+  svfloat32_t ay2;
+  for (int i = 0; i < np; i += ggml_f32_step) {
+    ay1 = GGML_F32_VEC_LOAD(y + i);
+    ay1 = GGML_F32_VEC_MUL(ay1, vx);
+    GGML_F32_VEC_STORE(y + i, ay1);
+
+    ay2 = GGML_F32_VEC_LOAD(y + i + ggml_f32_epr);
+    ay2 = GGML_F32_VEC_MUL(ay2, vx);
+    GGML_F32_VEC_STORE(y + i + ggml_f32_epr, ay2);
+  }
+
+  for (int i = np; i < n; i += ggml_f32_epr) {
+    svbool_t pg = svwhilelt_b32(i, n);
+    ay1 = svld1_f32(pg, y + i);
+    ay1 = svmul_f32_m(pg, ay1, vx);
+    svst1_f32(pg, y + i, ay1);
+  }
+#elif defined(__riscv_v_intrinsic)
+  for (int i = 0, avl; i < n; i += avl) {
+    avl = __riscv_vsetvl_e32m8(n - i);
+    vfloat32m8_t ay = __riscv_vle32_v_f32m8(&y[i], avl);
+    vfloat32m8_t ny = __riscv_vfmul_vf_f32m8(ay, v, avl);
+    __riscv_vse32_v_f32m8(&y[i], ny, avl);
+  }
+#else
   const int np = (n & ~(GGML_F32_STEP - 1));
 
   GGML_F32_VEC vx = GGML_F32_VEC_SET1(v);
@@ -806,6 +840,7 @@ void ggml_vec_scale_f32(const int n, float* y, const float v) {
   for (int i = np; i < n; ++i) {
     y[i] *= v;
   }
+#endif
 #else
   // scalar
   for (int i = 0; i < n; ++i) {

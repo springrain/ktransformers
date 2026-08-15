@@ -27,6 +27,7 @@
 #include <tuple>
 
 #include "avx2_bf16_utils.hpp"
+#include "ggml-impl.h"
 
 namespace avx2 {
 
