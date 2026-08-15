@@ -24,7 +24,7 @@
 #include <type_traits>
 #if defined __x86_64__ || defined __aarch64__ || defined(_M_X64)
 
-#include "ggml-impl.h"
+#include "ggml-cpu/ggml-cpu-impl.h"
 #include "ggml-quants.h"
 #include "sgemm.h"
 
