@@ -561,22 +561,22 @@ class NEON_MOE_BASE {
         }
         // Scalar tail — mirror the vectorized swigluoai / silu paths in armneon::act_fn.
         for (; j < n_end; j++) {
-          float g = GGML_BF16_TO_FP32(gate_ptr[j]);
-          float u = GGML_BF16_TO_FP32(up_ptr[j]);
+          float g = ggml_bf16_to_fp32(gate_ptr[j]);
+          float u = ggml_bf16_to_fp32(up_ptr[j]);
           if (swiglu_alpha > 0.0f) {
             if (swiglu_limit > 0.0f) {
               g = std::min(std::max(g, -swiglu_limit), swiglu_limit);
               u = std::min(std::max(u, -swiglu_limit), swiglu_limit);
             }
             float sigmoid_ga = 1.0f / (1.0f + expf(-g * swiglu_alpha));
-            gate_ptr[j] = GGML_FP32_TO_BF16(g * sigmoid_ga * (u + 1.0f));
+            gate_ptr[j] = ggml_fp32_to_bf16(g * sigmoid_ga * (u + 1.0f));
           } else {
             if (swiglu_limit > 0.0f) {
               g = std::min(g, swiglu_limit);
               u = std::min(std::max(u, -swiglu_limit), swiglu_limit);
             }
             float sigmoid_g = 1.0f / (1.0f + expf(-g));
-            gate_ptr[j] = GGML_FP32_TO_BF16(g * sigmoid_g * u);
+            gate_ptr[j] = ggml_fp32_to_bf16(g * sigmoid_g * u);
           }
         }
       }

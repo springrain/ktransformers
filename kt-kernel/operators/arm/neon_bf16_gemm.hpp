@@ -153,7 +153,7 @@ struct GemmKernelNeonBF16 {
         }
         // Scalar tail
         for (; j < n_end; j++) {
-          dst_row[j] = GGML_FP32_TO_BF16(src_row[j]);
+          dst_row[j] = ggml_fp32_to_bf16(src_row[j]);
         }
       }
     }
@@ -190,7 +190,7 @@ static inline float dot_bf16(const ggml_bf16_t* a, const ggml_bf16_t* b, int k) 
 
   // Scalar tail
   for (; ki < k; ki++) {
-    sum += GGML_BF16_TO_FP32(a[ki]) * GGML_BF16_TO_FP32(b[ki]);
+    sum += ggml_bf16_to_fp32(a[ki]) * ggml_bf16_to_fp32(b[ki]);
   }
   return sum;
 }
@@ -216,7 +216,7 @@ static inline float dot_bf16(const ggml_bf16_t* a, const ggml_bf16_t* b, int k) 
 
   // Scalar tail
   for (; ki < k; ki++) {
-    sum += GGML_BF16_TO_FP32(a[ki]) * GGML_BF16_TO_FP32(b[ki]);
+    sum += ggml_bf16_to_fp32(a[ki]) * ggml_bf16_to_fp32(b[ki]);
   }
   return sum;
 }
