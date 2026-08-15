@@ -103,6 +103,9 @@ install_sglang() {
 
   local sglang_dir="$REPO_ROOT/third_party/sglang"
   local pyproject="$sglang_dir/python/pyproject.toml"
+  local custom_flashinfer_dir="$REPO_ROOT/third_party/custom_flashinfer"
+  local custom_flashinfer_pyproject="$custom_flashinfer_dir/pyproject.toml"
+  local custom_flashinfer_version_file="$custom_flashinfer_dir/version.txt"
 
   if [ ! -f "$pyproject" ]; then
     log_error "sglang source not found at $sglang_dir"
@@ -110,15 +113,105 @@ install_sglang() {
     exit 1
   fi
 
+  if [ ! -f "$custom_flashinfer_pyproject" ] || [ ! -f "$custom_flashinfer_version_file" ]; then
+    log_error "custom_flashinfer source not found at $custom_flashinfer_dir"
+    log_error "Run 'git submodule update --init --recursive' first, or clone with --recursive."
+    exit 1
+  fi
+
+  local custom_flashinfer_version
+  custom_flashinfer_version="$(tr -d '[:space:]' < "$custom_flashinfer_version_file")"
+
+  python3 - "$pyproject" "$custom_flashinfer_pyproject" "$custom_flashinfer_version" <<'PY'
+import sys
+import tomllib
+
+sglang_path, custom_path, custom_version = sys.argv[1:]
+with open(sglang_path, "rb") as f:
+    sglang = tomllib.load(f)["project"]
+with open(custom_path, "rb") as f:
+    custom = tomllib.load(f)["project"]
+
+sglang_dependencies = set(sglang["dependencies"])
+custom_cutlass = next(
+    requirement
+    for requirement in custom["optional-dependencies"]["cu13"]
+    if requirement.startswith("nvidia-cutlass-dsl")
+)
+required = {
+    f"flashinfer_python[cu13]=={custom_version}",
+    custom_cutlass,
+}
+missing = required - sglang_dependencies
+if missing:
+    raise SystemExit(
+        "SGLang/custom_flashinfer dependency mismatch: " + ", ".join(sorted(missing))
+    )
+PY
+
+  log_step "Installing custom_flashinfer $custom_flashinfer_version"
+  python3 -m pip install \
+    'setuptools>=77' \
+    'packaging>=24' \
+    'apache-tvm-ffi==0.1.11'
+
+  # Remove public packages and prebuilt AOT modules before installing the KT
+  # fork. The custom MLA and norm bindings must be compiled from this source.
+  python3 -m pip uninstall -y \
+    flashinfer-python flashinfer-cubin flashinfer-jit-cache \
+    quack-kernels flash-attn-4 \
+    sglang sglang-kt sgl-kernel sglang-kernel transformers-kt
+
+  # This editable distribution is installed first so SGLang's exact
+  # flashinfer-python requirement is satisfied locally, not from PyPI.
+  BUILD_NVEP="${BUILD_NVEP:-0}" \
+    python3 -m pip install --no-build-isolation -e "${custom_flashinfer_dir}[cu13]"
+
+  log_info "Clearing stale FlashInfer JIT modules..."
+  python3 -c 'from flashinfer.jit import clear_cache_dir; clear_cache_dir()'
+
   cd "$sglang_dir"
 
   if [ "$editable" = "1" ]; then
     log_info "Installing sglang in editable mode..."
-    pip install -e "./python[all]"
+    python3 -m pip install -e "./python[all]"
   else
     log_info "Installing sglang..."
-    pip install "./python[all]"
+    python3 -m pip install "./python[all]"
   fi
+
+  python3 - "$custom_flashinfer_dir" "$custom_flashinfer_version" <<'PY'
+import importlib.metadata as metadata
+import pathlib
+import sys
+
+import flashinfer
+
+expected_path = pathlib.Path(sys.argv[1]).resolve()
+loaded_path = pathlib.Path(flashinfer.__file__).resolve()
+expected_version = sys.argv[2]
+
+if not loaded_path.is_relative_to(expected_path):
+    raise SystemExit(
+        f"SGLang replaced custom_flashinfer: loaded {loaded_path}, expected {expected_path}"
+    )
+if metadata.version("flashinfer-python") != expected_version:
+    raise SystemExit(
+        f"flashinfer-python version mismatch: "
+        f"{metadata.version('flashinfer-python')} != {expected_version}"
+    )
+for package in ("flashinfer-cubin", "flashinfer-jit-cache"):
+    try:
+        installed = metadata.version(package)
+    except metadata.PackageNotFoundError:
+        continue
+    raise SystemExit(
+        f"{package} {installed} is installed; custom FlashInfer must JIT from source"
+    )
+print(f"custom_flashinfer {expected_version} is active: {loaded_path}")
+PY
+
+  python3 -c 'import quack, sglang; print("SGLang and quack imports are active")'
 
   log_info "sglang installed successfully."
 }
