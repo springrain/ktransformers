@@ -221,6 +221,63 @@ bool llamafile_sgemm_impl(long m, long n, long k, const void* A, long lda, const
 #endif
         }
 
+        // MXFP4 weights use the native GGML block layout (one E8M0 scale
+        // byte plus sixteen packed E2M1 bytes per 32 values).  The KT
+        // llamafile path keeps those rows in that layout, while activations
+        // are quantized to the standard block_q8_0 type.
+        case GGML_TYPE_MXFP4: {
+            if (Btype != GGML_TYPE_Q8_0 || Ctype != GGML_TYPE_F32)
+                return NOT_SUPPORTED;
+#if defined(__ARM_FEATURE_DOTPROD)
+            // AmpereOne and other Armv8.2+ dot-product CPUs use the same
+            // tiled kernel as Q8/Q4.  The MXFP4 overloads decode E2M1 nibbles
+            // through GGML's canonical LUT and apply the E8M0-half scale.
+            tinyBLAS_Q0_ARM<0, block_mxfp4, block_q8_0, TC> tb{
+                k, (const block_mxfp4*)A, lda, (const block_q8_0*)B, ldb, C, ldc, ith, nth};
+            tb.matmul(m, n, task);
+            return true;
+#elif defined(__aarch64__)
+            // Generic ARM64 builds without dot-product instructions retain a
+            // correctness fallback through llama.cpp's architecture-specific
+            // MXFP4 x Q8_0 vector dot implementation.
+            if (task != GGML_TASK_TYPE_COMPUTE)
+                return true;
+
+            const long total = m * n;
+            const long duty = (total + nth - 1) / nth;
+            long start = duty * ith;
+            if (start > total)
+                start = total;
+            long end = start + duty;
+            if (end > total)
+                end = total;
+
+            const auto* a = static_cast<const block_mxfp4*>(A);
+            const auto* b = static_cast<const block_q8_0*>(B);
+            const auto* traits = ggml_get_type_traits_cpu(GGML_TYPE_MXFP4);
+            if (traits == nullptr || traits->vec_dot == nullptr)
+                return NOT_SUPPORTED;
+            for (long job = start; job < end; ++job) {
+                // C is column-major in this API: each column is one input
+                // token and each row is one output feature.
+                const long i = job % m;
+                const long j = job / m;
+                traits->vec_dot(
+                    static_cast<int>(k * QK_MXFP4),
+                    &C[j * ldc + i],
+                    0,
+                    a + lda * i,
+                    0,
+                    b + ldb * j,
+                    0,
+                    1);
+            }
+            return true;
+#else
+            return NOT_SUPPORTED;
+#endif
+        }
+
         case GGML_TYPE_Q8_0: {
             if (Btype == GGML_TYPE_F32)
                 return WANT_QUANTIZATION;
