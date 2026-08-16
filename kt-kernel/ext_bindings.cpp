@@ -1006,6 +1006,7 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .value("F64", GGML_TYPE_F64)
       .value("IQ1_M", GGML_TYPE_IQ1_M)
       .value("BF16", GGML_TYPE_BF16)
+      .value("MXFP4", GGML_TYPE_MXFP4)
       .export_values();
 
   py::enum_<RetrievalType>(kvcache_module, "RetrievalType")

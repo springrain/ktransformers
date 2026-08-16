@@ -52,6 +52,7 @@
 #endif
 
 #include "ggml-impl.h"
+#include "ggml-cpu.h"
 #include "ggml-quants.h"
 #include "kt_ggml_compat.h"
 // #include "log.h"
@@ -801,8 +802,8 @@ class tinyBLAS_Q0_ARM {
                             vdotq_s32(vdupq_n_s32(0), load_lo(INDEX(A, lda, ii + i, l)),
                                       load_lo(INDEX(B, ldb, jj + j, l))),
                             load_hi(INDEX(A, lda, ii + i, l)), load_hi(INDEX(B, ldb, jj + j, l))));
-                        float b = unhalf(INDEX(A, lda, ii + i, l)->d) *
-                                  unhalf(INDEX(B, ldb, jj + j, l)->d);
+                        float b = block_scale(INDEX(A, lda, ii + i, l)) *
+                                  block_scale(INDEX(B, ldb, jj + j, l));
                         if (PRECISE)
                             Cv[j][i] = badder(a, b, Cv[j][i], &Ce[j][i]);
                         else
@@ -831,6 +832,38 @@ class tinyBLAS_Q0_ARM {
 
     inline int8x16_t load_hi(const block_q4_0* b) {
         return vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(vld1q_u8(b->qs), 4)), vdupq_n_s8(0x8));
+    }
+
+    inline int8x16_t load_lo(const block_mxfp4* b) {
+        const uint8x16_t packed = vld1q_u8(b->qs);
+        const uint8x16_t indices = vandq_u8(packed, vdupq_n_u8(0x0f));
+        return vqtbl1q_s8(mxfp4_lut(), indices);
+    }
+
+    inline int8x16_t load_hi(const block_mxfp4* b) {
+        const uint8x16_t packed = vld1q_u8(b->qs);
+        const uint8x16_t indices = vshrq_n_u8(packed, 4);
+        return vqtbl1q_s8(mxfp4_lut(), indices);
+    }
+
+    inline int8x16_t mxfp4_lut() {
+        // GGML's doubled E2M1 values.  Doubling keeps the dot product in
+        // int8; GGML_E8M0_TO_FP32_HALF supplies the matching half scale.
+        alignas(16) static const int8_t values[16] = {
+            0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+        return vld1q_s8(values);
+    }
+
+    inline float block_scale(const block_q8_0* b) {
+        return unhalf(b->d);
+    }
+
+    inline float block_scale(const block_q4_0* b) {
+        return unhalf(b->d);
+    }
+
+    inline float block_scale(const block_mxfp4* b) {
+        return GGML_E8M0_TO_FP32_HALF(b->e);
     }
 
     const TA* const A;

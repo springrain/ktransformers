@@ -48,6 +48,9 @@ class GGMLQuantizationType(IntEnum):
     F64 = 28
     IQ1_M = 29
     BF16 = 30
+    # GGML_TYPE_MXFP4: one 32-value block is 1 E8M0 scale byte + 16 packed
+    # E2M1 bytes.
+    MXFP4 = 39
 
 
 def translate_name_to_gguf(name):
@@ -1028,6 +1031,8 @@ class GGUFLoader:
             GGMLQuantizationType.F32: (1, 4),
             GGMLQuantizationType.F16: (1, 2),
             GGMLQuantizationType.BF16: (1, 2),
+            # block_mxfp4 { uint8_t e; uint8_t qs[16]; }
+            GGMLQuantizationType.MXFP4: (32, 1 + 16),
             GGMLQuantizationType.Q4_0: (32, 2 + 16),
             GGMLQuantizationType.Q4_1: (32, 2 + 2 + 16),
             GGMLQuantizationType.Q5_0: (32, 2 + 4 + 16),
