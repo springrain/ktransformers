@@ -1329,8 +1329,13 @@ class MXFP8SafeTensorLoader(SafeTensorLoader):
                 (down_name, down_weights),
             ):
                 w = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight", device).contiguous()
-                if w.dtype != torch.uint8:
+                if w.dtype == torch.float8_e4m3fn:
                     w = w.view(torch.uint8)
+                elif w.dtype != torch.uint8:
+                    raise ValueError(
+                        f"MXFP8 weight {prefix}.{exp_id}.{proj}.weight must use "
+                        f"float8_e4m3fn or uint8 storage, got {w.dtype}"
+                    )
                 dst[exp_id] = w
 
             for proj, dst in (
@@ -1339,8 +1344,14 @@ class MXFP8SafeTensorLoader(SafeTensorLoader):
                 (down_name, down_scales),
             ):
                 s = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight_scale_inv", device).contiguous()
-                if s.dtype != torch.uint8:
+                e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+                if e8m0_dtype is not None and s.dtype == e8m0_dtype:
                     s = s.view(torch.uint8)
+                elif s.dtype != torch.uint8:
+                    raise ValueError(
+                        f"MXFP8 scale {prefix}.{exp_id}.{proj}.weight_scale_inv must use "
+                        f"float8_e8m0fnu or uint8 storage, got {s.dtype}"
+                    )
                 dst[exp_id] = s
 
         print(f"[MXFP8SafeTensorLoader] Loaded {expert_count} experts from {prefix}")

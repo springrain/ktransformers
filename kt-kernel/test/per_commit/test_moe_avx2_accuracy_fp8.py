@@ -5,6 +5,7 @@
 import os
 import sys
 import math
+import platform
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -23,6 +24,62 @@ max_len = 128
 group_size = 128
 validation_iter = 3
 CPUINFER_PARAM = 60
+
+
+def fp8_backend():
+    if platform.machine().lower() in ("aarch64", "arm64"):
+        backend = getattr(kt_kernel_ext.moe, "NEONFP8_MOE", None)
+    else:
+        backend = getattr(kt_kernel_ext.moe, "AVX2FP8_MOE", None)
+    if backend is None:
+        pytest.skip("No native block-scaled FP8 MoE backend in this build")
+    return backend
+
+
+def verify_arm_layerwise_staging(
+    cpu_infer,
+    moe,
+    gate,
+    gate_scale,
+    up,
+    up_scale,
+    down,
+    down_scale,
+):
+    if platform.machine().lower() not in ("aarch64", "arm64"):
+        return
+
+    logical_expert = 0
+    w13 = torch.empty((2 * intermediate_size, hidden_size), dtype=torch.uint8)
+    w13_scale = torch.empty(
+        (2 * ((intermediate_size + group_size - 1) // group_size),
+         (hidden_size + group_size - 1) // group_size),
+        dtype=torch.float32,
+    )
+    w2 = torch.empty((hidden_size, intermediate_size), dtype=torch.uint8)
+    w2_scale = torch.empty(
+        ((hidden_size + group_size - 1) // group_size,
+         (intermediate_size + group_size - 1) // group_size),
+        dtype=torch.float32,
+    )
+    cpu_infer.submit(
+        moe.write_weight_scale_to_buffer_task(
+            1,
+            logical_expert,
+            [w13.data_ptr()],
+            [w13_scale.data_ptr()],
+            [w2.data_ptr()],
+            [w2_scale.data_ptr()],
+        )
+    )
+    cpu_infer.sync()
+
+    assert torch.equal(w13[:intermediate_size], gate[logical_expert])
+    assert torch.equal(w13[intermediate_size:], up[logical_expert])
+    assert torch.equal(w13_scale[: gate_scale.shape[1]], gate_scale[logical_expert])
+    assert torch.equal(w13_scale[gate_scale.shape[1] :], up_scale[logical_expert])
+    assert torch.equal(w2, down[logical_expert])
+    assert torch.equal(w2_scale, down_scale[logical_expert])
 
 
 def fp8_e4m3_quantize(tensor_bf16):
@@ -135,7 +192,7 @@ def mlp_torch(input, gate_proj, up_proj, down_proj):
     return torch.mm(intermediate, down_proj.t())
 
 
-def moe_torch(input, expert_ids, weights, gate_proj, up_proj, down_proj):
+def moe_torch(input, expert_ids, weights, gate_proj, up_proj, down_proj, physical_to_logical_map=None):
     cnts = expert_ids.new_zeros((expert_ids.shape[0], expert_num))
     cnts.scatter_(1, expert_ids, 1)
     tokens_per_expert = cnts.sum(dim=0)
@@ -148,7 +205,8 @@ def moe_torch(input, expert_ids, weights, gate_proj, up_proj, down_proj):
         if num_tokens == 0:
             continue
         tokens = sorted_tokens[start_idx:end_idx]
-        out = mlp_torch(tokens, gate_proj[i], up_proj[i], down_proj[i])
+        logical_expert = int(physical_to_logical_map[i]) if physical_to_logical_map is not None else i
+        out = mlp_torch(tokens, gate_proj[logical_expert], up_proj[logical_expert], down_proj[logical_expert])
         outputs.append(out)
         start_idx = end_idx
     outs = torch.cat(outputs, dim=0) if outputs else sorted_tokens.new_empty(0)
@@ -160,7 +218,11 @@ def moe_torch(input, expert_ids, weights, gate_proj, up_proj, down_proj):
 @pytest.mark.cpu
 @pytest.mark.parametrize("qlen,label", [(1, "Decode"), (16, "Prefill")])
 def test_avx2_fp8_accuracy(qlen, label):
-    physical_to_logical_map = torch.tensor(range(expert_num), dtype=torch.int64).contiguous()
+    if platform.machine().lower() in ("aarch64", "arm64"):
+        # Exercise propagation of the runtime expert remap into every NUMA TP.
+        physical_to_logical_map = torch.arange(expert_num - 1, -1, -1, dtype=torch.int64).contiguous()
+    else:
+        physical_to_logical_map = torch.arange(expert_num, dtype=torch.int64).contiguous()
     CPUInfer = kt_kernel_ext.CPUInfer(CPUINFER_PARAM)
 
     with torch.inference_mode():
@@ -212,9 +274,19 @@ def test_avx2_fp8_accuracy(qlen, label):
         config.quant_config.zero_point = False
         config.pool = CPUInfer.backend_
 
-        moe = kt_kernel_ext.moe.AVX2FP8_MOE(config)
+        moe = fp8_backend()(config)
         CPUInfer.submit(moe.load_weights_task(physical_to_logical_map.data_ptr()))
         CPUInfer.sync()
+        verify_arm_layerwise_staging(
+            CPUInfer,
+            moe,
+            gate_fp8,
+            gate_scales,
+            up_fp8,
+            up_scales,
+            down_fp8,
+            down_scales,
+        )
 
         print("\n--- %s (qlen=%d) ---" % (label, qlen))
         for i in range(validation_iter):
@@ -232,7 +304,15 @@ def test_avx2_fp8_accuracy(qlen, label):
             CPUInfer.sync()
 
             # Reference: use dequantized FP32 weights
-            t_output = moe_torch(input_data.float(), expert_ids, weights, gate_deq, up_deq, down_deq).to(torch.bfloat16)
+            t_output = moe_torch(
+                input_data.float(),
+                expert_ids,
+                weights,
+                gate_deq,
+                up_deq,
+                down_deq,
+                physical_to_logical_map,
+            ).to(torch.bfloat16)
 
             diff = torch.mean(torch.abs(output.float() - t_output.float())) / (torch.mean(torch.abs(t_output.float())) + 1e-8)
             print("  Iteration %d: diff = %.6f" % (i, diff.item()))

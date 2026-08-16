@@ -556,27 +556,38 @@ class NEON_MOE_BASE {
         for (; j + 8 <= n_end; j += 8) {
           armneon::v8f32 gate_val = armneon::load_bf16_to_fp32(gate_ptr + j);
           armneon::v8f32 up_val = armneon::load_bf16_to_fp32(up_ptr + j);
-          armneon::v8f32 result = armneon::act_fn(gate_val, up_val, swiglu_limit, swiglu_alpha);
+          armneon::v8f32 result;
+          if constexpr (requires(Derived& backend) {
+                          backend.custom_activation(gate_val, up_val, swiglu_limit, swiglu_alpha);
+                        }) {
+            result = derived()->custom_activation(gate_val, up_val, swiglu_limit, swiglu_alpha);
+          } else {
+            result = armneon::act_fn(gate_val, up_val, swiglu_limit, swiglu_alpha);
+          }
           armneon::store_fp32_to_bf16(gate_ptr + j, result);
         }
         // Scalar tail — mirror the vectorized swigluoai / silu paths in armneon::act_fn.
         for (; j < n_end; j++) {
           float g = ggml_bf16_to_fp32(gate_ptr[j]);
           float u = ggml_bf16_to_fp32(up_ptr[j]);
-          if (swiglu_alpha > 0.0f) {
-            if (swiglu_limit > 0.0f) {
-              g = std::min(std::max(g, -swiglu_limit), swiglu_limit);
-              u = std::min(std::max(u, -swiglu_limit), swiglu_limit);
-            }
-            float sigmoid_ga = 1.0f / (1.0f + expf(-g * swiglu_alpha));
-            gate_ptr[j] = ggml_fp32_to_bf16(g * sigmoid_ga * (u + 1.0f));
+          if constexpr (requires(Derived& backend) { backend.custom_activation(g, u, swiglu_limit, swiglu_alpha); }) {
+            gate_ptr[j] = ggml_fp32_to_bf16(derived()->custom_activation(g, u, swiglu_limit, swiglu_alpha));
           } else {
-            if (swiglu_limit > 0.0f) {
-              g = std::min(g, swiglu_limit);
-              u = std::min(std::max(u, -swiglu_limit), swiglu_limit);
+            if (swiglu_alpha > 0.0f) {
+              if (swiglu_limit > 0.0f) {
+                g = std::min(std::max(g, -swiglu_limit), swiglu_limit);
+                u = std::min(std::max(u, -swiglu_limit), swiglu_limit);
+              }
+              float sigmoid_ga = 1.0f / (1.0f + expf(-g * swiglu_alpha));
+              gate_ptr[j] = ggml_fp32_to_bf16(g * sigmoid_ga * (u + 1.0f));
+            } else {
+              if (swiglu_limit > 0.0f) {
+                g = std::min(g, swiglu_limit);
+                u = std::min(std::max(u, -swiglu_limit), swiglu_limit);
+              }
+              float sigmoid_g = 1.0f / (1.0f + expf(-g));
+              gate_ptr[j] = ggml_fp32_to_bf16(g * sigmoid_g * u);
             }
-            float sigmoid_g = 1.0f / (1.0f + expf(-g));
-            gate_ptr[j] = ggml_fp32_to_bf16(g * sigmoid_g * u);
           }
         }
       }

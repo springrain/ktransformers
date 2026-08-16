@@ -68,6 +68,8 @@ static const bool _is_plain_ = false;
 // ARM NEON backends — always available on aarch64
 #if defined(__aarch64__)
 #include "operators/arm/bf16-moe.hpp"
+#include "operators/arm/fp8-moe.hpp"
+#include "operators/arm/mxfp8-moe.hpp"
 #endif
 #if defined(USE_SYCL)
 #include "operators/sycl/gptq_int4_sycl-moe.hpp"
@@ -881,6 +883,8 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
 // ARM NEON backends — available on all aarch64 hosts (e.g. Ampere One)
 #if defined(__aarch64__)
   bind_moe_module<NEON_BF16_MOE_TP<armneon::GemmKernelNeonBF16>>(moe_module, "NEONBF16_MOE");
+  bind_moe_module<NEON_FP8_MOE_TP<armneon::GemmKernelNeonFP8>>(moe_module, "NEONFP8_MOE");
+  bind_moe_module<NEON_MXFP8_MOE_TP<armneon::GemmKernelNeonMXFP8>>(moe_module, "NEONMXFP8_MOE");
 #endif
 #if defined(USE_SYCL)
   bind_moe_module<SYCL_GPTQ_INT4_MOE_TP<sycl_int4::GemmKernelSYCLGPTQInt4>>(moe_module, "SYCLGPTQInt4_MOE");

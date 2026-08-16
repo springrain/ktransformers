@@ -39,6 +39,8 @@ AVX2MXFP4_MOE = getattr(_moe_mod, "AVX2MXFP4_MOE", None)
 AVX2MXFP8_MOE = getattr(_moe_mod, "AVX2MXFP8_MOE", None)
 AVXVNNI256GPTQInt4_MOE = getattr(_moe_mod, "AVXVNNI256GPTQInt4_MOE", None)
 AVXVNNI256RawInt4_MOE = getattr(_moe_mod, "AVXVNNI256RawInt4_MOE", None)
+NEONFP8_MOE = getattr(_moe_mod, "NEONFP8_MOE", None)
+NEONMXFP8_MOE = getattr(_moe_mod, "NEONMXFP8_MOE", None)
 NEONBF16_MOE = getattr(_moe_mod, "NEONBF16_MOE", None)
 SYCLGPTQInt4_MOE = getattr(_moe_mod, "SYCLGPTQInt4_MOE", None)
 
@@ -59,10 +61,142 @@ _HAS_AVX2_MXFP4_SUPPORT = AVX2MXFP4_MOE is not None
 _HAS_AVX2_MXFP8_SUPPORT = AVX2MXFP8_MOE is not None
 _HAS_AVXVNNI256_GPTQ_INT4_SUPPORT = AVXVNNI256GPTQInt4_MOE is not None
 _HAS_AVXVNNI256_RAW_INT4_SUPPORT = AVXVNNI256RawInt4_MOE is not None
+_HAS_NEON_FP8_SUPPORT = NEONFP8_MOE is not None
+_HAS_NEON_MXFP8_SUPPORT = NEONMXFP8_MOE is not None
 _HAS_NEON_BF16_SUPPORT = NEONBF16_MOE is not None
 _HAS_SYCL_GPTQ_INT4_SUPPORT = SYCLGPTQInt4_MOE is not None
 _AVXVNNI256_GPTQ_INT4_MAX_GROUP_SIZE = 256
 _AVXVNNI256_RAW_INT4_MAX_GROUP_SIZE = 256
+
+
+def _validate_block_fp8_layout(
+    weights,
+    scales,
+    projection: str,
+    expected_weight_shape,
+    block_size: int = 128,
+) -> None:
+    """Reject layouts that the block-FP8 kernels would otherwise misinterpret."""
+    if len(weights) != len(scales):
+        raise ValueError(
+            f"FP8 {projection}: weight/scale expert counts differ "
+            f"({len(weights)} != {len(scales)})"
+        )
+    for expert_id, (weight, scale) in enumerate(zip(weights, scales)):
+        if (
+            weight.ndim != 2
+            or weight.element_size() != 1
+            or weight.dtype not in (torch.uint8, torch.float8_e4m3fn)
+        ):
+            raise ValueError(
+                f"FP8 {projection} expert {expert_id}: expected a 2-D, one-byte E4M3FN "
+                f"weight tensor, got shape={tuple(weight.shape)}, dtype={weight.dtype}"
+            )
+        if tuple(weight.shape) != tuple(expected_weight_shape):
+            raise ValueError(
+                f"FP8 {projection} expert {expert_id}: expected weight shape "
+                f"{tuple(expected_weight_shape)}, got {tuple(weight.shape)}"
+            )
+        expected = (
+            (int(weight.shape[0]) + block_size - 1) // block_size,
+            (int(weight.shape[1]) + block_size - 1) // block_size,
+        )
+        if scale.dtype != torch.float32 or scale.ndim != 2 or tuple(scale.shape) != expected:
+            raise ValueError(
+                f"FP8 {projection} expert {expert_id}: NEON/AVX block FP8 requires "
+                f"a float32 {block_size}x{block_size} scale tensor with shape {expected}, "
+                f"got shape={tuple(scale.shape)}, dtype={scale.dtype}. "
+                "Per-channel FP8 is a different format."
+            )
+
+
+def _validate_mxfp8_layout(
+    weights,
+    scales,
+    projection: str,
+    expected_weight_shape,
+    group_size: int = 32,
+) -> None:
+    """Validate native MXFP8 E4M3FN + row-wise UE8M0 group scales."""
+    if len(weights) != len(scales):
+        raise ValueError(
+            f"MXFP8 {projection}: weight/scale expert counts differ "
+            f"({len(weights)} != {len(scales)})"
+        )
+    for expert_id, (weight, scale) in enumerate(zip(weights, scales)):
+        if weight.dtype != torch.uint8 or weight.ndim != 2 or weight.element_size() != 1:
+            raise ValueError(
+                f"MXFP8 {projection} expert {expert_id}: expected a 2-D, one-byte E4M3FN "
+                f"weight tensor, got shape={tuple(weight.shape)}, dtype={weight.dtype}"
+            )
+        if tuple(weight.shape) != tuple(expected_weight_shape):
+            raise ValueError(
+                f"MXFP8 {projection} expert {expert_id}: expected weight shape "
+                f"{tuple(expected_weight_shape)}, got {tuple(weight.shape)}"
+            )
+        n, k = (int(weight.shape[0]), int(weight.shape[1]))
+        if k % group_size != 0:
+            raise ValueError(
+                f"MXFP8 {projection} expert {expert_id}: K={k} must be divisible by "
+                f"group_size={group_size}"
+            )
+        expected = (n, k // group_size)
+        if scale.dtype != torch.uint8 or scale.ndim != 2 or tuple(scale.shape) != expected:
+            raise ValueError(
+                f"MXFP8 {projection} expert {expert_id}: expected uint8 UE8M0 scales "
+                f"with shape {expected}, got shape={tuple(scale.shape)}, dtype={scale.dtype}"
+            )
+
+
+def _validate_expert_mapping(
+    physical_to_logical_map_cpu: torch.Tensor,
+    expected_physical_experts: int,
+    projection_weights,
+) -> int:
+    """Validate EPLB mapping without conflating physical and logical experts."""
+    if not isinstance(physical_to_logical_map_cpu, torch.Tensor):
+        raise TypeError("physical_to_logical_map_cpu must be a torch.Tensor")
+    if physical_to_logical_map_cpu.device.type != "cpu":
+        raise ValueError("physical_to_logical_map_cpu must reside on CPU")
+    if physical_to_logical_map_cpu.dtype != torch.int64:
+        raise ValueError(
+            "physical_to_logical_map_cpu must use torch.int64 because the native "
+            f"backend reads uint64 IDs, got {physical_to_logical_map_cpu.dtype}"
+        )
+    if physical_to_logical_map_cpu.ndim != 1:
+        raise ValueError(
+            "physical_to_logical_map_cpu must be one-dimensional, got shape="
+            f"{tuple(physical_to_logical_map_cpu.shape)}"
+        )
+    if not physical_to_logical_map_cpu.is_contiguous():
+        raise ValueError("physical_to_logical_map_cpu must be contiguous")
+    if physical_to_logical_map_cpu.numel() != expected_physical_experts:
+        raise ValueError(
+            "physical_to_logical_map_cpu length must match the native physical "
+            f"expert count ({physical_to_logical_map_cpu.numel()} != "
+            f"{expected_physical_experts})"
+        )
+
+    logical_counts = {name: len(weights) for name, weights in projection_weights.items()}
+    if not logical_counts or len(set(logical_counts.values())) != 1:
+        raise ValueError(
+            "FP8/MXFP8 expert projections contain different logical expert counts: "
+            f"{logical_counts}"
+        )
+    logical_experts = next(iter(logical_counts.values()))
+    if logical_experts <= 0:
+        raise ValueError("FP8/MXFP8 checkpoint contains no logical experts")
+
+    if physical_to_logical_map_cpu.numel():
+        min_id = int(physical_to_logical_map_cpu.min().item())
+        max_id = int(physical_to_logical_map_cpu.max().item())
+        if min_id < 0 or max_id >= logical_experts:
+            raise ValueError(
+                "physical_to_logical_map_cpu contains an out-of-range logical "
+                f"expert ID: range=[{min_id}, {max_id}], checkpoint experts="
+                f"{logical_experts}"
+            )
+    return logical_experts
 
 
 def _host_has_cpu_flag(*flag_names: str) -> bool:
@@ -210,9 +344,9 @@ def _select_mxfp4_backend():
 
 
 def _select_mxfp8_backend():
-    """Select MXFP8 backend: AMX/AVX-512 (preferred) > AVX2 (fallback).
+    """Select MXFP8 backend: AMX/AVX-512 > AVX2 > ARM NEON.
 
-    Override with KT_MXFP8_BACKEND=avx2|amx.
+    Override with KT_MXFP8_BACKEND=amx|avx2|neon.
     Returns None if no MXFP8 backend is available.
     """
     forced = os.getenv("KT_MXFP8_BACKEND", "").strip().lower()
@@ -238,12 +372,22 @@ def _select_mxfp8_backend():
             )
         return AVX2MXFP8_MOE
 
+    if forced == "neon":
+        if not _HAS_NEON_MXFP8_SUPPORT:
+            raise RuntimeError(
+                "KT_MXFP8_BACKEND=neon requested, but NEONMXFP8_MOE is not compiled in. "
+                "Recompile on AArch64 with the ARM backend enabled."
+            )
+        return NEONMXFP8_MOE
+
     # Auto-select: prefer AMX iff the .so was built with it AND the runtime CPU has AMX.
     # Compile-time-only check would SIGILL on AVX-512 CPUs lacking AMX (pre-Sapphire Rapids).
     if _HAS_MXFP8_SUPPORT and _host_has_cpu_flag("amx_tile", "amx_bf16"):
         return AMXMXFP8_KGroup_MOE
     if _HAS_AVX2_MXFP8_SUPPORT:
         return AVX2MXFP8_MOE
+    if _HAS_NEON_MXFP8_SUPPORT:
+        return NEONMXFP8_MOE
     return None
 
 
@@ -592,12 +736,13 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 "AVX-VNNI-256 will be selected automatically when available on the current CPU.\n"
                 "Please recompile kt_kernel_ext with AVX512 or AVX2 enabled."
             )
-        if method == "FP8" and not _HAS_FP8_SUPPORT and not _HAS_AVX2_FP8_SUPPORT:
+        if method == "FP8" and not (_HAS_FP8_SUPPORT or _HAS_AVX2_FP8_SUPPORT or _HAS_NEON_FP8_SUPPORT):
             raise RuntimeError(
                 "FP8 backend not available. Required ISA:\n"
                 "  - AVX512F + AVX512BW + AVX512_BF16 + AVX512_VBMI (for AMX), or\n"
-                "  - AVX2 + FMA (for AVX2 fallback)\n"
-                "Please recompile kt_kernel_ext with AVX512 + BF16 + VBMI enabled."
+                "  - AVX2 + FMA (for AVX2 fallback), or\n"
+                "  - AArch64 NEON (BF16 BFDOT preferred)\n"
+                "Please recompile kt_kernel_ext with the appropriate CPU backend enabled."
             )
         if method == "FP8_PERCHANNEL" and not _HAS_FP8_PERCHANNEL_SUPPORT:
             raise RuntimeError(
@@ -631,11 +776,12 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 "  - AVX2 + FMA (for AVX2 fallback backend)\n"
                 "Please recompile kt_kernel_ext with one of the above enabled."
             )
-        if method == "MXFP8" and not (_HAS_MXFP8_SUPPORT or _HAS_AVX2_MXFP8_SUPPORT):
+        if method == "MXFP8" and not (_HAS_MXFP8_SUPPORT or _HAS_AVX2_MXFP8_SUPPORT or _HAS_NEON_MXFP8_SUPPORT):
             raise RuntimeError(
                 "MXFP8 backend not available. Required ISA (any one of):\n"
                 "  - AVX512F + AVX512BW + AVX512_BF16 + AVX512_VBMI (for AMX/AVX-512 backend)\n"
                 "  - AVX2 + FMA (for AVX2 fallback backend)\n"
+                "  - AArch64 NEON (BF16 BFDOT preferred)\n"
                 "Please recompile kt_kernel_ext with one of the above enabled."
             )
 
@@ -769,16 +915,14 @@ class NativeMoEWrapper(BaseMoEWrapper):
             if self.method == "RAWINT4":
                 assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 scales for RAWINT4"
             elif self.method == "FP8":
-                if self.gate_scales[0].dtype != torch.float32:
-                    self.gate_scales = [t.to(torch.float32).contiguous() for t in weights["gate_scale"]]
-                    self.up_scales = [t.to(torch.float32).contiguous() for t in weights["up_scale"]]
-                    self.down_scales = [t.to(torch.float32).contiguous() for t in weights["down_scale"]]
+                self.gate_scales = [t.to(torch.float32).contiguous() for t in weights["gate_scale"]]
+                self.up_scales = [t.to(torch.float32).contiguous() for t in weights["up_scale"]]
+                self.down_scales = [t.to(torch.float32).contiguous() for t in weights["down_scale"]]
                 assert self.gate_scales[0].dtype == torch.float32, "Expected float32 scales for FP8"
             elif self.method == "FP8_PERCHANNEL":
-                if self.gate_scales[0].dtype != torch.float32:
-                    self.gate_scales = [t.to(torch.float32).contiguous() for t in weights["gate_scale"]]
-                    self.up_scales = [t.to(torch.float32).contiguous() for t in weights["up_scale"]]
-                    self.down_scales = [t.to(torch.float32).contiguous() for t in weights["down_scale"]]
+                self.gate_scales = [t.to(torch.float32).contiguous() for t in weights["gate_scale"]]
+                self.up_scales = [t.to(torch.float32).contiguous() for t in weights["up_scale"]]
+                self.down_scales = [t.to(torch.float32).contiguous() for t in weights["down_scale"]]
                 assert self.gate_scales[0].dtype == torch.float32, "Expected float32 scales for FP8_PERCHANNEL"
             elif self.method == "MXFP4":
                 # ue8m0 is losslessly representable in bf16 (8-bit exponent, 0 mantissa);
@@ -787,6 +931,65 @@ class NativeMoEWrapper(BaseMoEWrapper):
             elif self.method == "MXFP8":
                 # ue8m0 scales stay as uint8; C++ convert_ue8m0_to_fp32 handles conversion.
                 assert self.gate_scales[0].dtype == torch.uint8, "Expected uint8 (ue8m0) scales for MXFP8"
+
+        if self.method in ("FP8", "MXFP8"):
+            _validate_expert_mapping(
+                physical_to_logical_map_cpu,
+                self.num_experts,
+                {
+                    "gate": self.gate_weights,
+                    "up": self.up_weights,
+                    "down": self.down_weights,
+                },
+            )
+            # C++ retains this pointer for layerwise expert staging after the
+            # initial load task, so keep the owning tensor alive on the wrapper.
+            self.physical_to_logical_map_cpu = physical_to_logical_map_cpu
+
+        if self.method == "FP8":
+            if self.loader.is_per_channel():
+                raise ValueError(
+                    "method='FP8' only supports 128x128 block-wise FP8, but this checkpoint "
+                    "contains per-channel scales. Use method='FP8_PERCHANNEL' on a supported "
+                    "x86 backend; ARM NEON per-channel FP8 is not implemented."
+                )
+            _validate_block_fp8_layout(
+                self.gate_weights,
+                self.gate_scales,
+                "gate",
+                (self.moe_intermediate_size, self.hidden_size),
+            )
+            _validate_block_fp8_layout(
+                self.up_weights,
+                self.up_scales,
+                "up",
+                (self.moe_intermediate_size, self.hidden_size),
+            )
+            _validate_block_fp8_layout(
+                self.down_weights,
+                self.down_scales,
+                "down",
+                (self.hidden_size, self.moe_intermediate_size),
+            )
+        elif self.method == "MXFP8":
+            _validate_mxfp8_layout(
+                self.gate_weights,
+                self.gate_scales,
+                "gate",
+                (self.moe_intermediate_size, self.hidden_size),
+            )
+            _validate_mxfp8_layout(
+                self.up_weights,
+                self.up_scales,
+                "up",
+                (self.moe_intermediate_size, self.hidden_size),
+            )
+            _validate_mxfp8_layout(
+                self.down_weights,
+                self.down_scales,
+                "down",
+                (self.hidden_size, self.moe_intermediate_size),
+            )
 
         t2 = time.time()
 
@@ -884,7 +1087,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
             if backend_cls is None:
                 raise RuntimeError(
                     "No MXFP8 backend available after runtime selection. "
-                    "Compile with AVX512+VBMI (AMXMXFP8_KGroup_MOE) or AVX2 (AVX2MXFP8_MOE)."
+                    "Compile with AVX512+VBMI, AVX2, or AArch64 NEON support."
                 )
             self.moe = backend_cls(moe_config)
         elif self.method == "FP8":
@@ -895,10 +1098,11 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 self.moe = AMXFP8_MOE(moe_config)
             elif _HAS_AVX2_FP8_SUPPORT:
                 self.moe = AVX2FP8_MOE(moe_config)
+            elif _HAS_NEON_FP8_SUPPORT:
+                self.moe = NEONFP8_MOE(moe_config)
             else:
                 raise RuntimeError(
-                    "FP8 MoE is not available in this build: no AMX FP8 or AVX2 FP8 "
-                    "kernel was compiled in (on ARM64, use method='BF16' instead)."
+                    "FP8 MoE is not available in this build: no AMX, AVX2, or NEON FP8 kernel was compiled in."
                 )
         elif self.method == "FP8_PERCHANNEL":
             moe_config.quant_config.bits = 8
