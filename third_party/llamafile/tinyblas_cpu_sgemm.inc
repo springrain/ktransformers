@@ -236,10 +236,9 @@ bool llamafile_sgemm_impl(long m, long n, long k, const void* A, long lda, const
                 k, (const block_mxfp4*)A, lda, (const block_q8_0*)B, ldb, C, ldc, ith, nth};
             tb.matmul(m, n, task);
             return true;
-#elif defined(__aarch64__)
-            // Generic ARM64 builds without dot-product instructions retain a
-            // correctness fallback through llama.cpp's architecture-specific
-            // MXFP4 x Q8_0 vector dot implementation.
+#elif defined(__aarch64__) || defined(__x86_64__) || defined(_M_X64)
+            // Generic ARM64 and x86 builds use llama.cpp's architecture-
+            // specific MXFP4 x Q8_0 vector dot implementation.
             if (task != GGML_TASK_TYPE_COMPUTE)
                 return true;
 
