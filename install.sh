@@ -160,7 +160,7 @@ PY
   python3 -m pip uninstall -y \
     flashinfer-python flashinfer-cubin flashinfer-jit-cache \
     quack-kernels flash-attn-4 \
-    sglang sglang-kt sgl-kernel sglang-kernel transformers-kt
+    sglang sglang-kt sgl-kernel transformers-kt
 
   # This editable distribution is installed first so SGLang's exact
   # flashinfer-python requirement is satisfied locally, not from PyPI.
