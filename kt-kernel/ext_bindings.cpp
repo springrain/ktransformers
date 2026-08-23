@@ -69,6 +69,7 @@ static const bool _is_plain_ = false;
 #if defined(__aarch64__)
 #include "operators/arm/bf16-moe.hpp"
 #include "operators/arm/fp8-moe.hpp"
+#include "operators/arm/mxfp4-moe.hpp"
 #include "operators/arm/mxfp8-moe.hpp"
 #endif
 #if defined(USE_SYCL)
@@ -884,6 +885,7 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
 #if defined(__aarch64__)
   bind_moe_module<NEON_BF16_MOE_TP<armneon::GemmKernelNeonBF16>>(moe_module, "NEONBF16_MOE");
   bind_moe_module<NEON_FP8_MOE_TP<armneon::GemmKernelNeonFP8>>(moe_module, "NEONFP8_MOE");
+  bind_moe_module<NEON_MXFP4_MOE_TP<armneon::GemmKernelNeonMXFP4>>(moe_module, "NEONMXFP4_MOE");
   bind_moe_module<NEON_MXFP8_MOE_TP<armneon::GemmKernelNeonMXFP8>>(moe_module, "NEONMXFP8_MOE");
 #endif
 #if defined(USE_SYCL)

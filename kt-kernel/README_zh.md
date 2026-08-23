@@ -91,12 +91,14 @@ conda activate kt-kernel
 | **RAWINT4** | AVX512F + AVX512BW | Intel Skylake-X (2017+)、Ice Lake、Cascade Lake | 支持 VNNI/BF16 软件回退 |
 | **AMXINT4/INT8** | AMX | Intel Sapphire Rapids (2023+) | 最佳性能，需要 AMX 硬件 |
 | **NEON BF16** | AArch64 (NEON) | Ampere One、Neoverse N/V 系列 | ARM64 原生 BF16 MoE；有 BFDOT 时自动使用 |
+| **NEON MXFP4** | AArch64（Ampere One 使用 BFDOT） | Ampere One、Neoverse V2+ | packed E2M1 权重 + group-32 UE8M0 scale，CPU 侧直接解码 FP4 |
 
 **ARM64（aarch64）平台说明：**
 - `./install.sh` 会识别 ARM64 主机并跳过全部 AMX/AVX512 选项，直接使用 `-mcpu=native` 构建
 - ARM64 构建在 `kt_kernel_ext.moe` 中额外提供 `NEONBF16_MOE`；Python 侧 `BF16` 方法的回退链为 AMX → AVX2 → NEON，ARM 机器上无需任何配置
 - 运行时 CPU 检测返回 `arm` 变体（`KT_KERNEL_CPU_VARIANT=arm` 可强制指定）
-- 量化格式（GGUF/IQK 等）在 ARM64 上继续通过 `LLAMAFILE` 后端运行
+- 原生 packed MXFP4 safetensors 可使用 `--kt-method MXFP4`，ARM64 自动选择 `NEONMXFP4_MOE`
+- GGUF/IQK 等量化格式继续通过 `LLAMAFILE` 后端运行
 - ARM64 可移植构建：`CPUINFER_CPU_INSTRUCT=GENERIC ./install.sh build --manual`（armv8-a 基线）；再加 `CPUINFER_ARM_CPU=ampere1a` 可按微架构（`-mcpu`）调优
 
 **软件回退支持（AVX512 后端）：**
@@ -177,7 +179,7 @@ LLAMAFILE 在 CPU 侧直接使用预量化的 **GGUF** 权重，无需运行 `co
 在通常的 SGLang 启动参数基础上，增加如下 KT-Kernel 相关参数，以启用 CPU-GPU 异构推理：
 
 **需要增加的 KT-Kernel 参数：**
-- `--kt-method`：后端类型（AMXINT4、AMXINT8、或 LLAMAFILE）
+- `--kt-method`：后端类型（AMXINT4、AMXINT8、MXFP4、或 LLAMAFILE）
 - `--kt-weight-path`：转换后的 CPU 权重路径
 - `--kt-cpuinfer`：CPU 推理线程数（建议设为物理核数）
 - `--kt-threadpool-count`：线程池数量（建议设为 NUMA 节点个数）
@@ -316,7 +318,7 @@ python -m sglang.launch_server \
 
 | 参数 | 描述 | 示例值 |
 |------|------|--------|
-| `--kt-method` | CPU 推理后端类型 | `AMXINT4`、`AMXINT8`、`RAWINT4` 或 `LLAMAFILE` |
+| `--kt-method` | CPU 推理后端类型 | `AMXINT4`、`AMXINT8`、`MXFP4`、`RAWINT4` 或 `LLAMAFILE` |
 | `--kt-weight-path` | 量化后的 CPU 权重路径 | `/path/to/cpu-weights` |
 | `--kt-cpuinfer` | CPU 推理线程数 | `64`（根据 CPU 核心数调整） |
 | `--kt-threadpool-count` | 并行执行的线程池数量 | `2`（通常为 1–4） |
@@ -330,6 +332,7 @@ python -m sglang.launch_server \
   - `AMXINT4`：在 AMX CPU 上 INT4 量化时具有最佳性能（但可能对某些模型有较大精度影响，例如 Qwen3-30B-A3B）
   - `AMXINT8`：在 AMX CPU 上提供更高精度的 INT8 量化方案
   - `RAWINT4`：CPU 和 GPU 共享原生 INT4 权重（仅限 AMX 后端，目前仅支持 Kimi-K2-Thinking 模型）。详见 [Kimi-K2-Thinking 原生推理教程](../doc/en/Kimi-K2-Thinking-Native.md)。
+  - `MXFP4`：原生 packed E2M1/UE8M0 safetensors；ARM64 使用 NEON packed-decode 后端
   - `LLAMAFILE`：基于 AVX2/AVX512 的通用 CPU 后端，性能较 AMX 略低，但适用范围更广
 
 - **`kt-cpuinfer`**：设置为 **物理核数**（不是线程数）。

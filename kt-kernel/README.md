@@ -192,12 +192,14 @@ Simply run the install script - it will auto-detect your CPU and optimize for be
 | **FP8** | AVX512F + AVX512BW + AVX512_BF16 + AVX512_VBMI | Intel Cooper Lake (2020+), Sapphire Rapids (2023+); AMD Zen 4+ (e.g., EPYC 9355) | Native Precision (e.g., DeepSeek V3.2, MiniMax M2.1) |
 | **BF16** | AVX512F + AVX512BW + AVX512_BF16 | Intel Cooper Lake (2020+), Sapphire Rapids (2023+); AMD Zen 4+ (e.g., EPYC 9355) | Native Precision (e.g., Qwen3-235B-A22B, GLM-4.7) |
 | **NEON BF16** | AArch64 (NEON) | Ampere One, Neoverse N/V series | Native ARM64 BF16 MoE; uses BFDOT when available |
+| **NEON MXFP4** | AArch64 (NEON; BFDOT on Ampere One) | Ampere One, Neoverse V2+ | Packed E2M1 weights with group-32 UE8M0 scales; decodes FP4 directly in the CPU kernel |
 
 **ARM64 (aarch64) notes:**
 - `./install.sh` detects ARM64 hosts, skips all AMX/AVX512 toggles and builds with `-mcpu=native`
 - ARM64 builds additionally expose `NEONBF16_MOE` in `kt_kernel_ext.moe`; the Python `BF16` method falls back AMX -> AVX2 -> NEON automatically
 - Runtime CPU detection reports the `arm` variant (force it with `KT_KERNEL_CPU_VARIANT=arm`)
-- Quantized formats (GGUF/IQK etc.) keep working on ARM64 through the `LLAMAFILE` backend
+- Native packed MXFP4 safetensors can use `--kt-method MXFP4` through `NEONMXFP4_MOE`; the CPU kernel keeps nibble-packed weights and decodes FP4 in registers
+- Quantized GGUF/IQK formats keep working on ARM64 through the `LLAMAFILE` backend
 - Portable ARM64 builds: `CPUINFER_CPU_INSTRUCT=GENERIC ./install.sh build --manual` (baseline armv8-a), or add `CPUINFER_ARM_CPU=ampere1a` to tune `-mcpu` for a specific microarchitecture
 
 **Software Fallback Support (AVX512 backends):**
@@ -324,7 +326,7 @@ LLAMAFILE uses pre-quantized **GGUF** weights on the CPU side directly, without 
 Start the SGLang server with your normal SGLang parameters, and add the following KT-Kernel specific parameters to enable CPU-GPU heterogeneous inference:
 
 **KT-Kernel Parameters to Add:**
-- `--kt-method`: Backend method (AMXINT4, AMXINT8, or LLAMAFILE)
+- `--kt-method`: Backend method (AMXINT4, AMXINT8, MXFP4, or LLAMAFILE)
 - `--kt-weight-path`: Path to the converted CPU weights
 - `--kt-cpuinfer`: Number of CPU inference threads (set to physical cores)
 - `--kt-threadpool-count`: Number of thread pools (set to NUMA node count)
@@ -505,7 +507,7 @@ python -m sglang.launch_server \
 
 | Parameter | Description | Example Value |
 |-----------|-------------|---------------|
-| `--kt-method` | CPU inference backend method | `AMXINT4`, `AMXINT8`, `RAWINT4`, `FP8`, `FP8_PERCHANNEL`, `BF16` or `LLAMAFILE` |
+| `--kt-method` | CPU inference backend method | `AMXINT4`, `AMXINT8`, `MXFP4`, `RAWINT4`, `FP8`, `FP8_PERCHANNEL`, `BF16` or `LLAMAFILE` |
 | `--kt-weight-path` | Path to quantized CPU weights | `/path/to/cpu-weights` |
 | `--kt-cpuinfer` | Number of CPU inference threads | `64` (adjust based on CPU cores) |
 | `--kt-threadpool-count` | Number of thread pools for parallel execution | `2` (typically 1-4) |
@@ -523,6 +525,7 @@ python -m sglang.launch_server \
   - `RAWINT4`: Native INT4 weights shared by CPU and GPU (currently supports Kimi-K2-Thinking model). See [Kimi-K2-Thinking Native Tutorial](../doc/en/kt-kernel/Kimi-K2-Thinking-Native.md) for details.
   - `FP8`, `FP8_PERCHANNEL`: FP8 weights shared by CPU and GPU
   - `BF16`: BF16 weights shared by CPU and GPU
+  - `MXFP4`: Native packed E2M1/UE8M0 safetensors; on AArch64 uses the NEON packed-decode backend
   - `LLAMAFILE`: GGUF-based backend
 
 - **`kt-cpuinfer`**: Set to the number of **physical CPU cores** (not hyperthreads).

@@ -37,6 +37,7 @@ AVX2GPTQInt4_MOE = getattr(_moe_mod, "AVX2GPTQInt4_MOE", None)
 AVX2RawInt4_MOE = getattr(_moe_mod, "AVX2RawInt4_MOE", None)
 AVX2MXFP4_MOE = getattr(_moe_mod, "AVX2MXFP4_MOE", None)
 AVX2MXFP8_MOE = getattr(_moe_mod, "AVX2MXFP8_MOE", None)
+NEONMXFP4_MOE = getattr(_moe_mod, "NEONMXFP4_MOE", None)
 AVXVNNI256GPTQInt4_MOE = getattr(_moe_mod, "AVXVNNI256GPTQInt4_MOE", None)
 AVXVNNI256RawInt4_MOE = getattr(_moe_mod, "AVXVNNI256RawInt4_MOE", None)
 NEONFP8_MOE = getattr(_moe_mod, "NEONFP8_MOE", None)
@@ -59,6 +60,7 @@ _HAS_AVX2_GPTQ_INT4_SUPPORT = AVX2GPTQInt4_MOE is not None
 _HAS_AVX2_RAWINT4_SUPPORT = AVX2RawInt4_MOE is not None
 _HAS_AVX2_MXFP4_SUPPORT = AVX2MXFP4_MOE is not None
 _HAS_AVX2_MXFP8_SUPPORT = AVX2MXFP8_MOE is not None
+_HAS_NEON_MXFP4_SUPPORT = NEONMXFP4_MOE is not None
 _HAS_AVXVNNI256_GPTQ_INT4_SUPPORT = AVXVNNI256GPTQInt4_MOE is not None
 _HAS_AVXVNNI256_RAW_INT4_SUPPORT = AVXVNNI256RawInt4_MOE is not None
 _HAS_NEON_FP8_SUPPORT = NEONFP8_MOE is not None
@@ -148,6 +150,46 @@ def _validate_mxfp8_layout(
             )
 
 
+def _validate_mxfp4_layout(
+    weights,
+    scales,
+    projection: str,
+    expected_weight_shape,
+    group_size: int = 32,
+) -> None:
+    """Validate native nibble-packed MXFP4 weights and BF16 UE8M0 scales."""
+    if len(weights) != len(scales):
+        raise ValueError(
+            f"MXFP4 {projection}: weight/scale expert counts differ "
+            f"({len(weights)} != {len(scales)})"
+        )
+    for expert_id, (weight, scale) in enumerate(zip(weights, scales)):
+        if weight.dtype != torch.uint8 or weight.ndim != 2 or weight.element_size() != 1:
+            raise ValueError(
+                f"MXFP4 {projection} expert {expert_id}: expected a 2-D packed uint8 "
+                f"weight tensor, got shape={tuple(weight.shape)}, dtype={weight.dtype}"
+            )
+        expected = (int(expected_weight_shape[0]), int(expected_weight_shape[1]) // 2)
+        if tuple(weight.shape) != expected:
+            raise ValueError(
+                f"MXFP4 {projection} expert {expert_id}: expected packed weight shape "
+                f"{expected} for logical shape {tuple(expected_weight_shape)}, "
+                f"got {tuple(weight.shape)}"
+            )
+        n, packed_k = (int(weight.shape[0]), int(weight.shape[1]))
+        if (packed_k * 2) % group_size != 0:
+            raise ValueError(
+                f"MXFP4 {projection} expert {expert_id}: logical K={packed_k * 2} "
+                f"must be divisible by group_size={group_size}"
+            )
+        expected_scale = (n, packed_k * 2 // group_size)
+        if scale.dtype != torch.bfloat16 or scale.ndim != 2 or tuple(scale.shape) != expected_scale:
+            raise ValueError(
+                f"MXFP4 {projection} expert {expert_id}: expected BF16 UE8M0 scales "
+                f"with shape {expected_scale}, got shape={tuple(scale.shape)}, dtype={scale.dtype}"
+            )
+
+
 def _validate_expert_mapping(
     physical_to_logical_map_cpu: torch.Tensor,
     expected_physical_experts: int,
@@ -180,7 +222,7 @@ def _validate_expert_mapping(
     logical_counts = {name: len(weights) for name, weights in projection_weights.items()}
     if not logical_counts or len(set(logical_counts.values())) != 1:
         raise ValueError(
-            "FP8/MXFP8 expert projections contain different logical expert counts: "
+            "FP8/MXFP4/MXFP8 expert projections contain different logical expert counts: "
             f"{logical_counts}"
         )
     logical_experts = next(iter(logical_counts.values()))
@@ -313,9 +355,9 @@ def _select_rawint4_backend(group_size: Optional[int] = None):
 
 
 def _select_mxfp4_backend():
-    """Select MXFP4 backend: AMX/AVX-512 (preferred) > AVX2 (fallback).
+    """Select MXFP4 backend: AMX > AVX2 > ARM NEON.
 
-    Override with KT_MXFP4_BACKEND=avx2|amx.
+    Override with KT_MXFP4_BACKEND=amx|avx2|neon.
     Returns None if no MXFP4 backend is available.
     """
     forced = os.getenv("KT_MXFP4_BACKEND", "").strip().lower()
@@ -336,10 +378,20 @@ def _select_mxfp4_backend():
             )
         return AVX2MXFP4_MOE
 
+    if forced == "neon":
+        if not _HAS_NEON_MXFP4_SUPPORT:
+            raise RuntimeError(
+                "KT_MXFP4_BACKEND=neon requested, but NEONMXFP4_MOE is not "
+                "compiled in. Rebuild kt-kernel on AArch64."
+            )
+        return NEONMXFP4_MOE
+
     if _HAS_MXFP4_SUPPORT:
         return AMXFP4_KGroup_MOE
     if _HAS_AVX2_MXFP4_SUPPORT:
         return AVX2MXFP4_MOE
+    if _HAS_NEON_MXFP4_SUPPORT:
+        return NEONMXFP4_MOE
     return None
 
 
@@ -769,11 +821,14 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 "SYCL_GPTQ_INT4 backend not available. Rebuild kt_kernel_ext with "
                 "CPUINFER_USE_SYCL=1 using a SYCL compiler such as icpx."
             )
-        if method == "MXFP4" and not (_HAS_MXFP4_SUPPORT or _HAS_AVX2_MXFP4_SUPPORT):
+        if method == "MXFP4" and not (
+            _HAS_MXFP4_SUPPORT or _HAS_AVX2_MXFP4_SUPPORT or _HAS_NEON_MXFP4_SUPPORT
+        ):
             raise RuntimeError(
                 "MXFP4 backend not available. Required ISA (any one of):\n"
                 "  - AVX512F + AVX512BW + AVX512_BF16 (for AMX/AVX-512 backend)\n"
                 "  - AVX2 + FMA (for AVX2 fallback backend)\n"
+                "  - AArch64 NEON/BFDOT (for ARM backend)\n"
                 "Please recompile kt_kernel_ext with one of the above enabled."
             )
         if method == "MXFP8" and not (_HAS_MXFP8_SUPPORT or _HAS_AVX2_MXFP8_SUPPORT or _HAS_NEON_MXFP8_SUPPORT):
@@ -932,7 +987,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 # ue8m0 scales stay as uint8; C++ convert_ue8m0_to_fp32 handles conversion.
                 assert self.gate_scales[0].dtype == torch.uint8, "Expected uint8 (ue8m0) scales for MXFP8"
 
-        if self.method in ("FP8", "MXFP8"):
+        if self.method in ("FP8", "MXFP4", "MXFP8"):
             _validate_expert_mapping(
                 physical_to_logical_map_cpu,
                 self.num_experts,
@@ -944,7 +999,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
             )
             # C++ retains this pointer for layerwise expert staging after the
             # initial load task, so keep the owning tensor alive on the wrapper.
-            self.physical_to_logical_map_cpu = physical_to_logical_map_cpu
+            self.physical_to_logical_map_cpu = physical_to_logical_map_cpu.contiguous()
 
         if self.method == "FP8":
             if self.loader.is_per_channel():
@@ -985,6 +1040,25 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 (self.moe_intermediate_size, self.hidden_size),
             )
             _validate_mxfp8_layout(
+                self.down_weights,
+                self.down_scales,
+                "down",
+                (self.hidden_size, self.moe_intermediate_size),
+            )
+        elif self.method == "MXFP4":
+            _validate_mxfp4_layout(
+                self.gate_weights,
+                self.gate_scales,
+                "gate",
+                (self.moe_intermediate_size, self.hidden_size),
+            )
+            _validate_mxfp4_layout(
+                self.up_weights,
+                self.up_scales,
+                "up",
+                (self.moe_intermediate_size, self.hidden_size),
+            )
+            _validate_mxfp4_layout(
                 self.down_weights,
                 self.down_scales,
                 "down",
@@ -1043,6 +1117,13 @@ class NativeMoEWrapper(BaseMoEWrapper):
         moe_config.up_scales = up_scale_ptrs
         moe_config.down_scales = down_scale_ptrs
 
+        # Keep the physical->logical mapping alive after the asynchronous
+        # load.  Layerwise prefill writers receive logical expert IDs and the
+        # ARM/x86 native TP exporters resolve them back to their physical
+        # BufferB slots through this pointer.
+        self.physical_to_logical_map_cpu = physical_to_logical_map_cpu.contiguous()
+        moe_config.physical_to_logical_map = self.physical_to_logical_map_cpu.data_ptr()
+
         # Infer group_size from scale shape (column-major layout)
         # For gate/up projection: in_features = hidden_size
         # So: group_size = hidden_size / scale.shape[1]
@@ -1072,7 +1153,8 @@ class NativeMoEWrapper(BaseMoEWrapper):
             if backend_cls is None:
                 raise RuntimeError(
                     "No MXFP4 backend available after runtime selection. "
-                    "Compile with AVX512_BF16 (AMXFP4_KGroup_MOE) or AVX2 (AVX2MXFP4_MOE)."
+                    "Compile with AVX512_BF16 (AMXFP4_KGroup_MOE), AVX2 (AVX2MXFP4_MOE), "
+                    "or AArch64 NEON/BFDOT (NEONMXFP4_MOE)."
                 )
             self.moe = backend_cls(moe_config)
         elif self.method == "MXFP8":
@@ -1160,7 +1242,9 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 )
         t4 = time.time()
 
-        self.cpu_infer.submit(self.moe.load_weights_task(physical_to_logical_map_cpu.data_ptr()))
+        # Pass the wrapper-owned mapping to the asynchronous native loader;
+        # the C++ MoE retains this pointer for later layerwise staging calls.
+        self.cpu_infer.submit(self.moe.load_weights_task(self.physical_to_logical_map_cpu.data_ptr()))
         self.cpu_infer.sync()
         t5 = time.time()
 
