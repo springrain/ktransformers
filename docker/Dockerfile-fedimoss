@@ -3,6 +3,7 @@
 ### 多线程加载模型
 ### --model-loader-extra-config '{"enable_multithread_load":true,"num_threads":2}'
 
+### `--kt-method LLAMAFILE` 目前未实现支持 `--kt-gpu-prefill-token-threshold` 和 `--kt-enable-dynamic-expert-update`. 可以使用 `--kt-method MXFP4`
 
 ### watch -n 2 "numactl --hardware | grep -E 'node|free'"   #查看NUMA node 内存分配
 ### numactl --interleave=all ##轮询分配, 均匀使用所有节点的内存
@@ -17,6 +18,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 ## 禁用sglang的自动绑定NUMA
 ENV SGLANG_NUMA_BIND_V2=0
 ENV SGLANG_AUTO_NUMA_BIND=0
+
+## 使用UTF-8编码
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONIOENCODING=utf-8
 
 # 【关键】针对 ARM64 架构换源 (替换 ports.ubuntu.com) 
 RUN sed -i 's/ports.ubuntu.com/mirrors.tuna.tsinghua.edu.cn\/ubuntu-ports/g' /etc/apt/sources.list
