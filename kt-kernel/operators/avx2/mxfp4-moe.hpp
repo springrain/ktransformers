@@ -617,22 +617,9 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
 // TP_MOE specialization (boilerplate, identical to rawint4 pattern)
 template <typename K>
 class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_MOE_TP<K>>> {
-  std::vector<void*> tp_owned_down_bufs_;
-  std::vector<void*> tp_owned_gate_bufs_;
-  std::vector<void*> tp_owned_up_bufs_;
-
  public:
   using Base = TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_MOE_TP<K>>>;
   using Base::Base;
-
-  ~TP_MOE() {
-    for (void* p : tp_owned_down_bufs_)
-      if (p) std::free(p);
-    for (void* p : tp_owned_gate_bufs_)
-      if (p) std::free(p);
-    for (void* p : tp_owned_up_bufs_)
-      if (p) std::free(p);
-  }
 
   void load_weights() override {
     auto& config = this->config;
@@ -647,12 +634,9 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
       int group_size = config.quant_config.group_size;
       int full_interm = config.intermediate_size;
 
-      // Allocate per-partition repack buffers for all projections.
-      // Previously gate/up used direct mmap pointers, causing use-after-free when Python
-      // releases mmap. Now we memcpy all weights to decouple from mmap lifecycle (aligned with AMX).
-      tp_owned_down_bufs_.resize(this->tp_count, nullptr);
-      tp_owned_gate_bufs_.resize(this->tp_count, nullptr);
-      tp_owned_up_bufs_.resize(this->tp_count, nullptr);
+      // Reuse the base-owned BufferB storage. The source tensors are still
+      // copied into C++-owned memory, but no second packed-weight image is
+      // needed for the TP repack.
       pool->dispense_backend()->do_numa_job([&, this](int i) {
         auto* tp = tps[i].get();
         auto& tpc = tp->config_;
@@ -663,24 +647,11 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
                                    std::to_string(per_tp_interm));
         // gate/up: [intermediate × hidden] = [N × K], TP slices along N → contiguous rows
         size_t gate_up_wt_per_expert = (size_t)per_tp_interm * tpc.hidden_size / 2;
-        size_t gate_up_alloc = ((size_t)tpc.expert_num * gate_up_wt_per_expert + 63) & ~(size_t)63;
-        uint8_t* gate_buf = (uint8_t*)std::aligned_alloc(64, gate_up_alloc);
-        uint8_t* up_buf = (uint8_t*)std::aligned_alloc(64, gate_up_alloc);
-        if (!gate_buf || !up_buf) throw std::runtime_error("aligned_alloc failed for MXFP4 gate/up_buf");
-        tp_owned_gate_bufs_[i] = gate_buf;
-        tp_owned_up_bufs_[i] = up_buf;
-        // down: [hidden × intermediate], TP slices along K → non-contiguous
-        size_t down_wt_per_expert = (size_t)tpc.hidden_size * per_tp_interm / 2;
-        size_t alloc_size = ((size_t)tpc.expert_num * down_wt_per_expert + 63) & ~(size_t)63;
-        uint8_t* down_buf = (uint8_t*)std::aligned_alloc(64, alloc_size);
-        if (!down_buf) throw std::runtime_error("aligned_alloc failed for MXFP4 down_buf");
-        tp_owned_down_bufs_[i] = down_buf;
 
         auto subpool = pool->get_subpool(i);
         subpool->do_work_stealing_job(
             tpc.expert_num, nullptr,
-            [&, i, per_tp_interm, full_interm, gate_buf, up_buf, down_buf, gate_up_wt_per_expert,
-             down_wt_per_expert](int eid) {
+            [&, i, per_tp_interm, full_interm, gate_up_wt_per_expert](int eid) {
               if (tpc.should_skip_expert(eid)) return;
               uint64_t lid = expert_map(physical_to_logical_map, eid);
 
@@ -694,15 +665,19 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
                 throw std::runtime_error("TP_MOE load_weights: null weight pointer for expert " + std::to_string(lid));
               }
 
-              // gate/up weights: N-split, contiguous rows → memcpy TP slice into owned buffer
+              if (tp->gate_bb_[eid] == nullptr || tp->up_bb_[eid] == nullptr || tp->down_bb_[eid] == nullptr ||
+                  tp->gate_bb_[eid]->b == nullptr || tp->up_bb_[eid]->b == nullptr || tp->down_bb_[eid]->b == nullptr) {
+                throw std::runtime_error("TP_MOE load_weights: MXFP4 BufferB storage is not allocated for expert " +
+                                         std::to_string(eid));
+              }
+
+              // gate/up weights: N-split, contiguous rows -> copy into base-owned storage
               // Each TP partition handles per_tp_interm rows starting at row i*per_tp_interm
               size_t n_byte_off = (size_t)i * per_tp_interm * tpc.hidden_size / 2;
-              uint8_t* dst_gate = gate_buf + (size_t)eid * gate_up_wt_per_expert;
-              uint8_t* dst_up = up_buf + (size_t)eid * gate_up_wt_per_expert;
+              uint8_t* dst_gate = tp->gate_bb_[eid]->b;
+              uint8_t* dst_up = tp->up_bb_[eid]->b;
               std::memcpy(dst_gate, (const uint8_t*)config.gate_projs[0][lid] + n_byte_off, gate_up_wt_per_expert);
               std::memcpy(dst_up, (const uint8_t*)config.up_projs[0][lid] + n_byte_off, gate_up_wt_per_expert);
-              tp->gate_bb_[eid]->b = dst_gate;
-              tp->up_bb_[eid]->b = dst_up;
 
               // gate/up scales: contiguous → convert BF16→FP32
               size_t scale_count = (size_t)(tpc.hidden_size / group_size) * per_tp_interm;
@@ -715,15 +690,14 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
               convert_or_copy(tp->up_bb_[eid]->d, (const ggml_bf16_t*)config.up_scales[0][lid] + scale_off,
                               scale_count);
 
-              // down weights: K-split, non-contiguous → per-row memcpy into repack buf
+              // down weights: K-split, non-contiguous -> copy rows into base-owned storage
               uint8_t* src_down = (uint8_t*)config.down_projs[0][lid];
-              uint8_t* dst_down = down_buf + (size_t)eid * down_wt_per_expert;
+              uint8_t* dst_down = tp->down_bb_[eid]->b;
               for (int row = 0; row < tpc.hidden_size; row++) {
                 std::memcpy(dst_down + (size_t)row * per_tp_interm / 2,
                             src_down + (size_t)row * full_interm / 2 + (size_t)i * per_tp_interm / 2,
                             per_tp_interm / 2);
               }
-              tp->down_bb_[eid]->b = dst_down;
 
               // down scales: K-split, non-contiguous → per-row convert
               if (config.down_scales[0][lid] == nullptr) {
