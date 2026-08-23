@@ -258,7 +258,7 @@ class NEON_MXFP4_MOE_TP : public NEON_MOE_BASE<T, NEON_MXFP4_MOE_TP<T>> {
               const int global_n = global_n_offset + row;
               const int target = global_n / gpu_n;
               const int n_in_gpu = global_n % gpu_n;
-              uint8_t* wdst = static_cast<uint8_t*>(w13_weight_ptrs[target]);
+              uint8_t* wdst = reinterpret_cast<uint8_t*>(w13_weight_ptrs[target]);
               const size_t matrix_off = is_up ? gpu_w13_weight_per_mat : 0;
               std::memcpy(wdst + matrix_off + static_cast<size_t>(n_in_gpu) * cpu_k / 2,
                           bb->b + static_cast<size_t>(row) * cpu_row_bytes, cpu_row_bytes);
@@ -293,7 +293,7 @@ class NEON_MXFP4_MOE_TP : public NEON_MOE_BASE<T, NEON_MXFP4_MOE_TP<T>> {
                     (k_in_gpu % group_size) || (len % group_size)) {
                   throw std::runtime_error("NEON MXFP4 staging: down slice is not nibble/group aligned");
                 }
-                uint8_t* wdst = static_cast<uint8_t*>(w2_weight_ptrs[target]);
+                uint8_t* wdst = reinterpret_cast<uint8_t*>(w2_weight_ptrs[target]);
                 std::memcpy(wdst + static_cast<size_t>(row) * gpu_w2_k / 2 + k_in_gpu / 2,
                             bb->b + static_cast<size_t>(row) * cpu_w2_k / 2 + local_start / 2, len / 2);
                 ggml_bf16_t* sdst = reinterpret_cast<ggml_bf16_t*>(w2_scale_ptrs[target]);

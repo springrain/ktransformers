@@ -130,9 +130,12 @@ def detect_parallel_jobs() -> str:
     try:
         import multiprocessing
 
-        return str(multiprocessing.cpu_count())
+        # ext_bindings.cpp includes the complete CPU/CUDA kernel graph. Using
+        # every logical core can exhaust RAM on large ARM servers; callers
+        # can raise this explicitly with CPUINFER_PARALLEL when appropriate.
+        return str(min(multiprocessing.cpu_count(), 8))
     except Exception:
-        return "1"
+        return "8"
 
 
 try:
