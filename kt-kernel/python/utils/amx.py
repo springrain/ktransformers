@@ -17,6 +17,7 @@ from .loader import (
     BF16SafeTensorLoader,
     GPTQSafeTensorLoader,
     MXFP4SafeTensorLoader,
+    NVFP4SafeTensorLoader,
     MXFP8SafeTensorLoader,
 )
 from kt_kernel_ext.moe import MOEConfig
@@ -769,13 +770,17 @@ class NativeMoEWrapper(BaseMoEWrapper):
         swiglu_alpha: float = 0.0,
     ):
         self._swiglu_alpha = float(swiglu_alpha)
-        # Defence in depth: reject swiglu_limit on non-MXFP4/MXFP8 methods even
+        # Defence in depth: reject swiglu_limit on methods whose native MoE
+        # activation contract has not been validated.  The block-FP8 backend
+        # shares the same MOEConfig/act_fn path as MXFP4/MXFP8 and is required
+        # by GLM-5-Next's E4M3 + FP32 [128, 128] checkpoint format.
         # if the experts.py guard is bypassed (e.g., by a future caller
         # that constructs NativeMoEWrapper directly). Origin: kt-sglang 耦合.
-        if swiglu_limit != 0.0 and method not in ("MXFP4", "MXFP8"):
+        if swiglu_limit != 0.0 and method not in ("FP8", "MXFP4", "MXFP8"):
             raise ValueError(
                 f"NativeMoEWrapper received swiglu_limit={swiglu_limit} with "
-                f"method={method!r}; the clamp only applies to MXFP4/MXFP8. "
+                f"method={method!r}; the clamp is supported only by "
+                "FP8/MXFP4/MXFP8. "
                 f"This indicates a missing guard in the caller."
             )
         if method == "RAWINT4" and not (
@@ -820,6 +825,10 @@ class NativeMoEWrapper(BaseMoEWrapper):
             raise RuntimeError(
                 "SYCL_GPTQ_INT4 backend not available. Rebuild kt_kernel_ext with "
                 "CPUINFER_USE_SYCL=1 using a SYCL compiler such as icpx."
+            )
+        if method == "NVFP4" and not _HAS_AVX2_MXFP4_SUPPORT:
+            raise RuntimeError(
+                "NVFP4 needs the AVX2 FP4 backend (AVX2MXFP4_MOE), which is not compiled in."
             )
         if method == "MXFP4" and not (
             _HAS_MXFP4_SUPPORT or _HAS_AVX2_MXFP4_SUPPORT or _HAS_NEON_MXFP4_SUPPORT
@@ -883,6 +892,8 @@ class NativeMoEWrapper(BaseMoEWrapper):
             return GPTQSafeTensorLoader(weight_path)
         elif method == "MXFP4":
             return MXFP4SafeTensorLoader(weight_path)
+        elif method == "NVFP4":
+            return NVFP4SafeTensorLoader(weight_path)
         elif method == "MXFP8":
             return MXFP8SafeTensorLoader(weight_path)
         else:
@@ -983,6 +994,9 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 # ue8m0 is losslessly representable in bf16 (8-bit exponent, 0 mantissa);
                 # the loader has already done that conversion.
                 assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 scales for MXFP4"
+            elif self.method == "NVFP4":
+                # e4m3 block scale x per-tensor global, folded to bf16 by the loader.
+                assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 scales for NVFP4"
             elif self.method == "MXFP8":
                 # ue8m0 scales stay as uint8; C++ convert_ue8m0_to_fp32 handles conversion.
                 assert self.gate_scales[0].dtype == torch.uint8, "Expected uint8 (ue8m0) scales for MXFP8"
@@ -1094,18 +1108,22 @@ class NativeMoEWrapper(BaseMoEWrapper):
         moe_config.layer_idx = self.layer_idx
         moe_config.pool = self.cpu_infer.backend_
         moe_config.max_len = self.chunked_prefill_size
-        # V4-Flash 2604B SwiGLU clamp; 0.0 = disabled (default for non-MXFP4
-        # paths). Read by `act_fn` in operators/amx/la/amx.hpp via
+        # Clamp-before-SiLU; 0.0 = disabled. Read by `act_fn` in
+        # operators/amx/la/amx.hpp via
         # `apply_activation` in operators/amx/moe_base.hpp. Re-checked here
         # (defence in depth) so a future caller that bypasses both the
-        # experts.py and the __init__ guards still cannot apply the clamp
-        # on RAWINT4 / FP8 / BF16 / FP8_PERCHANNEL / GPTQ_INT4 paths.
+        # experts.py and the __init__ guards still cannot apply the clamp on
+        # unvalidated RAWINT4 / BF16 / FP8_PERCHANNEL / GPTQ_INT4 paths.
         # Origin: kt-sglang 耦合.
-        if self.swiglu_limit != 0.0 and self.method not in ("MXFP4", "MXFP8"):
+        if self.swiglu_limit != 0.0 and self.method not in (
+            "FP8",
+            "MXFP4",
+            "MXFP8",
+        ):
             raise ValueError(
                 f"NativeMoEWrapper.load_weights: swiglu_limit="
                 f"{self.swiglu_limit} with method={self.method!r}; clamp is "
-                f"only valid for MXFP4/MXFP8."
+                f"only valid for FP8/MXFP4/MXFP8."
             )
         moe_config.swiglu_limit = self.swiglu_limit
 
@@ -1155,6 +1173,35 @@ class NativeMoEWrapper(BaseMoEWrapper):
                     "No MXFP4 backend available after runtime selection. "
                     "Compile with AVX512_BF16 (AMXFP4_KGroup_MOE), AVX2 (AVX2MXFP4_MOE), "
                     "or AArch64 NEON/BFDOT (NEONMXFP4_MOE)."
+                )
+            self.moe = backend_cls(moe_config)
+        elif self.method == "NVFP4":
+            # NVFP4: same E2M1 nibble packing as MXFP4, but a per-16 block scale
+            # in E4M3 times a per-tensor global scale. The loader has already
+            # folded both into one bf16 scale per group, so the FP4 kernel runs
+            # this unchanged -- only group_size differs (16 vs 32).
+            group_size = self.hidden_size // self.gate_scales[0].shape[1]
+            if group_size != 16:
+                raise RuntimeError(
+                    f"NVFP4 expects group_size 16, derived {group_size} from "
+                    f"hidden_size={self.hidden_size} and scale shape "
+                    f"{tuple(self.gate_scales[0].shape)}."
+                )
+            moe_config.quant_config.bits = 4
+            moe_config.quant_config.group_size = group_size
+            moe_config.quant_config.zero_point = False
+            backend_cls = _select_mxfp4_backend()
+            if backend_cls is None:
+                raise RuntimeError(
+                    "No FP4 backend available for NVFP4 after runtime selection. "
+                    "Compile with AVX512_BF16 (AMXFP4_KGroup_MOE) or AVX2 (AVX2MXFP4_MOE)."
+                )
+            if backend_cls is not AVX2MXFP4_MOE:
+                # Only the AVX2 kernel has the group-16 path; the AMX FP4 kernel
+                # is built around a 32-value k-group.
+                raise RuntimeError(
+                    "NVFP4 (group_size 16) currently requires the AVX2 FP4 backend. "
+                    "Set KT_MXFP4_BACKEND=avx2, or extend the AMX kernel to group-16."
                 )
             self.moe = backend_cls(moe_config)
         elif self.method == "MXFP8":
@@ -1311,3 +1358,37 @@ class NativeMoEWrapper(BaseMoEWrapper):
         """
         # The CPUInfer.sync() call blocks until pending tasks complete.
         self.cpu_infer.sync()
+
+    def run_layerwise_fp8_batch(
+        self,
+        transport,
+        epoch: int,
+        layer_id: int,
+        expert_count: int,
+    ):
+        """Run one block-FP8 layer's native writer/H2D transport pipeline.
+
+        The transport owns the hot per-expert protocol.  Python enters once per
+        layer, while the C++ producer overlaps writing expert ``e + 1`` with
+        each rank's local H2D copy of expert ``e``.
+        """
+        if self.method != "FP8":
+            raise RuntimeError(
+                "run_layerwise_fp8_batch is only valid for the block-FP8 NativeMoEWrapper backend"
+            )
+        if self.moe is None:
+            raise RuntimeError("MoE instance not initialized; cannot run FP8 layerwise transport.")
+        if not hasattr(self.moe, "run_layerwise_fp8_batch"):
+            raise NotImplementedError(
+                "The installed kt-kernel extension does not expose run_layerwise_fp8_batch."
+            )
+        # The native batch calls the shared NUMA distributor directly.  Drain
+        # CPUInfer first so it cannot race a previously queued task against the
+        # non-reentrant distributor state.
+        self.cpu_infer.sync()
+        return self.moe.run_layerwise_fp8_batch(
+            transport,
+            epoch,
+            layer_id,
+            expert_count,
+        )

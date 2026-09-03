@@ -25,6 +25,8 @@ Environment knobs (export before running pip install .):
   CPUINFER_ENABLE_AVX512_BF16=OFF ON/OFF -> -DLLAMA_AVX512_BF16
   CPUINFER_ENABLE_AVX512_VBMI=OFF ON/OFF -> -DLLAMA_AVX512_VBMI (required for FP8 MoE)
   CPUINFER_ENABLE_CPPTRACE=ON/OFF  ON/OFF -> -DKTRANSFORMERS_ENABLE_CPPTRACE (debug-only)
+  CPUINFER_ENABLE_ONEDNN_VNNI=OFF  ON/OFF -> -DKTRANSFORMERS_CPU_USE_ONEDNN_VNNI
+  CPUINFER_ONEDNN_SOURCE_DIR=/path Forward to -DKTRANSFORMERS_ONEDNN_SOURCE_DIR
   CPUINFER_BLIS_ROOT=/path/to/blis  Forward to -DBLIS_ROOT
 
 
@@ -34,13 +36,21 @@ Environment knobs (export before running pip install .):
   CPUINFER_NATIVE=ON               (override LLAMA_NATIVE)
 
 
-GPU backends:
+GPU/NPU backends:
   CPUINFER_USE_CUDA=0/1           -DKTRANSFORMERS_USE_CUDA
   CPUINFER_USE_SYCL=0/1           -DKTRANSFORMERS_USE_SYCL (GPTQ INT4 MoE)
   CPUINFER_USE_ROCM=0/1           -DKTRANSFORMERS_USE_ROCM
   CPUINFER_USE_MUSA=0/1           -DKTRANSFORMERS_USE_MUSA
   CPUINFER_USE_MACA=0/1           -DKTRANSFORMERS_USE_MACA
+  CPUINFER_USE_ASCEND_NPU=0/1     -DKTRANSFORMERS_USE_ASCEND_NPU
   MACA_PATH=/opt/maca             MACA SDK root
+
+ARM aarch64 feature toggles:
+  CPUINFER_ARM_DOTPROD=ON/OFF     -DLLAMA_ARM_DOTPROD
+  CPUINFER_ARM_FP16=ON/OFF        -DLLAMA_ARM_FP16
+  CPUINFER_ARM_SVE=ON/OFF         -DLLAMA_ARM_SVE
+  CPUINFER_ARM_BF16=ON/OFF        -DLLAMA_ARM_BF16
+  CPUINFER_ARM_I8MM=ON/OFF        -DLLAMA_ARM_I8MM
 
 Usage:
   pip install .
@@ -115,7 +125,9 @@ os.chdir(REPO_ROOT)
 CPU_FEATURE_MAP = {
     "FANCY": "-DLLAMA_NATIVE=OFF -DLLAMA_FMA=ON -DLLAMA_F16C=ON -DLLAMA_AVX=ON -DLLAMA_AVX2=ON -DLLAMA_AVX512=ON -DLLAMA_AVX512_FANCY_SIMD=ON",
     "AVX512": "-DLLAMA_NATIVE=OFF -DLLAMA_FMA=ON -DLLAMA_F16C=ON -DLLAMA_AVX=ON -DLLAMA_AVX2=ON -DLLAMA_AVX512=ON",
-    "AVX2": "-DLLAMA_NATIVE=OFF -DLLAMA_FMA=ON -DLLAMA_F16C=ON -DLLAMA_AVX=ON -DLLAMA_AVX2=ON",
+    # Explicit OFF values prevent DetectCPU.cmake from re-enabling host AVX512
+    # features while building the portable AVX2 wheel variant.
+    "AVX2": "-DLLAMA_NATIVE=OFF -DLLAMA_FMA=ON -DLLAMA_F16C=ON -DLLAMA_AVX=ON -DLLAMA_AVX2=ON -DLLAMA_AVX512=OFF -DLLAMA_AVX512_FANCY_SIMD=OFF -DLLAMA_AVX512_VNNI=OFF -DLLAMA_AVX512_BF16=OFF -DLLAMA_AVX512_VBMI=OFF",
     "NATIVE": "-DLLAMA_NATIVE=ON",
 }
 
@@ -243,6 +255,20 @@ class CMakeBuild(build_ext):
                         flags.update(m.group(1).lower().split())
                 info["raw"]["flags"] = flags
 
+                # ARM feature summary (Kunpeng / Neoverse / Apple Silicon).
+                # /proc/cpuinfo on Linux/aarch64 lists these in "Features:".
+                if info["vendor"] == "arm" or "aarch64" in info["arch"]:
+                    if "asimddp" in flags:
+                        info["features"].add("ARM_DOTPROD")
+                    if "asimdhp" in flags or "fphp" in flags:
+                        info["features"].add("ARM_FP16")
+                    if "sve" in flags:
+                        info["features"].add("ARM_SVE")
+                    if "bf16" in flags:
+                        info["features"].add("ARM_BF16")
+                    if "i8mm" in flags:
+                        info["features"].add("ARM_I8MM")
+
                 # feature summary
                 if any(f in flags or f in low for f in ["avx512f", "avx512bw", "avx512dq", "avx512vl"]):
                     info["features"].add("AVX512")
@@ -355,7 +381,10 @@ class CMakeBuild(build_ext):
             "CPUINFER_ENABLE_AVX512_VNNI": os.environ.get("CPUINFER_ENABLE_AVX512_VNNI"),
             "CPUINFER_ENABLE_AVX512_BF16": os.environ.get("CPUINFER_ENABLE_AVX512_BF16"),
             "CPUINFER_ENABLE_AVX512_VBMI": os.environ.get("CPUINFER_ENABLE_AVX512_VBMI"),
+            "CPUINFER_ENABLE_ONEDNN_VNNI": os.environ.get("CPUINFER_ENABLE_ONEDNN_VNNI"),
+            "CPUINFER_ONEDNN_SOURCE_DIR": os.environ.get("CPUINFER_ONEDNN_SOURCE_DIR"),
         }
+        enable_onednn_vnni = _env_get_bool("CPUINFER_ENABLE_ONEDNN_VNNI", False)
 
         # Variant configurations: (name, description, env_vars)
         # Each variant specifies exactly which features to enable
@@ -367,6 +396,7 @@ class CMakeBuild(build_ext):
                     "CPUINFER_CPU_INSTRUCT": "AVX2",
                     "CPUINFER_ENABLE_AVX512": "OFF",
                     "CPUINFER_ENABLE_AMX": "OFF",
+                    "CPUINFER_ENABLE_ONEDNN_VNNI": "OFF",
                 },
             ),
             (
@@ -379,6 +409,7 @@ class CMakeBuild(build_ext):
                     "CPUINFER_ENABLE_AVX512_BF16": "OFF",
                     "CPUINFER_ENABLE_AVX512_VBMI": "OFF",
                     "CPUINFER_ENABLE_AMX": "OFF",
+                    "CPUINFER_ENABLE_ONEDNN_VNNI": "OFF",
                 },
             ),
             (
@@ -391,6 +422,7 @@ class CMakeBuild(build_ext):
                     "CPUINFER_ENABLE_AVX512_BF16": "OFF",
                     "CPUINFER_ENABLE_AVX512_VBMI": "OFF",
                     "CPUINFER_ENABLE_AMX": "OFF",
+                    "CPUINFER_ENABLE_ONEDNN_VNNI": "OFF",
                 },
             ),
             (
@@ -403,6 +435,7 @@ class CMakeBuild(build_ext):
                     "CPUINFER_ENABLE_AVX512_BF16": "OFF",
                     "CPUINFER_ENABLE_AVX512_VBMI": "ON",
                     "CPUINFER_ENABLE_AMX": "OFF",
+                    "CPUINFER_ENABLE_ONEDNN_VNNI": "OFF",
                 },
             ),
             (
@@ -415,6 +448,7 @@ class CMakeBuild(build_ext):
                     "CPUINFER_ENABLE_AVX512_BF16": "ON",
                     "CPUINFER_ENABLE_AVX512_VBMI": "ON",
                     "CPUINFER_ENABLE_AMX": "OFF",
+                    "CPUINFER_ENABLE_ONEDNN_VNNI": "ON" if enable_onednn_vnni else "OFF",
                 },
             ),
             (
@@ -427,6 +461,7 @@ class CMakeBuild(build_ext):
                     "CPUINFER_ENABLE_AVX512_BF16": "ON",
                     "CPUINFER_ENABLE_AVX512_VBMI": "ON",
                     "CPUINFER_ENABLE_AMX": "ON",
+                    "CPUINFER_ENABLE_ONEDNN_VNNI": "OFF",
                 },
             ),
         ]
@@ -528,6 +563,20 @@ class CMakeBuild(build_ext):
                 return True
             return False
 
+        # Auto-detect Ascend CANN toolkit if user did not explicitly set CPUINFER_USE_ASCEND_NPU.
+        # We check $ASCEND_TOOLKIT_HOME, $CANN_HOME, and the default install
+        # prefix /usr/local/Ascend/ascend-toolkit/latest; treat the toolkit as
+        # available iff include/acl/acl_rt.h exists under that root.
+        def detect_cann_toolkit() -> str | None:
+            for env_name in ("ASCEND_TOOLKIT_HOME", "CANN_HOME"):
+                p = os.environ.get(env_name)
+                if p and (Path(p) / "include" / "acl" / "acl_rt.h").exists():
+                    return p
+            default_root = Path("/usr/local/Ascend/ascend-toolkit/latest")
+            if (default_root / "include" / "acl" / "acl_rt.h").exists():
+                return str(default_root)
+            return None
+
         # Locate nvcc executable (without forcing user to set -DCMAKE_CUDA_COMPILER)
         def find_nvcc_path() -> str | None:
             cuda_home = os.environ.get("CUDA_HOME")
@@ -571,7 +620,13 @@ class CMakeBuild(build_ext):
         if cuda_env is None:
             requested_non_cuda_gpu = any(
                 _env_get_bool(name, False)
-                for name in ("CPUINFER_USE_SYCL", "CPUINFER_USE_ROCM", "CPUINFER_USE_MUSA", "CPUINFER_USE_MACA")
+                for name in (
+                    "CPUINFER_USE_SYCL",
+                    "CPUINFER_USE_ROCM",
+                    "CPUINFER_USE_MUSA",
+                    "CPUINFER_USE_MACA",
+                    "CPUINFER_USE_ASCEND_NPU",
+                )
             )
             if requested_non_cuda_gpu:
                 os.environ["CPUINFER_USE_CUDA"] = "0"
@@ -581,6 +636,20 @@ class CMakeBuild(build_ext):
                 os.environ["CPUINFER_USE_CUDA"] = "1" if auto_cuda else "0"
                 print(f"-- CPUINFER_USE_CUDA not set; auto-detected CUDA toolkit: {'YES' if auto_cuda else 'NO'}")
 
+        npu_env = _env_get_bool("CPUINFER_USE_ASCEND_NPU", None)
+        if npu_env is None:
+            cann_root = detect_cann_toolkit()
+            host_is_arm = platform.machine().lower() in ("aarch64", "arm64")
+            cuda_active = os.environ.get("CPUINFER_USE_CUDA") == "1"
+            auto_npu = cann_root is not None and host_is_arm and not cuda_active
+            os.environ["CPUINFER_USE_ASCEND_NPU"] = "1" if auto_npu else "0"
+            if auto_npu:
+                os.environ.setdefault("ASCEND_TOOLKIT_HOME", cann_root)
+            print(
+                "-- CPUINFER_USE_ASCEND_NPU not set; auto-detected CANN toolkit: "
+                + (f"YES ({cann_root})" if auto_npu else "NO")
+            )
+
         enabled_gpu_backends = [
             name
             for name, env_name in (
@@ -589,6 +658,7 @@ class CMakeBuild(build_ext):
                 ("ROCM", "CPUINFER_USE_ROCM"),
                 ("MUSA", "CPUINFER_USE_MUSA"),
                 ("MACA", "CPUINFER_USE_MACA"),
+                ("ASCEND", "CPUINFER_USE_ASCEND_NPU"),
             )
             if _env_get_bool(env_name, False)
         ]
@@ -720,6 +790,8 @@ class CMakeBuild(build_ext):
         _forward_str_env(cmake_args, "CPUINFER_LTO_JOBS", "CPUINFER_LTO_JOBS")
         _forward_str_env(cmake_args, "CPUINFER_LTO_MODE", "CPUINFER_LTO_MODE")
         _forward_bool_env(cmake_args, "CPUINFER_ENABLE_CPPTRACE", "KTRANSFORMERS_ENABLE_CPPTRACE")
+        _forward_bool_env(cmake_args, "CPUINFER_ENABLE_ONEDNN_VNNI", "KTRANSFORMERS_CPU_USE_ONEDNN_VNNI")
+        _forward_str_env(cmake_args, "CPUINFER_ONEDNN_SOURCE_DIR", "KTRANSFORMERS_ONEDNN_SOURCE_DIR")
 
         # CUDA static runtime toggle
         _forward_bool_env(cmake_args, "CPUINFER_CUDA_STATIC_RUNTIME", "KTRANSFORMERS_CUDA_STATIC_RUNTIME")
@@ -764,6 +836,27 @@ class CMakeBuild(build_ext):
             if maca_path and not os.environ.get("MACA_PATH"):
                 cmake_args.append(f"-DMACA_PATH={maca_path}")
             print("-- Enabling MACA backend (-DKTRANSFORMERS_USE_MACA=ON)")
+        if _env_get_bool("CPUINFER_USE_ASCEND_NPU", False):
+            cmake_args.append("-DKTRANSFORMERS_USE_ASCEND_NPU=ON")
+            print("-- Enabling Ascend NPU backend (-DKTRANSFORMERS_USE_ASCEND_NPU=ON)")
+            if not _env_get_bool("CPUINFER_ENABLE_KML", None):
+                os.environ.setdefault("CPUINFER_ENABLE_KML", "OFF")
+            if not _env_get_bool("CPUINFER_ENABLE_BLIS", None):
+                os.environ.setdefault("CPUINFER_ENABLE_BLIS", "OFF")
+
+        if platform.machine().lower() in ("aarch64", "arm64"):
+            arm_feature_map = (
+                ("CPUINFER_ARM_DOTPROD", "LLAMA_ARM_DOTPROD", "ARM_DOTPROD"),
+                ("CPUINFER_ARM_FP16", "LLAMA_ARM_FP16", "ARM_FP16"),
+                ("CPUINFER_ARM_SVE", "LLAMA_ARM_SVE", "ARM_SVE"),
+                ("CPUINFER_ARM_BF16", "LLAMA_ARM_BF16", "ARM_BF16"),
+                ("CPUINFER_ARM_I8MM", "LLAMA_ARM_I8MM", "ARM_I8MM"),
+            )
+            for env_name, cmake_flag, feature in arm_feature_map:
+                if _forward_bool_env(cmake_args, env_name, cmake_flag):
+                    continue
+                value = "ON" if feature in d["features"] else "OFF"
+                cmake_args.append(f"-D{cmake_flag}={value}")
 
         # Respect user extra CMAKE_ARGS (space separated)
         extra = os.environ.get("CMAKE_ARGS")

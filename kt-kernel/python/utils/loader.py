@@ -50,7 +50,42 @@ class GGMLQuantizationType(IntEnum):
     BF16 = 30
     # GGML_TYPE_MXFP4: one 32-value block is 1 E8M0 scale byte + 16 packed
     # E2M1 bytes.
-    MXFP4 = 39
+    MXFP4 = 39  # OCP microscaling FP4 (E2M1 + ue8m0)
+
+
+# (block_size, type_size) per GGML quant type — bytes per `block_size` elements.
+GGML_QUANT_SIZES = {
+    GGMLQuantizationType.F32: (1, 4),
+    GGMLQuantizationType.F16: (1, 2),
+    GGMLQuantizationType.BF16: (1, 2),
+    GGMLQuantizationType.Q4_0: (32, 2 + 16),
+    GGMLQuantizationType.Q4_1: (32, 2 + 2 + 16),
+    GGMLQuantizationType.Q5_0: (32, 2 + 4 + 16),
+    GGMLQuantizationType.Q5_1: (32, 2 + 2 + 4 + 16),
+    GGMLQuantizationType.Q8_0: (32, 2 + 32),
+    GGMLQuantizationType.Q8_1: (32, 4 + 4 + 32),
+    GGMLQuantizationType.Q2_K: (256, 2 + 2 + 256 // 16 + 256 // 4),
+    GGMLQuantizationType.Q3_K: (256, 2 + 256 // 4 + 256 // 8 + 12),
+    GGMLQuantizationType.Q4_K: (256, 2 + 2 + 256 // 2 + 12),
+    GGMLQuantizationType.Q5_K: (256, 2 + 2 + 256 // 2 + 256 // 8 + 12),
+    GGMLQuantizationType.Q6_K: (256, 2 + 256 // 2 + 256 // 4 + 256 // 16),
+    GGMLQuantizationType.Q8_K: (256, 4 + 256 + 256 // 8),
+    GGMLQuantizationType.IQ2_XXS: (256, 2 + 256 // 4),
+    GGMLQuantizationType.IQ2_XS: (256, 2 + 256 // 4 + 256 // 32),
+    GGMLQuantizationType.IQ3_XXS: (256, 2 + 256 // 4 + 256 // 8),
+    GGMLQuantizationType.IQ1_S: (256, 2 + 256 // 8 + 256 // 16),
+    GGMLQuantizationType.IQ4_NL: (32, 2 + 16),
+    GGMLQuantizationType.IQ3_S: (256, 2 + 256 // 4 + 256 // 8 + 256 // 32 + 4),
+    GGMLQuantizationType.IQ2_S: (256, 2 + 256 // 4 + 256 // 16),
+    GGMLQuantizationType.IQ4_XS: (256, 2 + 2 + 256 // 2 + 256 // 64),
+    GGMLQuantizationType.I8: (1, 1),
+    GGMLQuantizationType.I16: (1, 2),
+    GGMLQuantizationType.I32: (1, 4),
+    GGMLQuantizationType.I64: (1, 8),
+    GGMLQuantizationType.F64: (1, 8),
+    GGMLQuantizationType.IQ1_M: (256, 256 // 8 + 256 // 16 + 256 // 32),
+    GGMLQuantizationType.MXFP4: (32, 1 + 16),  # 1B e8m0 scale + 16B nibble-packed E2M1
+}
 
 
 def translate_name_to_gguf(name):
@@ -1027,45 +1062,20 @@ class GGUFLoader:
         n_elements = info["n_elements"]
         ggml_type = info["dtype"]
 
-        GGML_QUANT_SIZES = {
-            GGMLQuantizationType.F32: (1, 4),
-            GGMLQuantizationType.F16: (1, 2),
-            GGMLQuantizationType.BF16: (1, 2),
-            # block_mxfp4 { uint8_t e; uint8_t qs[16]; }
-            GGMLQuantizationType.MXFP4: (32, 1 + 16),
-            GGMLQuantizationType.Q4_0: (32, 2 + 16),
-            GGMLQuantizationType.Q4_1: (32, 2 + 2 + 16),
-            GGMLQuantizationType.Q5_0: (32, 2 + 4 + 16),
-            GGMLQuantizationType.Q5_1: (32, 2 + 2 + 4 + 16),
-            GGMLQuantizationType.Q8_0: (32, 2 + 32),
-            GGMLQuantizationType.Q8_1: (32, 4 + 4 + 32),
-            GGMLQuantizationType.Q2_K: (256, 2 + 2 + 256 // 16 + 256 // 4),
-            GGMLQuantizationType.Q3_K: (256, 2 + 256 // 4 + 256 // 8 + 12),
-            GGMLQuantizationType.Q4_K: (256, 2 + 2 + 256 // 2 + 12),
-            GGMLQuantizationType.Q5_K: (256, 2 + 2 + 256 // 2 + 256 // 8 + 12),
-            GGMLQuantizationType.Q6_K: (256, 2 + 256 // 2 + 256 // 4 + 256 // 16),
-            GGMLQuantizationType.Q8_K: (256, 4 + 256 + 256 // 8),
-            GGMLQuantizationType.IQ2_XXS: (256, 2 + 256 // 4),
-            GGMLQuantizationType.IQ2_XS: (256, 2 + 256 // 4 + 256 // 32),
-            GGMLQuantizationType.IQ3_XXS: (256, 2 + 256 // 4 + 256 // 8),
-            GGMLQuantizationType.IQ1_S: (256, 2 + 256 // 8 + 256 // 16),
-            GGMLQuantizationType.IQ4_NL: (32, 2 + 16),
-            GGMLQuantizationType.IQ3_S: (256, 2 + 256 // 4 + 256 // 8 + 256 // 32 + 4),
-            GGMLQuantizationType.IQ2_S: (256, 2 + 256 // 4 + 256 // 16),
-            GGMLQuantizationType.IQ4_XS: (256, 2 + 2 + 256 // 2 + 256 // 64),
-            GGMLQuantizationType.I8: (1, 1),
-            GGMLQuantizationType.I16: (1, 2),
-            GGMLQuantizationType.I32: (1, 4),
-            GGMLQuantizationType.I64: (1, 8),
-            GGMLQuantizationType.F64: (1, 8),
-            GGMLQuantizationType.IQ1_M: (256, 256 // 8 + 256 // 16 + 256 // 32),
-        }
-
         block_size, type_size = GGML_QUANT_SIZES[ggml_type]
         n_bytes = n_elements * type_size // block_size
 
         data_bytes = mmap_data[offset : offset + n_bytes]
-        data = torch.from_numpy(np.frombuffer(data_bytes, dtype=np.uint8).copy())
+        # Zero-copy: the returned tensor is only ever consumed as a *read-only source* by the
+        # C++ MoE load_weights reshuffle (llamafile/moe.hpp memcpy SOURCE), which makes the
+        # single necessary copy into its NUMA-local buffers. So view the mmap directly instead
+        # of copying every layer's ~6.85GB single-threaded into anonymous RAM. The mmap stays
+        # alive in GGUFLoader.file_data_map; the wrapper pins the tensors in
+        # self.weights_to_keep until cpu_infer.sync() returns.
+        # (np.frombuffer over the memmap slice = read-only view, no copy; torch.from_numpy
+        # shares that buffer so data.data_ptr() points into the mmap. Use from_numpy, NOT
+        # torch.frombuffer — the latter is redirected to NPU by torch_npu's transfer_to_npu.)
+        data = torch.from_numpy(np.frombuffer(data_bytes, dtype=np.uint8))
 
         return data, ggml_type
 
@@ -1265,6 +1275,99 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
                 dst[exp_id] = self._ue8m0_to_bf16(s)
 
         print(f"[MXFP4SafeTensorLoader] Loaded {expert_count} experts from {prefix}")
+        return {
+            "gate": gate_weights,
+            "up": up_weights,
+            "down": down_weights,
+            "gate_scale": gate_scales,
+            "up_scale": up_scales,
+            "down_scale": down_scales,
+        }
+
+
+class NVFP4SafeTensorLoader(SafeTensorLoader):
+    """Loader for ModelOpt NVFP4 expert weights (W4A16_NVFP4, group_size 16).
+
+    Per expert layout (compressed-tensors / ModelOpt naming):
+      {base}.mlp.experts.{i}.gate_proj.weight          U8        [N, K/2]   nibble-packed E2M1
+      {base}.mlp.experts.{i}.gate_proj.weight_scale    F8_E4M3   [N, K/16]  per-block scale
+      {base}.mlp.experts.{i}.gate_proj.weight_scale_2  F32       scalar     per-tensor global
+      {base}.mlp.experts.{i}.{up_proj,down_proj}.{weight,weight_scale,weight_scale_2}
+
+    NVFP4 shares MXFP4's E2M1 codepoints and low-nibble-first packing, so the
+    weight bytes go to the FP4 kernel untouched; only the scale encoding differs.
+    The kernel consumes one FP32-valued scale per k-group, so both levels are
+    folded here into a single bf16 tensor:
+
+        scale[n, g] = float(e4m3(weight_scale[n, g])) * weight_scale_2
+
+    bf16 is lossy for E4M3 products (8 mantissa bits down to 7), which is what
+    the kernel's own group-32 MXFP4 path already accepts; measured against a
+    float64 dequant of the same bytes the end-to-end error is bf16-rounding
+    only (cosine 0.999993 on Ornith-1.5-35B-A3B-NVFP4).
+    """
+
+    EXPERTS_PATH_TPL = "{base}.mlp.experts"
+    PROJ_NAMES = ("gate_proj", "up_proj", "down_proj")
+
+    def _experts_prefix_candidates(self, base_key: str) -> list[str]:
+        candidates = [self.EXPERTS_PATH_TPL.format(base=base_key)]
+        for strip in ("model.language_model.", "language_model.model.", "language_model.", "model."):
+            if base_key.startswith(strip):
+                candidates.append(self.EXPERTS_PATH_TPL.format(base=base_key[len(strip):]))
+        # ModelOpt checkpoints for multimodal Qwen3.5-MoE nest under
+        # model.language_model.layers.{L}; callers may pass either form.
+        if not base_key.startswith("model.language_model."):
+            for pre in ("model.language_model.", "language_model.model."):
+                if base_key.startswith("model."):
+                    candidates.append(self.EXPERTS_PATH_TPL.format(base=pre + base_key[len("model."):]))
+        return list(dict.fromkeys(candidates))
+
+    @staticmethod
+    def _fold_scales_to_bf16(block_scale: torch.Tensor, global_scale: torch.Tensor) -> torch.Tensor:
+        """e4m3 block scale x per-tensor f32 global -> bf16 [N, K/16]."""
+        s = block_scale.to(torch.float32) * global_scale.to(torch.float32).reshape(())
+        return s.to(torch.bfloat16).contiguous()
+
+    def load_experts(self, base_key: str, device: str = "cpu"):
+        gate_name, up_name, down_name = self.PROJ_NAMES
+        prefix = None
+        expert_count = 0
+        for cand in self._experts_prefix_candidates(base_key):
+            expert_count = 0
+            while self.has_tensor(f"{cand}.{expert_count}.{gate_name}.weight"):
+                expert_count += 1
+            if expert_count > 0:
+                prefix = cand
+                break
+        if prefix is None:
+            raise ValueError(
+                f"No NVFP4 experts found under any of: {self._experts_prefix_candidates(base_key)}"
+            )
+
+        gate_weights = [None] * expert_count
+        up_weights = [None] * expert_count
+        down_weights = [None] * expert_count
+        gate_scales = [None] * expert_count
+        up_scales = [None] * expert_count
+        down_scales = [None] * expert_count
+
+        for exp_id in range(expert_count):
+            for proj, wdst, sdst in (
+                (gate_name, gate_weights, gate_scales),
+                (up_name, up_weights, up_scales),
+                (down_name, down_weights, down_scales),
+            ):
+                w = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight", device).contiguous()
+                if w.dtype != torch.uint8:
+                    w = w.view(torch.uint8)
+                wdst[exp_id] = w
+
+                bs = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight_scale", device)
+                gs = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight_scale_2", device)
+                sdst[exp_id] = self._fold_scales_to_bf16(bs, gs)
+
+        print(f"[NVFP4SafeTensorLoader] Loaded {expert_count} experts from {prefix}")
         return {
             "gate": gate_weights,
             "up": up_weights,

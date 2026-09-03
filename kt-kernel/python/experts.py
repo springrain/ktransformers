@@ -19,10 +19,10 @@ Usage:
 from __future__ import annotations
 
 import torch
-from typing import List, Optional, Union
+from typing import List, Optional
 
 # Import base infrastructure for inference
-from .experts_base import BaseMoEWrapper, KExpertsCPUBuffer
+from .experts_base import BaseMoEWrapper
 
 # Import inference backend implementations
 from .utils.amx import AMXMoEWrapper, NativeMoEWrapper
@@ -41,6 +41,7 @@ INFERENCE_METHODS = frozenset(
         "GPTQ_INT4",  # GPTQ INT4
         "SYCL_GPTQ_INT4",  # GPTQ INT4 experts on a SYCL device
         "MXFP4",  # MXFP4 (E2M1 nibble + ue8m0 group scale, e.g. DeepSeek-V4-Flash routed experts)
+        "NVFP4",  # NVFP4 (E2M1 nibble + e4m3 per-16 block scale x per-tensor global, ModelOpt)
         "MXFP8",  # MXFP8 (E4M3fn byte + ue8m0 group scale, e.g. MiniMax-M3-Preview)
         "LLAMAFILE",  # GGUF format
         "MOE_INT4",
@@ -51,6 +52,8 @@ INFERENCE_METHODS = frozenset(
 SFT_METHODS = frozenset(
     [
         "AMXBF16_SFT",  # AMX BF16 training
+        "AMXFP8_SFT",  # Block-wise E4M3 routed-expert LoRA training
+        "INT8_SFT",  # Hardware-neutral INT8 training (AMX or AVX512-VNNI)
         "AMXINT8_SFT",  # AMX INT8 training
         "AMXINT4_SFT",  # AMX INT4 training
         "AMXINT4_1_SFT",  # AMX INT4_1 training
@@ -140,6 +143,7 @@ class KTMoEWrapper:
         num_gpu_experts: int = 0,
         lora_rank: int = 16,
         lora_alpha: float = 32.0,
+        lora_dropout: float = 0.0,
         max_cache_depth: int = 1,
         # Quantization config (for K-Group SFT methods)
         group_size: int = 128,
@@ -251,6 +255,7 @@ class KTMoEWrapper:
                 method=method,
                 lora_rank=lora_rank,
                 lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
                 max_cache_depth=max_cache_depth,
                 group_size=group_size,
                 zero_point=zero_point,
@@ -347,6 +352,7 @@ def _create_inference_wrapper(
         "GPTQ_INT4",
         "SYCL_GPTQ_INT4",
         "MXFP4",
+        "NVFP4",
         "MXFP8",
     ]:
         backend_cls = NativeMoEWrapper
@@ -359,23 +365,28 @@ def _create_inference_wrapper(
         raise NotImplementedError(f"Unsupported inference method: {method}")
 
     # Create and return backend instance.
-    # `swiglu_limit != 0` is meaningful only on the MXFP4 path. NativeMoEWrapper
-    # also serves RAWINT4 / FP8 / BF16 / FP8_PERCHANNEL / GPTQ_INT4, so a
+    # `swiglu_limit != 0` is validated for block-FP8, MXFP4, MXFP8 and LLAMAFILE.
+    # NativeMoEWrapper also serves RAWINT4 / BF16 / FP8_PERCHANNEL / GPTQ_INT4, so a
     # `backend_cls is NativeMoEWrapper` test would silently forward a stale
     # 10.0 (e.g., from a leftover SGLANG_DSV4_2604_SUBMODE=2604B in the env)
     # into a non-MXFP4 backend; act_fn would then clamp gate/up to ±10 with
     # no warning. Gate strictly on method instead. Origin: kt-sglang 耦合.
+    # LLAMAFILE is on the list for the same reason as the native MXFP4 path: it
+    # validates the GGUF tensor types while loading and applies the clamp in its
+    # scalar/NEON-independent activation step.
     extra_kwargs = {}
-    if method in ("MXFP4", "MXFP8"):
+    if method in ("FP8", "MXFP4", "MXFP8", "LLAMAFILE"):
         extra_kwargs["swiglu_limit"] = swiglu_limit
         extra_kwargs["swiglu_alpha"] = swiglu_alpha
     elif swiglu_limit != 0.0:
         raise ValueError(
-            f"swiglu_limit={swiglu_limit} is only supported on method='MXFP4'/'MXFP8', "
+            f"swiglu_limit={swiglu_limit} is only supported on "
+            "method='FP8'/'MXFP4'/'MXFP8'/'LLAMAFILE', "
             f"got method={method!r} (backend={backend_cls.__name__}). This "
             f"usually means SGLANG_DSV4_2604_SUBMODE=2604B is set in the "
             f"environment while the current launch does not actually use "
-            f"MXFP4/MXFP8 weights — either unset the env or pass --kt-method MXFP4/MXFP8."
+            "FP8/MXFP4/MXFP8/LLAMAFILE weights — either unset the env or select a "
+            "matching --kt-method."
         )
     return backend_cls(
         layer_idx=layer_idx,
@@ -410,6 +421,7 @@ def _create_sft_wrapper(
     method: str,
     lora_rank: int,
     lora_alpha: float,
+    lora_dropout: float,
     max_cache_depth: int,
     group_size: int,
     zero_point: bool,
@@ -440,6 +452,7 @@ def _create_sft_wrapper(
         chunked_prefill_size=chunked_prefill_size,
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
         max_cache_depth=max_cache_depth,
         method=method,
         group_size=group_size,

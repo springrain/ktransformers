@@ -2,7 +2,7 @@
 # These dependencies will be automatically installed when running `pip install .`
 # You can skip this file if you already have these packages installed
 
-# Core dependencies (minimum versions)
+# Core dependencies (keep these versions aligned with pyproject.toml and SGLang-KT)
 torch==2.13.0
 torchvision==0.28.0
 torchaudio==2.11.0

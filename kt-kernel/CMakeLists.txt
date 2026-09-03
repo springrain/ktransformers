@@ -18,7 +18,13 @@ option(KTRANSFORMERS_USE_MUSA "ktransformers: use MUSA" OFF)
 option(KTRANSFORMERS_USE_ROCM "ktransformers: use ROCM" OFF)
 option(KTRANSFORMERS_USE_MACA "ktransformers: use MACA" OFF)
 option(KTRANSFORMERS_USE_SYCL "ktransformers: use SYCL GPTQ INT4 MoE" OFF)
+option(KTRANSFORMERS_USE_ASCEND_NPU "ktransformers: use Ascend NPU (CANN)" OFF)
 option(KTRANSFORMERS_CUDA_STATIC_RUNTIME "ktransformers: statically link CUDA runtime" ON)
+option(LLAMA_ARM_DOTPROD "llama: enable ARM NEON SDOT/UDOT" ON)
+option(LLAMA_ARM_FP16 "llama: enable ARM NEON FP16" ON)
+option(LLAMA_ARM_SVE "llama: enable ARM SVE" OFF)
+option(LLAMA_ARM_BF16 "llama: enable ARM BF16" OFF)
+option(LLAMA_ARM_I8MM "llama: enable ARM I8MM" OFF)
 option(KTRANSFORMERS_CPU_USE_KML "ktransformers: CPU use KML" OFF)
 option(KTRANSFORMERS_CPU_USE_AMX_AVX512 "ktransformers: CPU use AMX or AVX512" OFF)
 option(KTRANSFORMERS_CPU_USE_AMX "ktransformers: CPU use AMX" OFF)
@@ -27,6 +33,8 @@ option(KTRANSFORMERS_CPU_MLA "ktransformers: CPU use MLA" OFF)
 option(KTRANSFORMERS_CPU_MOE_KERNEL "ktransformers: CPU use moe kernel" OFF)
 option(KTRANSFORMERS_CPU_MOE_AMD "ktransformers: CPU use moe kernel for amd" OFF)
 option(KTRANSFORMERS_ENABLE_CPPTRACE "Enable native crash tracing in kt-kernel" OFF)
+option(KTRANSFORMERS_CPU_USE_ONEDNN_VNNI "Use oneDNN BRGEMM for AVX512-VNNI INT8 kernels" OFF)
+set(KTRANSFORMERS_ONEDNN_SOURCE_DIR "" CACHE PATH "Optional oneDNN source tree (version 3.9 or newer)")
 # LTO control
 option(CPUINFER_ENABLE_LTO "Enable link time optimization (IPO)" OFF)
 
@@ -36,13 +44,14 @@ foreach(_KT_GPU_BACKEND IN ITEMS
         KTRANSFORMERS_USE_SYCL
         KTRANSFORMERS_USE_ROCM
         KTRANSFORMERS_USE_MUSA
-        KTRANSFORMERS_USE_MACA)
+        KTRANSFORMERS_USE_MACA
+        KTRANSFORMERS_USE_ASCEND_NPU)
     if(${_KT_GPU_BACKEND})
         math(EXPR _KT_GPU_BACKEND_COUNT "${_KT_GPU_BACKEND_COUNT} + 1")
     endif()
 endforeach()
 if(_KT_GPU_BACKEND_COUNT GREATER 1)
-    message(FATAL_ERROR "CUDA, SYCL, ROCm, MUSA, and MACA backends are mutually exclusive")
+    message(FATAL_ERROR "CUDA, SYCL, ROCm, MUSA, MACA, and Ascend backends are mutually exclusive")
 endif()
 
 # Choose compilers BEFORE project() so CMake honors them
@@ -238,13 +247,10 @@ if(CMAKE_OSX_ARCHITECTURES STREQUAL "arm64" OR CMAKE_GENERATOR_PLATFORM_LWR STRE
             # Raspberry Pi 3, 4, Zero 2 (32-bit)
             list(APPEND ARCH_FLAGS -mno-unaligned-access)
         endif()
-
-
-        # AArch64 ISA selection, three tiers (paired with build_helpers.py):
-        #   LLAMA_NATIVE=ON    -> -mcpu=native        (tuned for THIS host; the setup.py default)
-        #   KT_ARM_CPU=<cpu>   -> -mcpu=<cpu>         (portable across a uarch family,
-        #                                            e.g. ampere1a for Ampere One)
-        #   otherwise          -> generic baseline    (armv8-a)
+        # AArch64 ISA selection supports both the local portable/native knobs and
+        # upstream's explicit extension toggles. Explicit KT_ARM_CPU/LLAMA_NATIVE
+        # targets take precedence; otherwise the extension toggles select a
+        # suitable armv8.2-a target.
         set(KT_ARM_CPU "" CACHE STRING "AArch64 -mcpu target (e.g. ampere1a, neoverse-v2)")
         if(LLAMA_NATIVE)
             check_cxx_compiler_flag(-mcpu=native COMPILER_SUPPORTS_MCPU_NATIVE)
@@ -266,10 +272,26 @@ if(CMAKE_OSX_ARCHITECTURES STREQUAL "arm64" OR CMAKE_GENERATOR_PLATFORM_LWR STRE
             else()
                 message(FATAL_ERROR "Compiler does not support -mcpu=${KT_ARM_CPU}")
             endif()
+        elseif(LLAMA_ARM_FP16 OR LLAMA_ARM_DOTPROD OR LLAMA_ARM_SVE OR LLAMA_ARM_BF16 OR LLAMA_ARM_I8MM)
+            set(_kt_arm_arch "armv8.2-a")
+            if(LLAMA_ARM_FP16)
+                set(_kt_arm_arch "${_kt_arm_arch}+fp16")
+            endif()
+            if(LLAMA_ARM_DOTPROD)
+                set(_kt_arm_arch "${_kt_arm_arch}+dotprod")
+            endif()
+            if(LLAMA_ARM_SVE)
+                set(_kt_arm_arch "${_kt_arm_arch}+sve")
+            endif()
+            if(LLAMA_ARM_BF16)
+                set(_kt_arm_arch "${_kt_arm_arch}+bf16")
+            endif()
+            if(LLAMA_ARM_I8MM)
+                set(_kt_arm_arch "${_kt_arm_arch}+i8mm")
+            endif()
+            list(APPEND ARCH_FLAGS "-march=${_kt_arm_arch}")
+            message(STATUS "ARM target: -march=${_kt_arm_arch}")
         else()
-            # GENERIC portable build: Armv8-A baseline. Optional dot-product,
-            # FP16 and BF16 instructions are not emitted unless the selected
-            # target enables them, so the binary remains portable across AArch64.
             set(ARM_MARCH_BASE "armv8-a")
             check_cxx_compiler_flag("-march=${ARM_MARCH_BASE}" COMPILER_SUPPORTS_ARM_BASELINE)
             if(COMPILER_SUPPORTS_ARM_BASELINE)
@@ -443,6 +465,22 @@ if(KTRANSFORMERS_CPU_MOE_AMD)
     # BLIS paths and apply them after the module target is created.
 endif()
 
+if(KTRANSFORMERS_CPU_DEBUG)
+    find_package(Threads REQUIRED)
+    add_executable(
+        test_task_queue
+        ${CMAKE_CURRENT_SOURCE_DIR}/cpu_backend/test/test_task_queue.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/cpu_backend/task_queue.cpp
+    )
+    target_link_libraries(test_task_queue PRIVATE Threads::Threads)
+    add_executable(
+        test_shared_mem_buffer_lifetime
+        ${CMAKE_CURRENT_SOURCE_DIR}/cpu_backend/test/test_shared_mem_buffer_lifetime.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/cpu_backend/shared_mem_buffer.cpp
+    )
+    target_link_libraries(test_shared_mem_buffer_lifetime PRIVATE Threads::Threads numa)
+endif()
+
 
 if(HOST_IS_X86)
     if(KTRANSFORMERS_CPU_USE_AMX_AVX512)
@@ -466,7 +504,7 @@ if(HOST_IS_X86)
                 get_filename_component(test_name ${test_src} NAME_WE)
                 add_executable(${test_name} ${test_src} ${CMAKE_CURRENT_SOURCE_DIR}/cpu_backend/shared_mem_buffer.cpp)
                 target_compile_options(${test_name} PRIVATE ${ARCH_FLAGS})
-                target_link_libraries(${test_name} llama OpenMP::OpenMP_CXX numa)
+                target_link_libraries(${test_name} PRIVATE llama OpenMP::OpenMP_CXX numa)
             endforeach()
         endif()
 
@@ -500,8 +538,9 @@ endforeach()
 
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/pybind11 ${CMAKE_CURRENT_BINARY_DIR}/third_party/pybind11)
 # The upstream GGML llamafile implementation exports the same symbols as
-# KT's llamafile kernels.  KT owns this dispatch path, so do not build the
-# duplicate upstream implementation.
+# KT's llamafile kernels. KT owns this dispatch path, and the llama.cpp
+# submodule is intentionally kept at the current local revision, so do not
+# apply the historical patch series from upstream or build duplicate symbols.
 set(GGML_LLAMAFILE OFF CACHE BOOL "Disable upstream llamafile; KT supplies its own" FORCE)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/llama.cpp ${CMAKE_CURRENT_BINARY_DIR}/third_party/llama.cpp)
 
@@ -609,6 +648,27 @@ elseif(KTRANSFORMERS_USE_MACA)
     add_compile_definitions(KTRANSFORMERS_USE_MACA=1)
 elseif(KTRANSFORMERS_USE_SYCL)
     message(STATUS "SYCL GPTQ INT4 support enabled")
+elseif(KTRANSFORMERS_USE_ASCEND_NPU)
+    message(STATUS "Ascend NPU (CANN) backend selected")
+    add_compile_definitions(KTRANSFORMERS_USE_ASCEND_NPU=1)
+    add_compile_definitions(USE_ASCEND_NPU=1)
+    if(DEFINED ENV{ASCEND_TOOLKIT_HOME})
+        set(_kt_cann_root "$ENV{ASCEND_TOOLKIT_HOME}")
+    elseif(DEFINED ENV{CANN_HOME})
+        set(_kt_cann_root "$ENV{CANN_HOME}")
+    else()
+        set(_kt_cann_root "/usr/local/Ascend/ascend-toolkit/latest")
+    endif()
+    find_path(ACL_INCLUDE_DIR acl/acl_rt.h
+        HINTS "${_kt_cann_root}/include"
+        REQUIRED)
+    find_library(ASCEND_CL_LIBRARY NAMES ascendcl
+        HINTS "${_kt_cann_root}/lib64" "${_kt_cann_root}/runtime/lib64"
+        REQUIRED)
+    message(STATUS "CANN root: ${_kt_cann_root}")
+    message(STATUS "Ascend CL include: ${ACL_INCLUDE_DIR}")
+    message(STATUS "Ascend CL library: ${ASCEND_CL_LIBRARY}")
+    include_directories(${ACL_INCLUDE_DIR})
 elseif(KTRANSFORMERS_CPU_USE_KML)
     message(STATUS "KML CPU detected")
 else()
@@ -740,6 +800,33 @@ else()
     message(STATUS "LTO: disabled")
 endif()
 
+if(KTRANSFORMERS_CPU_USE_ONEDNN_VNNI)
+    if(KTRANSFORMERS_ONEDNN_SOURCE_DIR)
+        if(NOT EXISTS "${KTRANSFORMERS_ONEDNN_SOURCE_DIR}/CMakeLists.txt")
+            message(FATAL_ERROR "KTRANSFORMERS_ONEDNN_SOURCE_DIR is not a oneDNN source tree: ${KTRANSFORMERS_ONEDNN_SOURCE_DIR}")
+        endif()
+        set(DNNL_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+        set(DNNL_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(DNNL_BUILD_GRAPH OFF CACHE BOOL "" FORCE)
+        set(DNNL_CPU_RUNTIME SEQ CACHE STRING "" FORCE)
+        set(DNNL_GPU_RUNTIME NONE CACHE STRING "" FORCE)
+        set(DNNL_LIBRARY_TYPE STATIC CACHE STRING "" FORCE)
+        set(DNNL_EXPERIMENTAL_UKERNEL ON CACHE BOOL "" FORCE)
+        add_subdirectory("${KTRANSFORMERS_ONEDNN_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/third_party/onednn" EXCLUDE_FROM_ALL)
+        set(_KT_ONEDNN_TARGET dnnl)
+    else()
+        find_package(dnnl 3.9 CONFIG REQUIRED)
+        set(_KT_ONEDNN_TARGET DNNL::dnnl)
+    endif()
+    target_compile_definitions(${PROJECT_NAME} PRIVATE KTRANSFORMERS_USE_ONEDNN_VNNI=1)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${_KT_ONEDNN_TARGET})
+    if(TARGET test_onednn_int8_brgemm)
+        target_compile_definitions(test_onednn_int8_brgemm PRIVATE KTRANSFORMERS_USE_ONEDNN_VNNI=1)
+        target_link_libraries(test_onednn_int8_brgemm PRIVATE ${_KT_ONEDNN_TARGET})
+    endif()
+    message(STATUS "INT8 AVX512-VNNI backend: oneDNN BRGEMM enabled")
+endif()
+
 if(KTRANSFORMERS_USE_SYCL)
     target_compile_definitions(${PROJECT_NAME} PRIVATE USE_SYCL=1)
     target_compile_options(${PROJECT_NAME} PRIVATE
@@ -815,6 +902,10 @@ if(NOT HOST_IS_X86 AND KTRANSFORMERS_CPU_USE_KML)
     target_compile_definitions(${PROJECT_NAME} PRIVATE CPU_USE_KML)
 endif()
 target_link_libraries(${PROJECT_NAME} PRIVATE llama PkgConfig::HWLOC OpenMP::OpenMP_CXX)
+if(KTRANSFORMERS_USE_ASCEND_NPU AND ASCEND_CL_LIBRARY)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${ASCEND_CL_LIBRARY})
+    target_include_directories(${PROJECT_NAME} PRIVATE ${ACL_INCLUDE_DIR})
+endif()
 if(NOT HOST_IS_X86 AND KTRANSFORMERS_CPU_USE_KML)
     if(KTRANSFORMERS_CPU_DEBUG)
         # add_executable(convert-test ${CMAKE_CURRENT_SOURCE_DIR}/operators/kml/convert-test.cpp)
