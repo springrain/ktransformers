@@ -36,6 +36,31 @@
 #include "neon_bf16_utils.hpp"
 #include "ggml.h"
 
+// ---------------------------------------------------------------------------
+// Phase timing for the ARM MoE decode path.  Same env var as the llamafile
+// backend (KT_MOE_PHASE_TIMING=1) so both engines can be profiled and their
+// per-layer µs compared directly.  Cost when unset: one getenv + one branch.
+// ---------------------------------------------------------------------------
+namespace armmoe_detail {
+static inline bool phase_timing_on() {
+  static const bool on = std::getenv("KT_MOE_PHASE_TIMING") != nullptr;
+  return on;
+}
+static inline uint64_t phase_report_interval() {
+  static const uint64_t interval = [] {
+    const char* raw = std::getenv("KT_MOE_PHASE_TIMING_INTERVAL");
+    const uint64_t parsed = raw ? std::strtoull(raw, nullptr, 10) : 0;
+    return parsed ? parsed : 4096;
+  }();
+  return interval;
+}
+struct ArmMoePhaseAcc {
+  uint64_t calls = 0, expert_sum = 0;
+  uint64_t prep_ns = 0, gateup_ns = 0, down_ns = 0, tail_ns = 0, total_ns = 0;
+};
+inline ArmMoePhaseAcc g_arm_moe_phase_acc[16];
+}  // namespace armmoe_detail
+
 template <class T, class Derived>
 class NEON_MOE_BASE {
  public:
@@ -49,6 +74,13 @@ class NEON_MOE_BASE {
   std::vector<std::vector<int>> m_local_pos_;
   std::vector<int> m_local_num_;
   std::vector<int> m_expert_id_map_;
+  // Decode-time context stashed for the fused derived hooks
+  // (decode_gate_up_activation / decode_down_projection), which need routing
+  // weights and the final output pointer but only receive (activated, qlen).
+  int decode_k_ = 0;
+  const int64_t* decode_expert_ids_ = nullptr;
+  const float* decode_weights_ = nullptr;
+  float* decode_output_ = nullptr;
   std::vector<ggml_bf16_t*> m_local_input_ptr_;
   std::vector<ggml_bf16_t*> m_local_gate_output_ptr_;
   std::vector<ggml_bf16_t*> m_local_up_output_ptr_;
@@ -359,6 +391,8 @@ class NEON_MOE_BASE {
   void forward_decode(int k, const int64_t* expert_ids, const float* weights, const void* input, void* output) {
     int qlen = 1;
     auto pool = config_.pool->get_subpool(tp_part_idx);
+    const bool kt_pt = armmoe_detail::phase_timing_on();
+    const auto kt_t0 = std::chrono::high_resolution_clock::now();
 
     int activated_expert = 0;
     std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
@@ -369,6 +403,12 @@ class NEON_MOE_BASE {
       m_local_num_[expert_ids[i]] = qlen;
       activated_expert++;
     }
+
+    // Stash routing context for fused derived decode hooks.
+    decode_k_ = k;
+    decode_expert_ids_ = expert_ids;
+    decode_weights_ = weights;
+    decode_output_ = static_cast<float*>(output);
 
     size_t offset = 0;
     for (int i = 0; i < activated_expert; i++) {
@@ -426,6 +466,7 @@ class NEON_MOE_BASE {
           (void*)((uintptr_t)gate_up_ba_pool_ptr + align64(buffer_a_required_size(max_m, config_.hidden_size)));
       gate_up_ba_[expert_idx]->from_mat(qlen, (ggml_bf16_t*)input, 0, 1);
     }
+    const auto kt_t1 = std::chrono::high_resolution_clock::now();
 
     // Gate + Up GEMM
     int nth = T::recommended_nth(config_.intermediate_size);
@@ -461,10 +502,14 @@ class NEON_MOE_BASE {
           nullptr);
     }
 
+    const auto kt_t2 = std::chrono::high_resolution_clock::now();
+
     // Down GEMM
     nth = T::recommended_nth(config_.hidden_size);
     if constexpr (has_fused_down_decode()) {
-      if (activated_expert > 0) run_fused_down_decode(activated_expert, qlen);
+      // Always run: the fused path owns the weighted merge, so it must also
+      // zero the output when no CPU expert is activated this token.
+      run_fused_down_decode(activated_expert, qlen);
     } else {
       pool->do_work_stealing_job(
           nth * activated_expert, [](int) { T::config(); },
@@ -475,23 +520,45 @@ class NEON_MOE_BASE {
             down_bc_[expert_idx]->to_mat(qlen, m_local_down_output_ptr_[expert_idx], ith, nth);
           },
           nullptr);
+
+      // Weighted sum — NEON (16 BF16 at a time)
+      for (int e = 0; e < config_.hidden_size; e += 16) {
+        armneon::v8f32 x0 = armneon::zero_v8f32();
+        armneon::v8f32 x1 = armneon::zero_v8f32();
+        for (int j = 0; j < k; j++) {
+          if (config_.should_skip_expert(expert_ids[j])) continue;
+          armneon::v8f32 weight = armneon::set1_v8f32(weights[j]);
+          armneon::v8f32 d0, d1;
+          armneon::load_16xbf16_to_2x8xfp32(
+              m_local_down_output_ptr_[expert_ids[j]] + m_local_pos_[0][j] * config_.hidden_size + e, &d0, &d1);
+          x0 = armneon::fmadd_v8f32(d0, weight, x0);
+          x1 = armneon::fmadd_v8f32(d1, weight, x1);
+        }
+        armneon::store_v8f32((float*)output + e, x0);
+        armneon::store_v8f32((float*)output + e + 8, x1);
+      }
     }
 
-    // Weighted sum — NEON (16 BF16 at a time)
-    for (int e = 0; e < config_.hidden_size; e += 16) {
-      armneon::v8f32 x0 = armneon::zero_v8f32();
-      armneon::v8f32 x1 = armneon::zero_v8f32();
-      for (int j = 0; j < k; j++) {
-        if (config_.should_skip_expert(expert_ids[j])) continue;
-        armneon::v8f32 weight = armneon::set1_v8f32(weights[j]);
-        armneon::v8f32 d0, d1;
-        armneon::load_16xbf16_to_2x8xfp32(
-            m_local_down_output_ptr_[expert_ids[j]] + m_local_pos_[0][j] * config_.hidden_size + e, &d0, &d1);
-        x0 = armneon::fmadd_v8f32(d0, weight, x0);
-        x1 = armneon::fmadd_v8f32(d1, weight, x1);
+    if (kt_pt) {
+      const auto kt_t3 = std::chrono::high_resolution_clock::now();
+      auto ns = [](auto a, auto b) {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+      };
+      auto& acc = armmoe_detail::g_arm_moe_phase_acc[tp_part_idx & 15];
+      acc.calls++;
+      acc.expert_sum += activated_expert;
+      acc.prep_ns += ns(kt_t0, kt_t1);
+      acc.gateup_ns += ns(kt_t1, kt_t2);
+      acc.down_ns += ns(kt_t2, kt_t3);
+      acc.total_ns += ns(kt_t0, kt_t3);
+      if (acc.calls % armmoe_detail::phase_report_interval() == 0) {
+        fprintf(stderr,
+                "[KT_PHASE_ARM tp%d] n=%llu avg_experts=%.1f avg/layer-call: prep=%.1fus gateup=%.1fus "
+                "down=%.1fus total=%.1fus\n",
+                tp_part_idx, (unsigned long long)acc.calls, (double)acc.expert_sum / acc.calls,
+                acc.prep_ns / 1e3 / acc.calls, acc.gateup_ns / 1e3 / acc.calls, acc.down_ns / 1e3 / acc.calls,
+                acc.total_ns / 1e3 / acc.calls);
       }
-      armneon::store_v8f32((float*)output + e, x0);
-      armneon::store_v8f32((float*)output + e + 8, x1);
     }
   }
 
@@ -540,57 +607,62 @@ class NEON_MOE_BASE {
     return derived_const()->make_buffer_c_impl(m, n, data);
   }
 
+  // One (expert, ith) slice of the SiLU activation over this thread's
+  // [n_start, n_end) range.  Shared by the staged path below and by fused
+  // derived decode hooks (which run it inside the gate/up pool job).
+  void apply_activation_block(int expert_idx, int ith, int nth) {
+    auto [n_start, n_end] = T::split_range_n(config_.intermediate_size, ith, nth);
+    const float swiglu_limit = config_.swiglu_limit;
+    const float swiglu_alpha = config_.swiglu_alpha;
+    for (int i = 0; i < m_local_num_[expert_idx]; i++) {
+      ggml_bf16_t* gate_ptr = &m_local_gate_output_ptr_[expert_idx][i * config_.intermediate_size];
+      ggml_bf16_t* up_ptr = &m_local_up_output_ptr_[expert_idx][i * config_.intermediate_size];
+      int j = n_start;
+      for (; j + 8 <= n_end; j += 8) {
+        armneon::v8f32 gate_val = armneon::load_bf16_to_fp32(gate_ptr + j);
+        armneon::v8f32 up_val = armneon::load_bf16_to_fp32(up_ptr + j);
+        armneon::v8f32 result;
+        if constexpr (requires(Derived& backend) {
+                        backend.custom_activation(gate_val, up_val, swiglu_limit, swiglu_alpha);
+                      }) {
+          result = derived()->custom_activation(gate_val, up_val, swiglu_limit, swiglu_alpha);
+        } else {
+          result = armneon::act_fn(gate_val, up_val, swiglu_limit, swiglu_alpha);
+        }
+        armneon::store_fp32_to_bf16(gate_ptr + j, result);
+      }
+      // Scalar tail — mirror the vectorized swigluoai / silu paths in armneon::act_fn.
+      for (; j < n_end; j++) {
+        float g = ggml_bf16_to_fp32(gate_ptr[j]);
+        float u = ggml_bf16_to_fp32(up_ptr[j]);
+        if constexpr (requires(Derived& backend) { backend.custom_activation(g, u, swiglu_limit, swiglu_alpha); }) {
+          gate_ptr[j] = ggml_fp32_to_bf16(derived()->custom_activation(g, u, swiglu_limit, swiglu_alpha));
+        } else {
+          if (swiglu_alpha > 0.0f) {
+            if (swiglu_limit > 0.0f) {
+              g = std::min(std::max(g, -swiglu_limit), swiglu_limit);
+              u = std::min(std::max(u, -swiglu_limit), swiglu_limit);
+            }
+            float sigmoid_ga = 1.0f / (1.0f + expf(-g * swiglu_alpha));
+            gate_ptr[j] = ggml_fp32_to_bf16(g * sigmoid_ga * (u + 1.0f));
+          } else {
+            if (swiglu_limit > 0.0f) {
+              g = std::min(g, swiglu_limit);
+              u = std::min(std::max(u, -swiglu_limit), swiglu_limit);
+            }
+            float sigmoid_g = 1.0f / (1.0f + expf(-g));
+            gate_ptr[j] = ggml_fp32_to_bf16(g * sigmoid_g * u);
+          }
+        }
+      }
+    }
+  }
+
   // SiLU activation — NEON: process 8 BF16 elements at a time
   void apply_activation(int activated_expert, int nth, int qlen) {
     auto pool = config_.pool->get_subpool(tp_part_idx);
     auto fn = [this, nth](int task_id) {
-      int expert_idx = m_expert_id_map_[task_id / nth];
-      int ith = task_id % nth;
-      auto [n_start, n_end] = T::split_range_n(config_.intermediate_size, ith, nth);
-      const float swiglu_limit = config_.swiglu_limit;
-      const float swiglu_alpha = config_.swiglu_alpha;
-      for (int i = 0; i < m_local_num_[expert_idx]; i++) {
-        ggml_bf16_t* gate_ptr = &m_local_gate_output_ptr_[expert_idx][i * config_.intermediate_size];
-        ggml_bf16_t* up_ptr = &m_local_up_output_ptr_[expert_idx][i * config_.intermediate_size];
-        int j = n_start;
-        for (; j + 8 <= n_end; j += 8) {
-          armneon::v8f32 gate_val = armneon::load_bf16_to_fp32(gate_ptr + j);
-          armneon::v8f32 up_val = armneon::load_bf16_to_fp32(up_ptr + j);
-          armneon::v8f32 result;
-          if constexpr (requires(Derived& backend) {
-                          backend.custom_activation(gate_val, up_val, swiglu_limit, swiglu_alpha);
-                        }) {
-            result = derived()->custom_activation(gate_val, up_val, swiglu_limit, swiglu_alpha);
-          } else {
-            result = armneon::act_fn(gate_val, up_val, swiglu_limit, swiglu_alpha);
-          }
-          armneon::store_fp32_to_bf16(gate_ptr + j, result);
-        }
-        // Scalar tail — mirror the vectorized swigluoai / silu paths in armneon::act_fn.
-        for (; j < n_end; j++) {
-          float g = ggml_bf16_to_fp32(gate_ptr[j]);
-          float u = ggml_bf16_to_fp32(up_ptr[j]);
-          if constexpr (requires(Derived& backend) { backend.custom_activation(g, u, swiglu_limit, swiglu_alpha); }) {
-            gate_ptr[j] = ggml_fp32_to_bf16(derived()->custom_activation(g, u, swiglu_limit, swiglu_alpha));
-          } else {
-            if (swiglu_alpha > 0.0f) {
-              if (swiglu_limit > 0.0f) {
-                g = std::min(std::max(g, -swiglu_limit), swiglu_limit);
-                u = std::min(std::max(u, -swiglu_limit), swiglu_limit);
-              }
-              float sigmoid_ga = 1.0f / (1.0f + expf(-g * swiglu_alpha));
-              gate_ptr[j] = ggml_fp32_to_bf16(g * sigmoid_ga * (u + 1.0f));
-            } else {
-              if (swiglu_limit > 0.0f) {
-                g = std::min(g, swiglu_limit);
-                u = std::min(std::max(u, -swiglu_limit), swiglu_limit);
-              }
-              float sigmoid_g = 1.0f / (1.0f + expf(-g));
-              gate_ptr[j] = ggml_fp32_to_bf16(g * sigmoid_g * u);
-            }
-          }
-        }
-      }
+      apply_activation_block(m_expert_id_map_[task_id / nth], task_id % nth, nth);
     };
 
     if (activated_expert == 0) return;

@@ -24,16 +24,26 @@ template <class T = armneon::GemmKernelNeonMXFP4>
 class NEON_MXFP4_MOE_TP : public NEON_MOE_BASE<T, NEON_MXFP4_MOE_TP<T>> {
   using Base = NEON_MOE_BASE<T, NEON_MXFP4_MOE_TP<T>>;
   using Base::config_;
+  using Base::decode_expert_ids_;
+  using Base::decode_k_;
+  using Base::decode_output_;
+  using Base::decode_weights_;
   using Base::down_ba_;
   using Base::down_bb_;
   using Base::down_bc_;
   using Base::gate_bb_;
   using Base::gate_bc_;
+  using Base::gate_bc_pool_;
   using Base::gate_up_ba_;
+  using Base::m_expert_id_map_;
+  using Base::m_local_down_output_ptr_;
+  using Base::m_local_gate_output_ptr_;
   using Base::m_local_num_;
+  using Base::m_local_up_output_ptr_;
   using Base::tp_part_idx;
   using Base::up_bb_;
   using Base::up_bc_;
+  using Base::up_bc_pool_;
 
  public:
   using typename Base::input_t;
@@ -53,10 +63,10 @@ class NEON_MXFP4_MOE_TP : public NEON_MOE_BASE<T, NEON_MXFP4_MOE_TP<T>> {
     }
     printf("Created NEON_MXFP4_MOE_TP %d at numa %d (group_size=%d)\n", tp_part_idx,
            numa_node_of_cpu(sched_getcpu()), q.group_size);
-#if defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
-    printf("NEON MXFP4 path: packed decode + native BFDOT\n");
+#if defined(__ARM_FEATURE_DOTPROD)
+    printf("NEON MXFP4 path: int8 packed decode + SDOT, fused 2-barrier decode\n");
 #else
-    printf("NEON MXFP4 path: packed decode + FP32 FMA fallback\n");
+    printf("NEON MXFP4 path: int8 packed decode + widening MAC fallback, fused 2-barrier decode\n");
 #endif
   }
 
@@ -90,6 +100,111 @@ class NEON_MXFP4_MOE_TP : public NEON_MOE_BASE<T, NEON_MXFP4_MOE_TP<T>> {
     const int m = m_local_num_[expert_idx];
     armneon::gemm_mxfp4(m, config_.hidden_size, config_.intermediate_size, *down_ba_[expert_idx],
                         *down_bb_[expert_idx], *down_bc_[expert_idx], ith, nth);
+  }
+
+  // ---------------------------------------------------------------------
+  // Fused decode path (qlen == 1), enabled by the presence of these two
+  // methods: the base forward_decode then delegates gate/up+activation and
+  // down+merge to us.  Mirrors the llamafile forward_one structure — ONE
+  // pool job for gate+up GEMM + SiLU + down-input staging, ONE pool job for
+  // down GEMM + weighted merge (2 barriers per layer per token).  The stage
+  // path the base would otherwise run costs 3 pool barriers plus two serial
+  // passes (activation and weighted merge) on the caller thread, which is
+  // what made MXFP4 decode slower than the LLAMAFILE backend despite moving
+  // fewer bytes.
+  // ---------------------------------------------------------------------
+
+  void decode_gate_up_activation(int activated_experts, int qlen) {
+    assert(qlen == 1);
+    // The base decode skips gate/up C-buffer wiring when this hook exists
+    // (a truly bufferless fused kernel would not need it); our GEMM still
+    // writes partial results through BufferC, so do the same setup here.
+    void* gate_bc_pool_ptr = gate_bc_pool_;
+    void* up_bc_pool_ptr = up_bc_pool_;
+    auto align64 = [](size_t v) { return (v + 63) & (~(size_t)63); };
+    const size_t max_m = 1;
+    for (int i = 0; i < activated_experts; i++) {
+      auto expert_idx = m_expert_id_map_[i];
+      gate_bc_[expert_idx]->max_m = max_m;
+      gate_bc_[expert_idx]->set_data(gate_bc_pool_ptr);
+      gate_bc_pool_ptr = reinterpret_cast<void*>(
+          reinterpret_cast<uintptr_t>(gate_bc_pool_ptr) +
+          align64(Base::buffer_c_required_size(max_m, config_.intermediate_size)));
+      up_bc_[expert_idx]->max_m = max_m;
+      up_bc_[expert_idx]->set_data(up_bc_pool_ptr);
+      up_bc_pool_ptr = reinterpret_cast<void*>(
+          reinterpret_cast<uintptr_t>(up_bc_pool_ptr) +
+          align64(Base::buffer_c_required_size(max_m, config_.intermediate_size)));
+    }
+
+    auto pool = config_.pool->get_subpool(tp_part_idx);
+    const int inter = config_.intermediate_size;
+    const int nth = T::recommended_nth(inter);
+    pool->do_work_stealing_job(
+        nth * activated_experts, [](int) { T::config(); },
+        [this, nth](int task_id) {
+          int expert_idx = m_expert_id_map_[task_id / nth];
+          int ith = task_id % nth;
+          do_gate_up_gemm(false, expert_idx, ith, nth, 1);
+          do_gate_up_gemm(true, expert_idx, ith, nth, 1);
+          ggml_bf16_t* gate_ptr = m_local_gate_output_ptr_[expert_idx];
+          ggml_bf16_t* up_ptr = m_local_up_output_ptr_[expert_idx];
+          gate_bc_[expert_idx]->to_mat(1, gate_ptr, ith, nth);
+          up_bc_[expert_idx]->to_mat(1, up_ptr, ith, nth);
+          // Same activation code as the staged path, on our column block.
+          Base::apply_activation_block(expert_idx, ith, nth);
+          // Stage the activated block as the down-GEMM input.  BufferA is
+          // plain row-major BF16 (from_mat degenerates to a copy), so a
+          // partial-block memcpy is exact.
+          auto [n_start, n_end] = T::split_range_n(config_.intermediate_size, ith, nth);
+          std::memcpy(down_ba_[expert_idx]->data + n_start, gate_ptr + n_start,
+                      static_cast<size_t>(n_end - n_start) * sizeof(ggml_bf16_t));
+        },
+        nullptr);
+  }
+
+  void decode_down_projection(int activated_experts, int qlen) {
+    assert(qlen == 1);
+    auto pool = config_.pool->get_subpool(tp_part_idx);
+    const int hidden = config_.hidden_size;
+    const int nth = T::recommended_nth(hidden);
+    float* output = decode_output_;
+    const int64_t* expert_ids = decode_expert_ids_;
+    const float* weights = decode_weights_;
+    const int k = decode_k_;
+    pool->do_work_stealing_job(
+        nth, [](int) { T::config(); },
+        [this, nth, hidden, activated_experts, output, expert_ids, weights, k](int ith) {
+          auto [n_start, n_end] = T::split_range_n(hidden, ith, nth);
+          int e = n_start;
+          for (; e + 8 <= n_end; e += 8) armneon::store_v8f32(output + e, armneon::zero_v8f32());
+          for (; e < n_end; ++e) output[e] = 0.0f;
+          for (int a = 0; a < activated_experts; a++) {
+            int expert_idx = m_expert_id_map_[a];
+            float weight = 0.0f;
+            for (int j = 0; j < k; j++) {
+              if (expert_ids[j] == expert_idx) {
+                weight = weights[j];
+                break;
+              }
+            }
+            do_down_gemm(expert_idx, ith, nth, 1);
+            ggml_bf16_t* dptr = m_local_down_output_ptr_[expert_idx];
+            down_bc_[expert_idx]->to_mat(1, dptr, ith, nth);
+            const armneon::v8f32 wv = armneon::set1_v8f32(weight);
+            e = n_start;
+            for (; e + 16 <= n_end; e += 16) {
+              armneon::v8f32 d0, d1;
+              armneon::load_16xbf16_to_2x8xfp32(dptr + e, &d0, &d1);
+              armneon::store_v8f32(output + e,
+                                   armneon::fmadd_v8f32(d0, wv, armneon::load_v8f32(output + e)));
+              armneon::store_v8f32(output + e + 8,
+                                   armneon::fmadd_v8f32(d1, wv, armneon::load_v8f32(output + e + 8)));
+            }
+            for (; e < n_end; ++e) output[e] += ggml_bf16_to_fp32(dptr[e]) * weight;
+          }
+        },
+        nullptr);
   }
 
   // Load native packed MXFP4 weights.  Python's MXFP4SafeTensorLoader gives
