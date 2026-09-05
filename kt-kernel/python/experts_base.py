@@ -12,6 +12,7 @@ from __future__ import annotations
 import torch
 from typing import Dict, List, Optional, Tuple
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 import ctypes
 import logging
 import os
@@ -159,6 +160,18 @@ def _wait_device(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def _graph_capture_active(device: torch.device) -> bool:
+    """True while a stream capture may still record host nodes referencing our buffers."""
+    try:
+        if device.type == "cuda":
+            return bool(torch.cuda.is_current_stream_capturing()) or _sglang_is_capture_mode()
+        if device.type == "npu":
+            return bool(torch.npu.is_current_stream_capturing()) or _sglang_is_capture_mode()  # type: ignore[attr-defined]
+    except Exception:
+        return True
+    return False
+
+
 def generate_gpu_experts_masks(
     activation_freq: torch.Tensor,
     num_gpu_experts: int,
@@ -222,8 +235,14 @@ class KExpertsCPUBuffer:
 
     capture_bs: List = list()
     capture_buffers: Dict = dict()
-    temp_bs: int = 0
-    temp_buffer: tuple = tuple()
+    # Bounded LRU of buffers for sizes not in capture_bs. The old single-slot
+    # temp_buffer dropped the previous pinned tensors on every size change
+    # while deferred CPU tasks could still hold their raw pointers; workers
+    # then wrote into freed/unregistered host memory and the process died
+    # much later at an unrelated site (e.g. inside cuGraphLaunch). Buffers
+    # here are only dropped via _evict_oldest_temp_buffer, which drains first.
+    temp_buffers: OrderedDict = OrderedDict()
+    max_temp_buffer_sizes: int = int(os.environ.get("KT_MAX_TEMP_BUFFER_SIZES", "4"))
     buffer_depth: int = 2
 
     @classmethod
@@ -235,8 +254,9 @@ class KExpertsCPUBuffer:
 
         if batch_size in cls.capture_buffers:
             return cls.capture_buffers[batch_size]
-        if batch_size == cls.temp_bs:
-            return cls.temp_buffer
+        if batch_size in cls.temp_buffers:
+            cls.temp_buffers.move_to_end(batch_size)
+            return cls.temp_buffers[batch_size]
 
         input_tensor_cpu = [
             torch.zeros((batch_size, hidden_size), device="cpu", pin_memory=pin_memory, dtype=torch.bfloat16)
@@ -277,10 +297,34 @@ class KExpertsCPUBuffer:
             output_gpu,
         )
         if batch_size in cls.capture_bs:
+            # Host nodes captured into CUDA graphs dereference these pinned
+            # pointers on every replay; never evict.
             cls.capture_buffers[batch_size] = cur_buffer
-        cls.temp_bs = batch_size
-        cls.temp_buffer = cur_buffer
+            return cur_buffer
+
+        cls.temp_buffers[batch_size] = cur_buffer
+        if len(cls.temp_buffers) > cls.max_temp_buffer_sizes:
+            cls._evict_oldest_temp_buffer(hidden_states.device)
         return cur_buffer
+
+    @classmethod
+    def _evict_oldest_temp_buffer(cls, device: torch.device) -> None:
+        """Drop the LRU temp buffer only after no dangling pointer can remain.
+
+        CPU workers may still hold raw pointers into the evicted pinned tensors:
+        tasks submitted via submit_with_cuda_stream only enter the CPU queue
+        when the stream's host callback fires, so the device must be drained
+        before draining the CPU task queue.
+        """
+        if _graph_capture_active(device):
+            # Cannot synchronize during capture; prefer extra pinned memory
+            # over a dangling pointer in a captured host node.
+            return
+        _wait_device(device)
+        cpu_infer = _MoEBase._cpu_infer_instance
+        if cpu_infer is not None:
+            cpu_infer.sync(0)
+        cls.temp_buffers.popitem(last=False)
 
 
 class _MoEBase:
@@ -935,6 +979,5 @@ class BaseMoEWrapper(_MoEBase, ABC):
         to reset the buffer state or free memory.
         """
         KExpertsCPUBuffer.capture_buffers.clear()
-        KExpertsCPUBuffer.temp_bs = 0
-        KExpertsCPUBuffer.temp_buffer = tuple()
+        KExpertsCPUBuffer.temp_buffers.clear()
 
