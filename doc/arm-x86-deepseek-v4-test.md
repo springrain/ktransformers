@@ -25,6 +25,8 @@
 - **推理后端**：HeterogeneousComputing + LLAMAFILE GGUF CPU + GPU协同计算
 
 > ⚠️ **ARM + 双卡 PCIe（无 NVLink）必配参数**：TP≥2 启动时必须加 **`--disable-custom-all-reduce`**。sglang 自定义 all-reduce v1 kernel(`cross_device_reduce_1stage`）在该平台存在 P2P 信号可见性失效问题，双 rank 互旋导致服务永久冻结（4/4 coredump 实锤，bs=1 探针与洪峰压测均可复现）；加此参数后全部集合通信落 NCCL（实测稳定），且与 KT 动态专家热更新（`--kt-enable-dynamic-expert-update`）完全正交。x86 平台及 aarch64 + 全 NVLink（如 Grace-Blackwell NVL）不受影响。
+>
+> ⚠️ **参数约束**：`--kt-gpu-prefill-token-threshold` 必须 ≥ `--chunked-prefill-size`。该阈值是热更新 GPU 路径的触发门槛；若小于 chunked prefill 大小，洪峰时每个满 chunk 都会触发一次热更新（broadcast + 双 `torch.cuda.synchronize` 插在 forward 中间），持续放大延迟与风险。
 
 ### 2.2 x86平台(Intel Xeon Gold 6530)
 

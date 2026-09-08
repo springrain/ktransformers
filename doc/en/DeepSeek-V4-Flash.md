@@ -192,6 +192,9 @@ See [KT-Kernel Parameters](https://github.com/kvcache-ai/ktransformers/tree/main
 >
 > x86 平台（无论有无 NVLink）以及 aarch64 + 全 NVLink 互联（如 Grace-Blackwell NVL）**不受影响**。
 
+> **⚠️ 参数约束：`--kt-gpu-prefill-token-threshold` 必须 ≥ `--chunked-prefill-size`。**
+> 该阈值是动态专家热更新 GPU 路径的触发门槛（当批内 prefill token 数 ≥ 阈值时执行热更新）。若阈值小于 chunked prefill 大小，高负载下每一个满 chunk 都会触发一次热更新（broadcast + 双 `torch.cuda.synchronize` 插在 forward 中间），洪峰时被持续激活、显著放大延迟并增加风险；阈值 ≥ chunked prefill 大小可保证热更新只按预期节奏触发。上面示例命令中 `4096 ≥ 2048`，满足约束。
+
 ### Optional: Enable MTP (Multi-Token Prediction) Speculative Decoding
 
 V4-Flash ships a NextN draft head that can be run as EAGLE-style speculative decoding for ~1.2× throughput on single-request decode (validated 26.5 → 32.74 tok/s on 8× RTX 5090, 90% accept rate at chain depth 1).
