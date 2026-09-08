@@ -20,9 +20,11 @@
 - **CPU**：AmpereOne(`ampere1/ampere1a/ampere1b`)，高核心数(如192核)架构
 - **构建**：`-mcpu=native` 默认原生构建
 - **关键指令集**：NEON(asimd)、FP16(asimdhp/fphp)、BF16(bf16)、INT8 dot(asimddp)、I8MM(i8mm)
-- **GPU**：**双路 NVIDIA RTX PRO 6000**(与x86平台完全相同)
+- **GPU**：**双路 NVIDIA RTX PRO 6000**(与x86平台完全相同,PCIe 互联,无 NVLink)
 - **内存**: 1T DDR5
 - **推理后端**：HeterogeneousComputing + LLAMAFILE GGUF CPU + GPU协同计算
+
+> ⚠️ **ARM + 双卡 PCIe（无 NVLink）必配参数**：TP≥2 启动时必须加 **`--disable-custom-all-reduce`**。sglang 自定义 all-reduce v1 kernel(`cross_device_reduce_1stage`）在该平台存在 P2P 信号可见性失效问题，双 rank 互旋导致服务永久冻结（4/4 coredump 实锤，bs=1 探针与洪峰压测均可复现）；加此参数后全部集合通信落 NCCL（实测稳定），且与 KT 动态专家热更新（`--kt-enable-dynamic-expert-update`）完全正交。x86 平台及 aarch64 + 全 NVLink（如 Grace-Blackwell NVL）不受影响。
 
 ### 2.2 x86平台(Intel Xeon Gold 6530)
 

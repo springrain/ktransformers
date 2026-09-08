@@ -185,6 +185,13 @@ It takes about 4-5 minutes to start the server (weight load + CUDA Graph capture
 
 See [KT-Kernel Parameters](https://github.com/kvcache-ai/ktransformers/tree/main/kt-kernel#kt-kernel-parameters) for detailed parameter tuning guidelines.
 
+> **⚠️ aarch64 主机 + PCIe 互联 GPU（无 NVLink）、TP ≥ 2 时必配：**
+> 启动命令必须加 **`--disable-custom-all-reduce`**。
+>
+> 在该平台组合下（如 AmpereOne 主机 + 双路 RTX PRO 6000 Blackwell、无 NVLink 桥），SGLang 的自定义 all-reduce v1 kernel(`cross_device_reduce_1stage`）在运行期会死锁：两个 rank 自旋等待的 P2P 信号在 PCIe 上永远无法可见，双卡永久冻结（4/4 CUDA coredump 实锤，bs=1 单请求与高并发洪峰均可复现）。加上 `--disable-custom-all-reduce` 后，全部集合通信回落 NCCL——这是该平台已验证稳定的通信路径，且与 KT-Kernel 动态专家热更新（`--kt-enable-dynamic-expert-update`）完全正交，热更新照常工作。
+>
+> x86 平台（无论有无 NVLink）以及 aarch64 + 全 NVLink 互联（如 Grace-Blackwell NVL）**不受影响**。
+
 ### Optional: Enable MTP (Multi-Token Prediction) Speculative Decoding
 
 V4-Flash ships a NextN draft head that can be run as EAGLE-style speculative decoding for ~1.2× throughput on single-request decode (validated 26.5 → 32.74 tok/s on 8× RTX 5090, 90% accept rate at chain depth 1).
