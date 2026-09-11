@@ -255,6 +255,14 @@ class KExpertsCPUBuffer:
         if batch_size in cls.capture_buffers:
             return cls.capture_buffers[batch_size]
         if batch_size in cls.temp_buffers:
+            if batch_size in cls.capture_bs or _graph_capture_active(hidden_states.device):
+                # The buffer predates its registration (e.g. EagerRunner warm-up
+                # runs before set_capture_batch_sizes) or is being recorded into
+                # a graph right now. It must leave the LRU: captured host nodes
+                # dereference the pinned pointers on every replay, long after
+                # eviction would have freed them.
+                cls.capture_buffers[batch_size] = cls.temp_buffers.pop(batch_size)
+                return cls.capture_buffers[batch_size]
             cls.temp_buffers.move_to_end(batch_size)
             return cls.temp_buffers[batch_size]
 
@@ -296,9 +304,11 @@ class KExpertsCPUBuffer:
             bsz_tensor_cpu,
             output_gpu,
         )
-        if batch_size in cls.capture_bs:
+        if batch_size in cls.capture_bs or _graph_capture_active(hidden_states.device):
             # Host nodes captured into CUDA graphs dereference these pinned
-            # pointers on every replay; never evict.
+            # pointers on every replay; never evict. Registration should cover
+            # every captured shape, but prefer extra pinned memory over a
+            # dangling pointer if a capture path misses it.
             cls.capture_buffers[batch_size] = cur_buffer
             return cur_buffer
 
@@ -973,11 +983,17 @@ class BaseMoEWrapper(_MoEBase, ABC):
     @staticmethod
     def clear_buffer_cache():
         """
-        Clear all cached buffers.
+        Clear evictable temp buffers after draining in-flight work.
 
-        This frees up memory by clearing the buffer cache. Useful when you want
-        to reset the buffer state or free memory.
+        Capture buffers are never freed here: CUDA graph host nodes reference
+        their pinned pointers on every replay, so dropping them while any
+        graph may still be launched is a use-after-free. Must not be called
+        during graph capture.
         """
-        KExpertsCPUBuffer.capture_buffers.clear()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        cpu_infer = _MoEBase._cpu_infer_instance
+        if cpu_infer is not None:
+            cpu_infer.sync(0)
         KExpertsCPUBuffer.temp_buffers.clear()
 
