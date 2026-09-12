@@ -19,7 +19,7 @@ from typing import Optional, Tuple
 from abc import ABC, abstractmethod
 
 from ..experts_base import KExpertsCPUBuffer, _MoEBase
-from .backend import is_fp8_sft_method, is_int8_sft_method
+from .backend import is_fp8_sft_method, is_int8_sft_method, is_rawint4_sft_method
 
 
 def _supports_authoritative_optimizer_grads(
@@ -39,7 +39,7 @@ def _supports_authoritative_optimizer_grads(
     if method == "AMXBF16_SFT":
         return True
     return (
-        (is_int8_sft_method(method) or is_fp8_sft_method(method))
+        (is_int8_sft_method(method) or is_fp8_sft_method(method) or is_rawint4_sft_method(method))
         and not bool(full_weight_grad)
         and int(lora_rank) > 0
     )
@@ -675,7 +675,8 @@ class BaseSFTMoEWrapper(_MoEBase, ABC):
 
     def _wait_for_pending_backward_repack(self) -> None:
         if getattr(self, "_backward_repack_pending", False):
-            self.wait_backward_repack()
+            with torch.profiler.record_function("kt.sft.wait_backward_repack"):
+                self.wait_backward_repack()
 
     def forward(
         self,
