@@ -323,6 +323,7 @@ python -m sglang.launch_server \
 | `--kt-cpuinfer` | CPU 推理线程数 | `64`（根据 CPU 核心数调整） |
 | `--kt-threadpool-count` | 并行执行的线程池数量 | `2`（通常为 1–4） |
 | `--kt-num-gpu-experts` | 保留在 GPU 上的 experts 数量 | `32`（其余 experts 由 CPU 承担） |
+| `--kt-num-gpu-layers` | 按全局层索引（layer_id 从 0 起，包含所有层）将前 N 层的 routed experts 完全运行在 GPU 上，绕过 KT CPU 路径 | `4`（`--kt-num-gpu-experts` 只作用于剩余层） |
 | `--kt-max-deferred-experts-per-token` | 每个 token 延迟到 CPU 的 experts 数量（用于流水线执行） | `2`（0 关闭，1–4 推荐） |
 | `--kt-gpu-prefill-token-threshold` | Prefill 策略的 token 数量阈值（仅 RAWINT4） | ~`400` |
 
@@ -352,6 +353,15 @@ python -m sglang.launch_server \
 
 - **`kt-num-gpu-experts`**：根据 GPU 显存和实际性能测试决定：
   - GPU 上的 experts 越多 → 延迟越低，但显存占用越高（可能 OOM）
+
+- **`kt-num-gpu-layers`**：按整层（而非逐 expert）将模型的前 N 层放到 GPU 上（与 llama.cpp `--n-cpu-moe` 方向相反，后者把前 N 层的 experts 留在 CPU）：
+  - 按全局层索引计数（layer_id 从 0 起），**所有层都计入**，不只数 MoE 层。以 DeepSeek V4 为例：前 3 层是 hash MoE 层（同样有 routed experts，只是按 input_ids 哈希路由），`--kt-num-gpu-layers 4` 会把索引 0–3（3 个 hash 层 + 1 个常规 MoE 层）的 experts 全部固定在 GPU 上运行。
+  - 该参数面向最新 MoE 模型（如 DeepSeek V4、GLM-5 系）设计；带前部 dense 层的老模型（如 DeepSeek V3，前 3 层无 experts 但仍占计数）不作为兼容目标。
+  - 这些层的 routed experts 直接从标准 GPU 权重（`--model-path`）加载，走 sglang 原生 fused-MoE 路径（attention、shared experts、norm 本来就在 GPU 上）。
+  - 这些层完全绕过 KT：不加载对应的 KT CPU 权重，可降低内存占用。
+  - `--kt-num-gpu-experts` / `--kt-gpu-experts-ratio` 只作用于剩余层。
+  - 适用于"显存能完整放下少数几层的全部 experts、但每层只能放部分 experts"的场景。
+  - `kt run` 未识别的参数会透传给底层 sglang server，例如 `kt run <model> --kt-num-gpu-layers 4`。
 
 - **`kt-max-deferred-experts-per-token`**：用于开启 CPU-GPU 流水线：
   - `0`：完全同步执行（简单但延迟较高）

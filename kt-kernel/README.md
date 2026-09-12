@@ -512,6 +512,7 @@ python -m sglang.launch_server \
 | `--kt-cpuinfer` | Number of CPU inference threads | `64` (adjust based on CPU cores) |
 | `--kt-threadpool-count` | Number of thread pools for parallel execution | `2` (typically 1-4) |
 | `--kt-num-gpu-experts` | Number of experts to keep on GPU | `32` (remaining experts go to CPU) |
+| `--kt-num-gpu-layers` | Run the first N layers (by global layer index, 0-based, all layer types included) entirely on GPU, bypassing KT CPU experts | `4` (per-layer GPU experts then apply only to the remaining layers) |
 | `--kt-max-deferred-experts-per-token` | Number of experts per token to defer for pipelined execution | `2` (0 to disable, 1-4 recommended) |
 | `--kt-gpu-prefill-token-threshold` | Token count threshold for prefill strategy (native backend only) | ~`1024-4096` |
 | `--kt-enable-dynamic-expert-update` | Enable dynamic expert placement updates during prefill based on actual routing statistics | (flag, no value needed) |
@@ -545,6 +546,15 @@ python -m sglang.launch_server \
 
 - **`kt-num-gpu-experts`**: Determine based on GPU memory and profiling:
   - More GPU experts = lower latency but higher GPU memory usage (May cause OOM)
+
+- **`kt-num-gpu-layers`**: Place the first N layers on GPU instead of individual experts, counted by global layer index (`layer_id`, 0-based) across **all** layers — not just MoE layers (conceptually the inverse of llama.cpp `--n-cpu-moe`, which keeps the leading layers' experts on CPU):
+  - Example (DeepSeek V4): the first 3 layers are hash-MoE layers (they also have routed experts, routed by input-ids hashing), so `--kt-num-gpu-layers 4` pins the experts of layers 0–3 (3 hash layers + 1 regular MoE layer) on GPU.
+  - Designed for current-generation MoE models (e.g. DeepSeek V4, GLM-5 family); older models with leading dense layers (e.g. DeepSeek V3, whose first 3 layers have no experts but still consume the count) are not a compatibility target.
+  - GPU layers load routed experts from the standard GPU weights (`--model-path`) and run on the native sglang fused-MoE path — attention, shared experts and norms are always on GPU anyway.
+  - Full-GPU layers bypass KT entirely: no KT CPU weights are loaded for them, reducing CPU RAM usage.
+  - `--kt-num-gpu-experts` / `--kt-gpu-experts-ratio` apply only to the remaining layers.
+  - Useful when a few complete layers fit in VRAM but per-layer partial experts do not.
+  - Options not listed in `kt run --help` are forwarded to the underlying sglang server, e.g. `kt run <model> --kt-num-gpu-layers 4`.
 
 - **`kt-max-deferred-experts-per-token`**: Enables pipelined execution:
   - `0`: Synchronous execution (simpler, higher latency)
