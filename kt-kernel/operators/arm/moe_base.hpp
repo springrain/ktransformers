@@ -189,6 +189,7 @@ class NEON_MOE_BASE {
   }
 
   virtual ~NEON_MOE_BASE() {
+    shared_mem_buffer_numa.dealloc(tp_part_idx, this);
     for (void* p : owned_aligned_allocs_) std::free(p);
   }
 

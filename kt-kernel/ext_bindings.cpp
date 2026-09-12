@@ -244,22 +244,22 @@ class MOEBindings {
       intptr_t input;
       intptr_t output;
       bool incremental;
+      // True only when inner() cannot be graph-recorded: it then frees this Args
+      // after enqueuing. Graph-recorded Args are re-invoked by every replay.
+      bool autofree;
     };
     static void inner(void* args) {
       Args* args_ = (Args*)args;
       args_->cpuinfer->enqueue(&TP_MOE<T>::forward_binding, args_->moe, args_->qlen, args_->k, args_->expert_ids,
                                args_->weights, args_->input, args_->output, args_->incremental);
+      if (args_->autofree) delete args_;
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe, intptr_t qlen, int k,
                                                             intptr_t expert_ids, intptr_t weights, intptr_t input,
-                                                            intptr_t output, bool incremental = false) {
-      Args* args = new Args{nullptr, moe.get(), qlen, k, expert_ids, weights, input, output, incremental};
+                                                            intptr_t output, bool incremental = false,
+                                                            bool autofree = false) {
+      Args* args = new Args{nullptr, moe.get(), qlen, k, expert_ids, weights, input, output, incremental, autofree};
       return std::make_pair((intptr_t)&inner, (intptr_t)args);
-    }
-    static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe, intptr_t qlen, int k,
-                                                            intptr_t expert_ids, intptr_t weights, intptr_t input,
-                                                            intptr_t output) {
-      return cpuinfer_interface(moe, qlen, k, expert_ids, weights, input, output, false);
     }
   };
 };
@@ -472,13 +472,9 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
            py::overload_cast<std::shared_ptr<MoeClass>, const uintptr_t>(
                &MoeBindings::LoadWeightsBindings::cpuinfer_interface),
            py::arg("physical_to_logical_map"))
-      // .def("forward_task", &MoeBindings::ForwardBindings::cpuinfer_interface)
-      .def("forward_task",
-           py::overload_cast<std::shared_ptr<MoeClass>, intptr_t, int, intptr_t, intptr_t, intptr_t, intptr_t>(
-               &MoeBindings::ForwardBindings::cpuinfer_interface))
-      .def("forward_task",
-           py::overload_cast<std::shared_ptr<MoeClass>, intptr_t, int, intptr_t, intptr_t, intptr_t, intptr_t, bool>(
-               &MoeBindings::ForwardBindings::cpuinfer_interface))
+      .def("forward_task", &MoeBindings::ForwardBindings::cpuinfer_interface, py::arg("qlen"), py::arg("k"),
+           py::arg("expert_ids"), py::arg("weights"), py::arg("input"), py::arg("output"),
+           py::arg("incremental") = false, py::arg("autofree") = false)
       .def("warm_up", &MoeClass::warm_up)
       .def("load_weights", &MoeClass::load_weights)
       .def("forward", &MoeClass::forward_binding);

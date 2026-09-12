@@ -59,8 +59,8 @@ class CPUInfer {
 
   ~CPUInfer() {
     printf("CPUInfer[0x%lx]: Goodbye\n", (intptr_t)this);
+    delete task_queue_;  // joins the worker first; queued tasks dereference backend_
     delete backend_;
-    delete task_queue_;
   }
 
   CPUInfer(const CPUInfer&) = delete;
@@ -95,23 +95,42 @@ class CPUInfer {
   struct SyncArgs {
     CPUInfer* cpuinfer;
     size_t allow_n_pending;
+    // True only when the args cannot be graph-recorded: sync_ then frees them
+    // after syncing. Graph-recorded args are re-invoked by every replay.
+    bool autofree;
   };
 
   static void sync_(void* sync_args) {
     SyncArgs* args = (SyncArgs*)sync_args;
-    args->cpuinfer->task_queue_->sync(args->allow_n_pending);
+    CPUInfer* cpuinfer = args->cpuinfer;
+    size_t allow_n_pending = args->allow_n_pending;
+    bool autofree = args->autofree;
+    cpuinfer->task_queue_->sync(allow_n_pending);
+    if (autofree) delete args;
   }
 
   void sync(size_t allow_n_pending = 0) {
-    SyncArgs* args = new SyncArgs{this, allow_n_pending};
-    sync_(args);
+    SyncArgs args{this, allow_n_pending, false};
+    sync_(&args);
   }
 #ifndef KTRANSFORMERS_CPU_ONLY
   void sync_with_cuda_stream(intptr_t user_cuda_stream, size_t allow_n_pending = 0) {
 #if defined(KTRANSFORMERS_USE_CUDA) || defined(KTRANSFORMERS_USE_CUDA_HOST_CALLBACKS) || \
     defined(KTRANSFORMERS_USE_MUSA) || defined(KTRANSFORMERS_USE_ROCM) || defined(KTRANSFORMERS_USE_MACA) || \
     defined(KTRANSFORMERS_USE_ASCEND_NPU)
-    SyncArgs* args = new SyncArgs{this, allow_n_pending};
+    // Single-use unless the stream is capturing: capture records the args pointer
+    // into a host node that replays it forever, so only eager launches self-free.
+    bool autofree = false;
+#if defined(KTRANSFORMERS_USE_CUDA)
+    cudaStreamCaptureStatus capture_status{};
+    cudaError_t err = cudaStreamGetCaptureInfo((cudaStream_t)user_cuda_stream, &capture_status, nullptr);
+    if (err == cudaSuccess) {
+      autofree = capture_status == cudaStreamCaptureStatusNone;
+    } else {
+      (void)cudaGetLastError();  // keep a failed query out of later error checks
+    }
+#endif
+    SyncArgs* args = new SyncArgs{this, allow_n_pending, autofree};
     cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)&sync_, (void*)args);
 #endif
   }

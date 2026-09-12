@@ -40,8 +40,10 @@ TaskQueue::~TaskQueue() {
 }
 
 void TaskQueue::enqueue(std::function<void()> task) {
-  pending.fetch_add(1, std::memory_order_acq_rel);
+  // Allocate first: a throw after fetch_add would credit pending with no node
+  // ever linked, and every later sync() would hang forever.
   Node* node = new Node(task);
+  pending.fetch_add(1, std::memory_order_acq_rel);
   Node* prev = tail.exchange(node, std::memory_order_acq_rel);
   prev->next.store(node, std::memory_order_release);
   {
