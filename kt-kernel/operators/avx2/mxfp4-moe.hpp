@@ -731,7 +731,7 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
           nth_gate * config_.expert_num, nullptr,
           [this, nth_gate, physical_to_logical_map](int task_id) {
             uint64_t expert_idx = task_id / nth_gate;
-            if (config_.should_skip_expert(expert_idx)) return;
+            if (config_.should_skip_expert_packing(expert_idx)) return;
             uint64_t lid = expert_map(physical_to_logical_map, expert_idx);
             int ith = task_id % nth_gate;
             size_t weight_offset = ((size_t)lid * config_.intermediate_size * config_.hidden_size) / 2;
@@ -745,7 +745,7 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
           nth_down * config_.expert_num, nullptr,
           [this, nth_down, physical_to_logical_map](int task_id) {
             uint64_t expert_idx = task_id / nth_down;
-            if (config_.should_skip_expert(expert_idx)) return;
+            if (config_.should_skip_expert_packing(expert_idx)) return;
             uint64_t lid = expert_map(physical_to_logical_map, expert_idx);
             int ith = task_id % nth_down;
             size_t weight_offset = ((size_t)lid * config_.hidden_size * config_.intermediate_size) / 2;
@@ -757,7 +757,7 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
           config_.expert_num, nullptr,
           [this, physical_to_logical_map, group_size](int task_id) {
             uint64_t expert_idx = task_id;
-            if (config_.should_skip_expert(expert_idx)) return;
+            if (config_.should_skip_expert_packing(expert_idx)) return;
             uint64_t lid = expert_map(physical_to_logical_map, expert_idx);
             size_t scale_elem_count = ((size_t)config_.hidden_size * config_.intermediate_size) / group_size;
             convert_or_copy(gate_bb_[expert_idx]->d, (ggml_bf16_t*)config_.gate_scale + lid * scale_elem_count,
@@ -769,6 +769,7 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
           },
           nullptr);
     }
+    this->mark_packed_experts();
   }
 
   static inline void fp32_to_bf16(ggml_bf16_t* dst, const float* src, size_t count) {
@@ -923,7 +924,7 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
         subpool->do_work_stealing_job(
             tpc.expert_num, nullptr,
             [&, i, per_tp_interm, full_interm, gate_up_wt_per_expert](int eid) {
-              if (tpc.should_skip_expert(eid)) return;
+              if (tpc.should_skip_expert_packing(eid)) return;
               uint64_t lid = expert_map(physical_to_logical_map, eid);
 
               // H1 & H2: Validate source pointers and lid bounds
@@ -1065,6 +1066,7 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
       });
     }
 
+    for (auto& tp : tps) tp->mark_packed_experts();
     this->weights_loaded = true;
   }
 

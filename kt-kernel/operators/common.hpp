@@ -242,6 +242,11 @@ struct GeneralMOEConfig {
   uint8_t* gpu_experts_mask = nullptr;  // Bool mask: true = expert on GPU
   void* physical_to_logical_map = nullptr;
 
+  // F3 (hidden-P0 fix): pack GPU-resident experts' weights onto host BufferB at load.
+  // Set via SGLANG_KT_PACK_GPU_RESIDENT_HOST=1 (Python import-time; C++ load-time single-shot).
+  // Default false = bit-identical to pre-fix behavior.
+  bool pack_gpu_resident_host = false;
+
   // Compute num_gpu_experts from gpu_experts_mask
   void compute_num_gpu_experts() {
     num_gpu_experts = 0;
@@ -255,6 +260,18 @@ struct GeneralMOEConfig {
   // Check if expert should be skipped (invalid, out of range, or on GPU)
   inline bool should_skip_expert(int64_t expert_id) const {
     return expert_id < 0 || expert_id >= expert_num || (gpu_experts_mask && gpu_experts_mask[expert_id]);
+  }
+
+  // Load-time packing gate (F3): identical to should_skip_expert when
+  // pack_gpu_resident_host is false (bit-equivalent default).  When the flag
+  // is set, the gpu_experts_mask leg is suppressed so every in-range expert is
+  // host-packed — closing the hidden-P0 hole where evicted GPU-resident
+  // experts hit uninitialized host BufferB.
+  // Range check always executes (loaders must still reject out-of-range ids).
+  inline bool should_skip_expert_packing(int64_t expert_id) const {
+    if (expert_id < 0 || expert_id >= expert_num) return true;
+    if (pack_gpu_resident_host) return false;
+    return gpu_experts_mask && gpu_experts_mask[expert_id];
   }
 
   void* gate_proj = nullptr;

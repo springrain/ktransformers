@@ -238,7 +238,7 @@ class NEON_MXFP4_MOE_TP : public NEON_MOE_BASE<T, NEON_MXFP4_MOE_TP<T>> {
       pool->do_work_stealing_job(
           config_.expert_num, nullptr,
           [this, physical_to_logical_map](int expert_idx) {
-            if (config_.should_skip_expert(expert_idx)) return;
+            if (config_.should_skip_expert_packing(expert_idx)) return;
             const uint64_t lid = expert_map(physical_to_logical_map, expert_idx);
             if (lid >= config_.gate_projs[0].size() || config_.gate_projs[0][lid] == nullptr ||
                 config_.up_projs[0][lid] == nullptr || config_.down_projs[0][lid] == nullptr) {
@@ -252,7 +252,7 @@ class NEON_MXFP4_MOE_TP : public NEON_MOE_BASE<T, NEON_MXFP4_MOE_TP<T>> {
       pool->do_work_stealing_job(
           config_.expert_num, nullptr,
           [this, physical_to_logical_map, group_size](int expert_idx) {
-            if (config_.should_skip_expert(expert_idx)) return;
+            if (config_.should_skip_expert_packing(expert_idx)) return;
             const uint64_t lid = expert_map(physical_to_logical_map, expert_idx);
             if (lid >= config_.gate_scales[0].size() || config_.gate_scales[0][lid] == nullptr ||
                 config_.up_scales[0][lid] == nullptr || config_.down_scales[0][lid] == nullptr) {
@@ -266,6 +266,7 @@ class NEON_MXFP4_MOE_TP : public NEON_MOE_BASE<T, NEON_MXFP4_MOE_TP<T>> {
                             count);
           },
           nullptr);
+      this->mark_packed_experts();
       return;
     }
 
@@ -277,7 +278,7 @@ class NEON_MXFP4_MOE_TP : public NEON_MOE_BASE<T, NEON_MXFP4_MOE_TP<T>> {
         nth * config_.expert_num, nullptr,
         [this, nth, physical_to_logical_map, packed_per_expert](int task_id) {
           const int expert_idx = task_id / nth;
-          if (config_.should_skip_expert(expert_idx)) return;
+          if (config_.should_skip_expert_packing(expert_idx)) return;
           const int ith = task_id % nth;
           const uint64_t lid = expert_map(physical_to_logical_map, expert_idx);
           const uint8_t* gate = static_cast<const uint8_t*>(config_.gate_proj) + lid * packed_per_expert;
@@ -291,7 +292,7 @@ class NEON_MXFP4_MOE_TP : public NEON_MOE_BASE<T, NEON_MXFP4_MOE_TP<T>> {
         nth * config_.expert_num, nullptr,
         [this, nth, physical_to_logical_map, packed_per_expert](int task_id) {
           const int expert_idx = task_id / nth;
-          if (config_.should_skip_expert(expert_idx)) return;
+          if (config_.should_skip_expert_packing(expert_idx)) return;
           const int ith = task_id % nth;
           const uint64_t lid = expert_map(physical_to_logical_map, expert_idx);
           const uint8_t* down = static_cast<const uint8_t*>(config_.down_proj) + lid * packed_per_expert;
@@ -301,7 +302,7 @@ class NEON_MXFP4_MOE_TP : public NEON_MOE_BASE<T, NEON_MXFP4_MOE_TP<T>> {
     pool->do_work_stealing_job(
         config_.expert_num, nullptr,
         [this, physical_to_logical_map, group_size, scale_per_expert](int expert_idx) {
-          if (config_.should_skip_expert(expert_idx)) return;
+          if (config_.should_skip_expert_packing(expert_idx)) return;
           const uint64_t lid = expert_map(physical_to_logical_map, expert_idx);
           const size_t off = lid * scale_per_expert;
           convert_or_copy(gate_bb_[expert_idx]->d, static_cast<const ggml_bf16_t*>(config_.gate_scale) + off,
@@ -312,6 +313,7 @@ class NEON_MXFP4_MOE_TP : public NEON_MOE_BASE<T, NEON_MXFP4_MOE_TP<T>> {
                           scale_per_expert);
         },
         nullptr);
+    this->mark_packed_experts();
   }
 
   // Copy one CPU TP expert into the GPU's packed MXFP4 staging buffers.  The
@@ -474,7 +476,7 @@ class TP_MOE<NEON_MXFP4_MOE_TP<K>> : public TP_MOE<NEON_MOE_BASE<K, NEON_MXFP4_M
         subpool->do_work_stealing_job(
             tc.expert_num, nullptr,
             [&, i, local_n, local_gate_bytes, local_scale_count, full_groups, local_groups](int eid) {
-              if (tc.should_skip_expert(eid)) return;
+              if (tc.should_skip_expert_packing(eid)) return;
               const uint64_t lid = expert_map(map, eid);
               if (lid >= config.gate_projs[0].size() || config.gate_projs[0][lid] == nullptr ||
                   config.up_projs[0][lid] == nullptr || config.down_projs[0][lid] == nullptr ||
@@ -597,6 +599,7 @@ class TP_MOE<NEON_MXFP4_MOE_TP<K>> : public TP_MOE<NEON_MOE_BASE<K, NEON_MXFP4_M
         tc.gate_scale = tc.up_scale = tc.down_scale = nullptr;
       });
     }
+    for (auto& tp : tps) tp->mark_packed_experts();
     this->weights_loaded = true;
   }
 

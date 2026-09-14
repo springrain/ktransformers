@@ -338,7 +338,7 @@ class AVXVNNI256_RAW_INT4_MOE_TP : public AVX2_MOE_BASE<T, AVXVNNI256_RAW_INT4_M
           nth * config_.expert_num, nullptr,
           [this, nth, physical_to_logical_map, group_size](int task_id) {
             uint64_t expert_idx = task_id / nth;
-            if (config_.should_skip_expert(expert_idx)) return;
+            if (config_.should_skip_expert_packing(expert_idx)) return;
             uint64_t logical = expert_map(physical_to_logical_map, expert_idx);
             int ith = task_id % nth;
 
@@ -365,7 +365,7 @@ class AVXVNNI256_RAW_INT4_MOE_TP : public AVX2_MOE_BASE<T, AVXVNNI256_RAW_INT4_M
           nth * config_.expert_num, nullptr,
           [this, nth, physical_to_logical_map, group_size](int task_id) {
             uint64_t expert_idx = task_id / nth;
-            if (config_.should_skip_expert(expert_idx)) return;
+            if (config_.should_skip_expert_packing(expert_idx)) return;
             uint64_t logical = expert_map(physical_to_logical_map, expert_idx);
             int ith = task_id % nth;
 
@@ -380,6 +380,7 @@ class AVXVNNI256_RAW_INT4_MOE_TP : public AVX2_MOE_BASE<T, AVXVNNI256_RAW_INT4_M
           },
           nullptr);
     }
+    this->mark_packed_experts();
   }
 
   void write_weights_to_buffer(int gpu_tp_count, [[maybe_unused]] int cpu_tp_count, int expert_id,
@@ -503,6 +504,7 @@ class TP_MOE<AVXVNNI256_RAW_INT4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX
       delete[] (ggml_bf16_t*)tpc.down_scale;
     });
 
+    for (auto& tp : tps) tp->mark_packed_experts();
     this->weights_loaded = true;
   }
 

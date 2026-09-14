@@ -14,6 +14,7 @@
 #include <immintrin.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -64,6 +65,11 @@ class AVX2_MOE_BASE {
 
   std::vector<void*> owned_aligned_allocs_;
 
+  // F4-soft canary: 1 = expert was host-packed at load time, 0 = skipped.
+  // Sized to config_.expert_num in init(); consumed (warn-only) by
+  // check_packed_canary() at each runtime mask gate. See hidden-P0 audit §7.
+  std::vector<uint8_t> expert_packed_;
+
   size_t pool_count_ = 0;
   size_t gate_up_ba_pool_bytes_ = 0;
   size_t gate_bc_pool_bytes_ = 0;
@@ -111,6 +117,7 @@ class AVX2_MOE_BASE {
     m_local_gate_output_ptr_.resize(config_.expert_num);
     m_local_up_output_ptr_.resize(config_.expert_num);
     m_local_down_output_ptr_.resize(config_.expert_num);
+    expert_packed_.resize(config_.expert_num, uint8_t{0});
 
     for (size_t i = 0; i < config_.expert_num; i++) {
       gate_up_ba_.push_back(make_buffer_a(config_.max_len, config_.hidden_size, nullptr));
@@ -202,6 +209,7 @@ class AVX2_MOE_BASE {
         if (config_.should_skip_expert(expert_ids[i * k + j])) {
           continue;
         }
+        check_packed_canary(expert_ids[i * k + j]);
         m_local_pos_[i][j] = m_local_num_[expert_ids[i * k + j]]++;
       }
     }
@@ -274,6 +282,7 @@ class AVX2_MOE_BASE {
     direct_or_pool(qlen, [&](int i) {
       for (int j = 0; j < k; j++) {
         if (config_.should_skip_expert(expert_ids[i * k + j])) continue;
+        check_packed_canary(expert_ids[i * k + j]);
         memcpy(m_local_input_ptr_[expert_ids[i * k + j]] + m_local_pos_[i][j] * config_.hidden_size,
                (ggml_bf16_t*)input + i * config_.hidden_size, sizeof(ggml_bf16_t) * config_.hidden_size);
       }
@@ -340,6 +349,7 @@ class AVX2_MOE_BASE {
             __m256 x1 = _mm256_setzero_ps();
             for (int j = 0; j < k; j++) {
               if (config_.should_skip_expert(expert_ids[i * k + j])) continue;
+              check_packed_canary(expert_ids[i * k + j]);
               __m256 weight = _mm256_set1_ps(weights[i * k + j]);
               __m256 d0, d1;
               avx2::load_16xbf16_to_2x8xfp32(
@@ -364,6 +374,7 @@ class AVX2_MOE_BASE {
     std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
     for (int i = 0; i < k; i++) {
       if (config_.should_skip_expert(expert_ids[i])) continue;
+      check_packed_canary(expert_ids[i]);
       m_expert_id_map_[activated_expert] = expert_ids[i];
       m_local_pos_[0][i] = 0;
       m_local_num_[expert_ids[i]] = qlen;
@@ -483,6 +494,7 @@ class AVX2_MOE_BASE {
       __m256 x1 = _mm256_setzero_ps();
       for (int j = 0; j < k; j++) {
         if (config_.should_skip_expert(expert_ids[j])) continue;
+        check_packed_canary(expert_ids[j]);
         __m256 weight = _mm256_set1_ps(weights[j]);
         __m256 d0, d1;
         avx2::load_16xbf16_to_2x8xfp32(
@@ -493,6 +505,40 @@ class AVX2_MOE_BASE {
       auto f32out = (__m256*)((float*)output + e);
       f32out[0] = x0;
       f32out[1] = x1;
+    }
+  }
+
+  // F3/F4-soft helpers (hidden-P0; mirrors operators/arm/moe_base.hpp).
+  // mark_packed_experts() re-evaluates the load-time packing gate for every
+  // expert and records 1/0. Call sites: end of each load_weights() path that
+  // consumed should_skip_expert_packing().
+  void mark_packed_experts() {
+    for (int64_t e = 0; e < config_.expert_num; e++) {
+      expert_packed_[e] = config_.should_skip_expert_packing(e) ? uint8_t{0} : uint8_t{1};
+    }
+  }
+
+  // Warn-only, rate-limited (first 8 hits, then powers of two), ONE static
+  // counter per process. No THROW, no control-flow change, no numeric change
+  // — closing the silent-corruption observability gap.
+  void warn_unpacked_expert_once(int64_t expert_id) const {
+    static std::atomic<uint64_t> warned{0};
+    const uint64_t k = warned.fetch_add(1, std::memory_order_relaxed);
+    if (k < 8 || (k & (k - 1)) == 0) {
+      fprintf(stderr,
+              "[KT_WARN hidden-P0] CPU MoE reads expert %lld that was never packed at load "
+              "(layer_idx=%d, tp_part_idx=%d): initial GPU-resident expert was evicted after "
+              "being skipped during host packing; its host BufferB holds uninitialized bytes. "
+              "Set SGLANG_KT_PACK_GPU_RESIDENT_HOST=1 and reload to fix.\n",
+              static_cast<long long>(expert_id), config_.layer_idx, tp_part_idx);
+    }
+  }
+
+  // Canary: read only when the F3 flag is OFF (when ON, every expert is
+  // packed so the check is trivially satisfied and adds no value).
+  inline void check_packed_canary(int64_t expert_id) const {
+    if (!config_.pack_gpu_resident_host && !expert_packed_[expert_id]) {
+      warn_unpacked_expert_once(expert_id);
     }
   }
 

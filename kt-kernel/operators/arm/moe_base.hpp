@@ -15,6 +15,7 @@
 #include <arm_neon.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -97,6 +98,11 @@ class NEON_MOE_BASE {
 
   std::vector<void*> owned_aligned_allocs_;
 
+  // F4-soft canary: 1 = expert was host-packed at load time, 0 = skipped.
+  // Sized to config_.expert_num in init(); consumed (warn-only) by
+  // check_packed_canary() at each runtime mask gate. See hidden-P0 audit §7.
+  std::vector<uint8_t> expert_packed_;
+
   size_t pool_count_ = 0;
   size_t gate_up_ba_pool_bytes_ = 0;
   size_t gate_bc_pool_bytes_ = 0;
@@ -144,6 +150,8 @@ class NEON_MOE_BASE {
     m_local_gate_output_ptr_.resize(config_.expert_num);
     m_local_up_output_ptr_.resize(config_.expert_num);
     m_local_down_output_ptr_.resize(config_.expert_num);
+
+    expert_packed_.resize(config_.expert_num, uint8_t{0});
 
     for (size_t i = 0; i < config_.expert_num; i++) {
       gate_up_ba_.push_back(make_buffer_a(config_.max_len, config_.hidden_size, nullptr));
@@ -214,6 +222,44 @@ class NEON_MOE_BASE {
     }
   }
 
+  // ---- F3/F4-soft (hidden-P0 fix) -------------------------------------------
+  // Mark which experts were actually host-packed.  Called once at the end of
+  // every load_weights() completion path (part-level and TP wrapper); runs
+  // single-threaded (load is submit+sync), so plain uint8_t suffices.
+  // IMPORTANT: must NOT be invoked from hot-forward paths.
+  void mark_packed_experts() {
+    for (int64_t e = 0; e < config_.expert_num; e++) {
+      expert_packed_[e] = config_.should_skip_expert_packing(e) ? uint8_t{0} : uint8_t{1};
+    }
+  }
+
+  // Warn (rate-limited) when a runtime gate admits an evicted initial-GPU-
+  // resident expert whose host BufferB was never written.  Warn-only: no THROW,
+  // no control-flow change — closing the silent-corruption observability gap.
+  void warn_unpacked_expert_once(int64_t expert_id) const {
+    static std::atomic<uint64_t> warned{0};
+    const uint64_t k = warned.fetch_add(1, std::memory_order_relaxed);
+    // First 8 hits + powers of two → bounded stderr traffic under bad workloads.
+    if (k < 8 || (k & (k - 1)) == 0) {
+      fprintf(stderr,
+              "[KT_WARN hidden-P0] CPU MoE reads expert %lld that was never packed at load "
+              "(layer_idx=%d, tp_part_idx=%d): initial GPU-resident expert was evicted after "
+              "being skipped during host packing; its host BufferB holds uninitialized bytes. "
+              "Set SGLANG_KT_PACK_GPU_RESIDENT_HOST=1 and reload to fix.\n",
+              static_cast<long long>(expert_id), config_.layer_idx, tp_part_idx);
+    }
+  }
+
+  // Cheap gate-side canary.  Only invoked right after should_skip_expert()
+  // admitted an expert into a CPU path, so expert_id is already in-range.
+  // Reads the flag byte only when pack_gpu_resident_host is OFF; with F3 on,
+  // short-circuit skips the vector read — near-zero runtime cost either way.
+  inline void check_packed_canary(int64_t expert_id) const {
+    if (!config_.pack_gpu_resident_host && !expert_packed_[expert_id]) {
+      warn_unpacked_expert_once(expert_id);
+    }
+  }
+
   template <typename... Args>
   void load_weights(Args&&... args) {
     derived()->load_weights(std::forward<Args>(args)...);
@@ -235,6 +281,7 @@ class NEON_MOE_BASE {
         if (config_.should_skip_expert(expert_ids[i * k + j])) {
           continue;
         }
+        check_packed_canary(expert_ids[i * k + j]);
         m_local_pos_[i][j] = m_local_num_[expert_ids[i * k + j]]++;
       }
     }
@@ -307,6 +354,7 @@ class NEON_MOE_BASE {
     direct_or_pool(qlen, [&](int i) {
       for (int j = 0; j < k; j++) {
         if (config_.should_skip_expert(expert_ids[i * k + j])) continue;
+        check_packed_canary(expert_ids[i * k + j]);
         memcpy(m_local_input_ptr_[expert_ids[i * k + j]] + m_local_pos_[i][j] * config_.hidden_size,
                (ggml_bf16_t*)input + i * config_.hidden_size, sizeof(ggml_bf16_t) * config_.hidden_size);
       }
@@ -373,6 +421,7 @@ class NEON_MOE_BASE {
             armneon::v8f32 x1 = armneon::zero_v8f32();
             for (int j = 0; j < k; j++) {
               if (config_.should_skip_expert(expert_ids[i * k + j])) continue;
+              check_packed_canary(expert_ids[i * k + j]);
               armneon::v8f32 weight = armneon::set1_v8f32(weights[i * k + j]);
               armneon::v8f32 d0, d1;
               armneon::load_16xbf16_to_2x8xfp32(
@@ -399,6 +448,7 @@ class NEON_MOE_BASE {
     std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
     for (int i = 0; i < k; i++) {
       if (config_.should_skip_expert(expert_ids[i])) continue;
+      check_packed_canary(expert_ids[i]);
       m_expert_id_map_[activated_expert] = expert_ids[i];
       m_local_pos_[0][i] = 0;
       m_local_num_[expert_ids[i]] = qlen;
@@ -528,6 +578,7 @@ class NEON_MOE_BASE {
         armneon::v8f32 x1 = armneon::zero_v8f32();
         for (int j = 0; j < k; j++) {
           if (config_.should_skip_expert(expert_ids[j])) continue;
+          check_packed_canary(expert_ids[j]);
           armneon::v8f32 weight = armneon::set1_v8f32(weights[j]);
           armneon::v8f32 d0, d1;
           armneon::load_16xbf16_to_2x8xfp32(

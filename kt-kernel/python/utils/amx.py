@@ -74,6 +74,23 @@ _AVXVNNI256_GPTQ_INT4_MAX_GROUP_SIZE = 256
 _AVXVNNI256_PACKED_GPTQ_INT4_MAX_GROUP_SIZE = 2048
 _AVXVNNI256_RAW_INT4_MAX_GROUP_SIZE = 256
 
+# F3 (hidden-P0 fix): pack ALL experts' weights onto host BufferB at load,
+# including experts initially GPU-resident — otherwise a later hot-update
+# eviction routes their Prefill/Decode onto host BufferB blocks that were
+# allocated but never written (silent corruption, both decode path and the
+# write_weights_to_buffer full-GPU-prefill staging path).  Read once at
+# import; C++ side latches it per-layer at MOEConfig creation.  Default off
+# (bit-equivalent to pre-fix behavior: mask leg still honored at load).
+# See doc/ft-kt-phase1-audit-hidden-p0.md §7 / §12.4.
+_PACK_GPU_RESIDENT_HOST = os.environ.get("SGLANG_KT_PACK_GPU_RESIDENT_HOST", "") == "1"
+
+if _PACK_GPU_RESIDENT_HOST:
+    logger.info(
+        "[KT hidden-P0] SGLANG_KT_PACK_GPU_RESIDENT_HOST=1: host-packing ALL experts at load "
+        "(mask-skip leg suppressed). RAM +0B; load-time packing work scales linearly with "
+        "expert_num (extra experts packed that were previously skipped)."
+    )
+
 
 def _validate_block_fp8_layout(
     weights,
@@ -1141,6 +1158,11 @@ class NativeMoEWrapper(BaseMoEWrapper):
             self.moe_intermediate_size,
             self.gpu_experts_mask.data_ptr(),
         )
+        # F3 (hidden-P0): read once at import (module top); latched here per
+        # MOEConfig.  Affects only the load-time packing gate
+        # (should_skip_expert_packing), never the runtime should_skip_expert
+        # dispatch.  See operators/common.hpp and doc/ft-kt-phase1-audit-hidden-p0.md §7.
+        moe_config.pack_gpu_resident_host = _PACK_GPU_RESIDENT_HOST
         moe_config.layer_idx = self.layer_idx
         moe_config.pool = self.cpu_infer.backend_
         moe_config.max_len = self.chunked_prefill_size

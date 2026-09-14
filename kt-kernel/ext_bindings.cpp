@@ -874,6 +874,11 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
           "gpu_experts_mask",
           [](const GeneralMOEConfig& self) { return reinterpret_cast<uintptr_t>(self.gpu_experts_mask); },
           [](GeneralMOEConfig& self, uintptr_t val) { self.gpu_experts_mask = reinterpret_cast<uint8_t*>(val); })
+      // F3 (hidden-P0): when true, load-time packing skips the gpu_experts_mask
+      // leg — every expert is host-packed.  Set once by Python (import-time env
+      // SGLANG_KT_PACK_GPU_RESIDENT_HOST) before load_weights; read-only concept
+      // afterwards.  Default false = bit-identical to pre-fix behavior.
+      .def_readwrite("pack_gpu_resident_host", &GeneralMOEConfig::pack_gpu_resident_host)
       .DEF_PTR_PROPERTY(GeneralMOEConfig, physical_to_logical_map)
 
       .DEF_PTR_PROPERTY(GeneralMOEConfig, gate_proj)
