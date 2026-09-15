@@ -21,7 +21,7 @@
 | 梯队 | 主题 | 状态 | 收益量级(复核口径) |
 |---|---|---|---|
 | **0** | 隐藏 P0 正确性(F3 装载期全量打包 + F4-soft 金丝雀) | **✅ 完成** | 正确性收益:消除静默错值/NaN 级联(不可用速度衡量) |
-| **1** | 归因与取证基础设施(benchbw / explicit-degrade / observability / ownership-asserts) | 📋 计划定稿,代码待(重新)实施 | 无直接增益;是梯队 2 全部收益数字的判官与准入证 |
+| **1** | 归因与取证基础设施(benchbw / explicit-degrade / observability / ownership-asserts) | ✅ 代码落盘,静态验证全过(实机尾项见明细) | 无直接增益;是梯队 2 全部收益数字的判官与准入证 |
 | **2** | Prefill 传输史诗(batch-dma / cpu-off-datapath / event-fence) | 🔒 待梯队 1 归因裁决后按序启动 | 合并上限 ≈ 传输段恢复线速(11→~22GB/s);**三者收割同一缺口,收益不可叠加** |
 | **3** | Decode 并行道(memop 握手 / CPU 池 watchdog / 池拓扑定形) | 📋 未始(可与梯队 1 同期推进,正交不冲突) | memop ≈ 省 2.5–4ms/step decode 尾延迟;其余为可观测性/稳定性收益 |
 | **4** | 装载与运维(host bank 快载 / warmup 阶梯 / 分层驻留 / cache 几何重建) | 📋 未始 | 直击装载时长(整趟零填约 47s 量级可省)+ 运维免重启 |
@@ -46,20 +46,21 @@
 - aarch64 GCC 编译报错已修:CRTP 派生类内 4 处裸调 `mark_packed_experts()` 补 `this->` 限定(两阶段名字查找;纯编译期语法,机器码逐位相同)。
 - **实机验证尾项(待 xysa10)**:aarch64 重编译 + smoke 四断言(baseline_off/on、evict_off/on)+ flag on 装载耗时实测(理论 +~10.3%)。
 
-## 第 1 梯队:归因与取证基础设施 —— 📋 计划定稿(派发序 1/4–4/4)
+## 第 1 梯队:归因与取证基础设施 —— ✅ 代码落盘(派发序 1/4–4/4 全部完成)
 
 > 地位:**一切传输优化(梯队 2)的准入证**。没有 benchbw 判官和 observability 分段账本,梯队 2 全部收益数字悬空。
 > 初版梯队 0 曾含 explicit-degrade / ownership-asserts,Phase-1 派发时并入本梯队;routing-probe 经对抗验证 refuted 后移出(数据需求由 observability 的 GPU 常驻 churn 直方搭车接替)。
 
 | 序 | 子项 | 计划文档 | 状态 | 说明 |
 |---|---|---|---|---|
-| 1/4 | benchbw 带宽归属探针 | [ft-kt-phase1-plan-benchbw.md](ft-kt-phase1-plan-benchbw.md) | ⏸ 代码曾完成,已随还原丢弃 | 实测 CPU GEMV vs PCIe gather(含重叠对),落 JSON——回答"22 vs 11GB/s 缺口归因" |
-| 2/4 | explicit-degrade(reason 链 + 告警 + ABI 探针) | [ft-kt-phase1-plan-explicit-degrade.md](ft-kt-phase1-plan-explicit-degrade.md) | ⏸ 代码曾完成,已随还原丢弃 | 把多处静默降级 gate 变成可观测/可拦截;正确性/取证收益 |
-| 3/4 | observability(`SGLANG_KT_PREFILL_STATS`) | [ft-kt-phase1-plan-observability.md](ft-kt-phase1-plan-observability.md) | ⏸ 施工中断,已随还原丢弃 | 每 chunk 拆成 host写/共识/H2D/D2D/热更新/residual 分项;字节账自校验;churn 直方搭车 |
-| 4/4 | ownership-asserts(槽位所有权哨兵) | [ft-kt-phase1-plan-ownership-asserts.md](ft-kt-phase1-plan-ownership-asserts.md) | 📋 未始 | 默认 2=warn-only 灰度;后续协议特性的对拍仪器 + 竞态取证 |
+| 1/4 | benchbw 带宽归属探针 | [ft-kt-phase1-plan-benchbw.md](ft-kt-phase1-plan-benchbw.md) | ✅ 代码落盘([bench_bw_kt.py](../kt-kernel/bench/bench_bw_kt.py)) | 实测 CPU GEMV vs PCIe gather(含重叠对),落 JSON——回答"22 vs 11GB/s 缺口归因"。实机尾项:xysa10 机时跑 G2/G3 采集 |
+| 2/4 | explicit-degrade(reason 链 + 告警 + ABI 探针) | [ft-kt-phase1-plan-explicit-degrade.md](ft-kt-phase1-plan-explicit-degrade.md) | ✅ 代码落盘(单测 N4/N5/N6 绿) | 把多处静默降级 gate 变成可观测/可拦截;正确性/取证收益。实机尾项:分支边界分析 + xysa10 对拍 |
+| 3/4 | observability(`SGLANG_KT_PREFILL_STATS`) | [ft-kt-phase1-plan-observability.md](ft-kt-phase1-plan-observability.md) | ✅ 代码落盘 | 每 chunk 拆成 host写/共识/H2D/D2D/热更新/residual 分项;字节账自校验;churn 直方搭车。实机尾项:离线确定性对拍 + 灰度文档 |
+| 4/4 | ownership-asserts(槽位所有权哨兵) | [ft-kt-phase1-plan-ownership-asserts.md](ft-kt-phase1-plan-ownership-asserts.md) | ✅ 代码落盘(单测 N1-N5 绿) | 默认 2=warn-only 灰度;后续协议特性的对拍仪器 + 竞态取证。实机尾项:离线确定性对拍 + 档 0 退出条件(threshold vs capture 双数入 PR) |
 | — | routing-probe(路由偏斜探针) | [ft-kt-phase1-plan-routing-probe.md](ft-kt-phase1-plan-routing-probe.md) | ❌ blocked 移出 | 原实施路径被裁定不可救;接替:observability churn 直方 |
 
-> 还原说明:2026-09-14 用户还原工作区"只保留第 0 梯队",benchbw / explicit-degrade / observability 的已落盘代码随之丢弃;五份计划文档仍在,重启时按计划文档从头施工。
+> 还原说明:2026-09-14 用户还原工作区"只保留第 0 梯队",benchbw / explicit-degrade / observability 的已落盘代码随之丢弃;五份计划文档仍在。
+> 重启记录:2026-09-15 已按五份计划文档从头施工完毕,1/4–4/4 全部 ✅(实机验证尾项见各行"说明"列)。
 
 ## 第 2 梯队:Prefill 传输史诗 —— 🔒 待归因裁决后按序启动
 

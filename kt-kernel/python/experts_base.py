@@ -182,6 +182,35 @@ def _forward_task_autofree(sync_submit: bool, device: torch.device) -> bool:
     return sync_submit or not _graph_capture_active(device)
 
 
+_FORWARD_TASK_ABI_CHECKED = False
+
+
+def _ensure_forward_task_abi(moe) -> None:
+    """Fail fast when kt_kernel_ext predates the forward_task autofree arg.
+
+    The Python side passes 8 args; an extension built before the autofree
+    fix binds only 7 and would otherwise fail deep inside the submit path
+    with an opaque pybind error.  Checked once per process against the
+    pybind-generated signature doc.
+    """
+    global _FORWARD_TASK_ABI_CHECKED
+    if _FORWARD_TASK_ABI_CHECKED:
+        return
+    # Escape hatch for mock-based tests or a knowingly patched binding.
+    if os.environ.get("SGLANG_KT_SKIP_FORWARD_TASK_ABI_CHECK") == "1":
+        _FORWARD_TASK_ABI_CHECKED = True
+        return
+    doc = type(moe).forward_task.__doc__ or ""
+    if "autofree" not in doc:
+        raise RuntimeError(
+            "kt_kernel_ext forward_task lacks the 'autofree' parameter; the "
+            "installed extension predates the ForwardBindings.Args autofree "
+            "fix. Rebuild kt-kernel (python setup.py build_ext --inplace), or "
+            "set SGLANG_KT_SKIP_FORWARD_TASK_ABI_CHECK=1 to bypass this check."
+        )
+    _FORWARD_TASK_ABI_CHECKED = True
+
+
 def generate_gpu_experts_masks(
     activation_freq: torch.Tensor,
     num_gpu_experts: int,
@@ -685,6 +714,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
 
         bypass = _should_bypass_stream_callback(hidden_states.device)
         incremental = BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx - 1, False)
+        _ensure_forward_task_abi(self.moe)
         immediate_task = self.moe.forward_task(
             bsz_slot_tensor.data_ptr(),
             immediate_experts_ids_cpu[current_slot].size(-1),
@@ -764,6 +794,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
         bsz_slot_tensor = bsz_tensor_cpu[current_slot]
 
         incremental = BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx - 1, False)
+        _ensure_forward_task_abi(self.moe)
         immediate_task = self.moe.forward_task(
             bsz_slot_tensor.data_ptr(),
             immediate_experts_ids_cpu[current_slot].size(-1),
@@ -844,6 +875,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
             _wait_device(hidden_states.device)
 
         incremental = BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx - 1, False)
+        _ensure_forward_task_abi(self.moe)
         immediate_task = self.moe.forward_task(
             bsz_slot_tensor.data_ptr(),
             immediate_experts_ids_cpu[current_slot].size(-1),
