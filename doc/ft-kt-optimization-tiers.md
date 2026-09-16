@@ -22,7 +22,7 @@
 |---|---|---|---|
 | **0** | 隐藏 P0 正确性(F3 装载期全量打包 + F4-soft 金丝雀) | **✅ 完成** | 正确性收益:消除静默错值/NaN 级联(不可用速度衡量) |
 | **1** | 归因与取证基础设施(benchbw / explicit-degrade / observability / ownership-asserts) | ✅ 代码落盘,静态验证全过(实机尾项见明细) | 无直接增益;是梯队 2 全部收益数字的判官与准入证 |
-| **2** | Prefill 传输史诗(batch-dma / cpu-off-datapath / event-fence) | 🔒 待梯队 1 归因裁决后按序启动 | 合并上限 ≈ 传输段恢复线速(11→~22GB/s);**三者收割同一缺口,收益不可叠加** |
+| **2** | Prefill 传输史诗(batch-dma / cpu-off-datapath / event-fence) | ✅ 第一批落盘(consumed_event 前置修复 + batch-dma w0→w1→w2),静态验证全过;cpu-off-datapath / event-fence 不在本期 | 合并上限 ≈ 传输段恢复线速(11→~22GB/s);**三者收割同一缺口,收益不可叠加** |
 | **3** | Decode 并行道(memop 握手 / CPU 池 watchdog / 池拓扑定形) | 📋 未始(可与梯队 1 同期推进,正交不冲突) | memop ≈ 省 2.5–4ms/step decode 尾延迟;其余为可观测性/稳定性收益 |
 | **4** | 装载与运维(host bank 快载 / warmup 阶梯 / 分层驻留 / cache 几何重建) | 📋 未始 | 直击装载时长(整趟零填约 47s 量级可省)+ 运维免重启 |
 | **5** | 条件触发(lru-hit-d2d / pretiled-banks / dual-slot-prefetch) | 🔒 暂锁 | lru 典型 +5–15%(探针先验决定);pretiled +10~25%(降级条件全部完成后复审);dual-slot ≈0 无限期推迟 |
@@ -62,13 +62,13 @@
 > 还原说明:2026-09-14 用户还原工作区"只保留第 0 梯队",benchbw / explicit-degrade / observability 的已落盘代码随之丢弃;五份计划文档仍在。
 > 重启记录:2026-09-15 已按五份计划文档从头施工完毕,1/4–4/4 全部 ✅(实机验证尾项见各行"说明"列)。
 
-## 第 2 梯队:Prefill 传输史诗 —— 🔒 待归因裁决后按序启动
+## 第 2 梯队:Prefill 传输史诗 —— ✅ 第一批落盘(2026-09-16)
 
-| 项目 | 宣称收益 → 复核口径 |
-|---|---|
-| batch-dma(分段 submit/sync + 整层 batch copy + <256KB 纪律,w0→w1→w2 灰度) | 宣称 500→650–850 tok/s(1.3–1.7×) → **gain 标 TBD**:方向被证实,具体数字须先跑画像门(transfer_stream busy >50% 才按 P1 继续) |
-| cpu-off-datapath(消 host 写,须容量/NUMA 预检) | host 写实为 ~340GiB/chunk(rank0 双写),收益被低估 2 倍;排 batch-dma 之后(同一批量引擎) |
-| event-fence(事件栅栏代 barrier) | 宣称 1.55–1.95× 不可达 → 口径改"恢复线速":仅当归因证实缺口在控制面才启动;`consumed_event` 前置修复为绑定硬前置 |
+| 项目 | 状态 | 宣称收益 → 复核口径 |
+|---|---|---|
+| batch-dma(分段 submit/sync + 整层 batch copy + <256KB 纪律,w0→w1→w2 灰度) | ✅ 代码落盘,静态验证全过([ft-kt-phase2-plan-batch-dma.md](ft-kt-phase2-plan-batch-dma.md);单测 N1–N11 绿,consumed_event 前置修复一并落盘) | 宣称 500→650–850 tok/s(1.3–1.7×) → **gain 标 TBD**:方向被证实,具体数字须先跑画像门(transfer_stream busy >50% 才按 P1 继续)——实机尾项见计划文档 §9 |
+| cpu-off-datapath(消 host 写,须容量/NUMA 预检) | 📋 未始(不在本期,另批) | host 写实为 ~340GiB/chunk(rank0 双写),收益被低估 2 倍;排 batch-dma 之后(同一批量引擎) |
+| event-fence(事件栅栏代 barrier) | 📋 未始(不在本期;绑定硬前置 consumed_event 前置修复已随第一批落盘) | 宣称 1.55–1.95× 不可达 → 口径改"恢复线速":仅当归因证实缺口在控制面才启动 |
 
 ⚠️ **不可加警告**:三者(外加 pretiled-banks)收割的是**同一个 11→22GB/s 缺口**,严禁按宣称值叠加;合并上限 ≈ 传输段恢复线速。
 
