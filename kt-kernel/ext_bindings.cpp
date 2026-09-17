@@ -492,13 +492,15 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
         std::vector<uintptr_t> w13_scale_ptrs;
         std::vector<uintptr_t> w2_weight_ptrs;
         std::vector<uintptr_t> w2_scale_ptrs;
+        // (kind << 32) | expert_id; 0 keeps the legacy untagged failure text.
+        int64_t task_tag;
       };
 
       static void inner(void* args) {
         Args* args_ = (Args*)args;
-        args_->cpuinfer->enqueue(&MoeClass::write_weight_scale_to_buffer, args_->moe, args_->gpu_tp_count,
-                                 args_->expert_id, args_->w13_weight_ptrs, args_->w13_scale_ptrs, args_->w2_weight_ptrs,
-                                 args_->w2_scale_ptrs);
+        args_->cpuinfer->enqueue_tagged(args_->task_tag, &MoeClass::write_weight_scale_to_buffer, args_->moe,
+                                        args_->gpu_tp_count, args_->expert_id, args_->w13_weight_ptrs,
+                                        args_->w13_scale_ptrs, args_->w2_weight_ptrs, args_->w2_scale_ptrs);
         // Submit-only path: never replayed as a CUDA-graph host node, so Args is freed here.
         // The forward bindings must NOT do this; their Args are reused by every graph replay.
         delete args_;
@@ -507,7 +509,7 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
       static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<MoeClass> moe, int gpu_tp_count,
                                                               int expert_id, py::list w13_weight_ptrs,
                                                               py::list w13_scale_ptrs, py::list w2_weight_ptrs,
-                                                              py::list w2_scale_ptrs) {
+                                                              py::list w2_scale_ptrs, int64_t task_tag) {
         // Convert Python lists to std::vector<uintptr_t>
         std::vector<uintptr_t> w13_weight_vec, w13_scale_vec, w2_weight_vec, w2_scale_vec;
 
@@ -517,14 +519,15 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
         for (auto item : w2_scale_ptrs) w2_scale_vec.push_back(py::cast<uintptr_t>(item));
 
         Args* args = new Args{nullptr,        moe.get(),     gpu_tp_count,  expert_id,
-                              w13_weight_vec, w13_scale_vec, w2_weight_vec, w2_scale_vec};
+                              w13_weight_vec, w13_scale_vec, w2_weight_vec, w2_scale_vec,
+                              task_tag};
         return std::make_pair((intptr_t)&inner, (intptr_t)args);
       }
     };
 
     moe_cls.def("write_weight_scale_to_buffer_task", &WriteWeightScaleToBufferBindings::cpuinfer_interface,
                 py::arg("gpu_tp_count"), py::arg("expert_id"), py::arg("w13_weight_ptrs"), py::arg("w13_scale_ptrs"),
-                py::arg("w2_weight_ptrs"), py::arg("w2_scale_ptrs"));
+                py::arg("w2_weight_ptrs"), py::arg("w2_scale_ptrs"), py::arg("task_tag") = 0);
 
     moe_cls.def(
         "run_layerwise_fp8_batch",

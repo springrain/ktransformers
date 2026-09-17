@@ -12,9 +12,13 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <mutex>
 #include <queue>
+#include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 #if defined(KTRANSFORMERS_USE_CUDA) || defined(KTRANSFORMERS_USE_CUDA_HOST_CALLBACKS)
@@ -34,6 +38,16 @@
 #include "ggml-cpu.h"
 #include "task_queue.h"
 #include "worker_pool.h"
+
+// Decode (kind << 32) | expert_id into a short human-readable prefix for
+// task failure messages.
+inline std::string describe_task_tag(int64_t task_tag, const char* what) {
+  uint32_t kind = (uint32_t)((uint64_t)task_tag >> 32);
+  uint32_t expert_id = (uint32_t)((uint64_t)task_tag & 0xffffffffu);
+  char buf[96];
+  std::snprintf(buf, sizeof(buf), "[kt task kind=%u expert=%u] ", kind, expert_id);
+  return std::string(buf) + what;
+}
 
 class CPUInfer {
  public:
@@ -71,6 +85,24 @@ class CPUInfer {
   template <typename Func, typename Obj, typename... Args>
   void enqueue(Func f, Obj* obj, Args... args) {
     task_queue_->enqueue([=]() { std::invoke(f, *obj, args...); });
+  }
+
+  // Tagged twin of enqueue: a nonzero task_tag prefixes task failure
+  // messages with (kind, expert); tag 0 keeps the exact legacy text and
+  // exception type.
+  template <typename Func, typename Obj, typename... Args>
+  void enqueue_tagged(int64_t task_tag, Func f, Obj* obj, Args... args) {
+    task_queue_->enqueue([=]() {
+      if (task_tag == 0) {
+        std::invoke(f, *obj, args...);
+        return;
+      }
+      try {
+        std::invoke(f, *obj, args...);
+      } catch (const std::exception& e) {
+        throw std::runtime_error(describe_task_tag(task_tag, e.what()));
+      }
+    });
   }
 
   void submit(std::pair<intptr_t, intptr_t> params) {

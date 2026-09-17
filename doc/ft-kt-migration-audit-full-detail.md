@@ -224,6 +224,8 @@ adjustments: 1) risk_level: medium → medium-high(保守上调)。理由:三项
 
 # event-fence  [adapt / P1 / risk=medium]
 
+> **历史注记(2026-09-17)**:本特性三枚 env(`SGLANG_KT_PREFILL_EVENT_FENCE/PREFILL_STAGE_CHUNK_EXPERTS/PREFILL_NO_DEVICE_SYNC`,下文 eval/验证段另有 `PREFILL_FENCE_DEBUG` 引用)连同第二批其余五枚,已随 [ft-kt-phase2-plan-bank-dma-event-fence.md](ft-kt-phase2-plan-bank-dma-event-fence.md) §6-21 参数化裁定改为 `--kt-*` CLI 参数(`--kt-prefill-event-fence` 默认 1,显式置 0 opt-out 逐位等价);以下段落保留原 env 设计仅作审计史,现行形态以该文档 §1 参数总表为准。
+
 ## expected_gain
 prefill 500 → 约 770–980 tok/s(1.55–1.95×)。推导:chunk=4096 tok 现耗时 8.2s;每 chunk 两 rank 合计约 170GiB H2D(85GiB/rank,232 专家×19,161,088B×61 层),实测有效带宽 11GB/s → 传输约 7.9s 占 chunk ~96%,纯同步/串扰开销是带宽离 Gen4 线速 22GB/s 的主因。本特性把串行路径 232 次 dist.barrier/层(kt_ep_wrapper.py:1323-1324)降为 2×⌈232/64⌉=8 次 NCCL 控制面 all_reduce/层,把 layerwise 路径 464 次 NCCL+.item()/层(:2253-2256+:2273-2275)同样降为 8 次;并移除每层 3 次全设备同步(:1777-1778/:1816-1817/:1420-1421;热更新自有的:2473/:4514 一期保留)。保守按 PCIe NCCL 2 方 rendezvous 50–200µs/次:控制面 host 开销 232×61≈1.4 万次→61×8≈488 次/chunk,省 0.7–2.8s;流水线不再被逐专家 rendezvous 打断,有效带宽 11→18–21GB/s ⇒ 传输 3.9–4.7s/rank;事件链使 Phase3 repack 与下一层写/H2D 以 stream 序重叠 ⇒ chunk 4.2–5.3s ⇒ 770–980 tok/s。上限被 PCIe 线速封顶(85GiB/22GB/s≈3.95s)。ERR 区间:若生产实际跑 layerwise 路径(其 464 次 .item() 更重),取下限附近收益更大,可能接近 2×。
 
@@ -896,6 +898,8 @@ adjustments: verdict=adapt 维持(四处设计改动均被代码证实必要且�
 ---
 
 # cpu-off-datapath  [adapt / P2 / risk=medium]
+
+> **历史注记(2026-09-17)**:本特性五枚 env(`SGLANG_KT_DIRECT_BANK_DMA/BANK_DMA_BATCH/BANK_DMA_LEAN/DUMP_SLOT_BYTES`,另 `PREFILL_EVENT_FENCE` 于对拍段交叉引用)已随 [ft-kt-phase2-plan-bank-dma-event-fence.md](ft-kt-phase2-plan-bank-dma-event-fence.md) §6-21 参数化裁定改为 `--kt-*` CLI 参数(`--kt-direct-bank-dma` 默认 1、无 manifest 时恰一行降级 warn 强制落 0;显式置 0 opt-out 逐位等价);以下段落保留原 env 设计仅作审计史,现行形态以该文档 §1 参数总表为准。
 
 ## expected_gain
 三层收益:(1) 传输效率——每 chunk H2D 约 170GiB(61 层 x 232 非驻留专家 x 19,161,088B/专家,TP=2 分片后),去掉 rank0 CPU memcpy leg(与 H2D 等量,约 170GiB/chunk 的 host 写流量)+ 去 14,152 个专家级控制事件(串行路 dist.barrier@kt_ep_wrapper.py:1324 或层wise 2x NCCL 4B all_reduce + .item()@:2253-2275 + host_slot_free_events.synchronize()@:2249 + sync_write@:1314),有效 DMA 带宽从实测 ~11GB/s 逼近 17-21GB/s(PCIe Gen4 x16 线速 ~22GB/s),chunk 传输时间 -35%~-48%;若 prefill 传输主导,500 tok/s → 700~900 tok/s(+40%~+80%),保守下限 +25%(部分计算主导情形)。(2) CPU 释放:kt-kernel WorkerPool(168 核,experts_base.py:405 单例)不再被 14,152 x ~38MB 的 do_numa_job/work_stealing memcpy(mxfp4-moe.hpp:627/:359-423)占满,decode 前向不再排在 staging 写后(TaskQueue FIFO + sync(0) 等全集语义,cpuinfer.h:103-114;amx.py:1391-1396),混合 prefill+decode 负载下 decode 尾延迟显性改善。(3) 控制面:每 chunk 移除 ~14,152x(1 NCCL barrier 或 2 all_reduce+.item())≈0.7~2.8s 的 host 往返,并消除 xysa10 PCIe-only 平台上热点环内的集合通信。

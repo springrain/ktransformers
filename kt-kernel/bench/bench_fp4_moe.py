@@ -16,11 +16,18 @@ Usage:
     python bench/bench_fp4_moe.py --backend v1
     python bench/bench_fp4_moe.py --backend v1 --routing concentrated
     python bench/bench_fp4_moe.py --all --routing concentrated   # 所有可用 backend 对比
+    python bench/bench_fp4_moe.py pack-bank --out <bank_dir> --layers 1 --tp 4
+        # pack-bank: 经 write_weight_scale_to_buffer_task 黄金写入路径把
+        # MXFP4 专家切片落盘成 <out>/tile_layer{L}_rank{R}.bin + manifest.json;
+        # tile 字节与生产 shm 像逐位等(同一 C++ writer 排版, ue8m0->bf16 加宽
+        # 发生在 convert_or_copy 内)。生产打包请在部署架构上跑(backend=auto
+        # 探测顺序 neon > v1 > v2)。
 
 `--backend` 是预留扩展点; 当前编译只绑定 v1 (AMXFP4_KGroup_MOE)。要选 v2/v3
 需要 ext_bindings 里加新绑定。`--all` 会自动检测哪些 backend 可用。
 """
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -55,6 +62,7 @@ BACKENDS = {
     "v1": getattr(kt_kernel_ext.moe, "AMXFP4_KGroup_MOE", None),
     # 预留扩展点; 加新 backend 时在 ext_bindings 绑定后这里加一行即可。
     "v2": getattr(kt_kernel_ext.moe, "AMXFP4_KGroup_MOE_V2", None),
+    "neon": getattr(kt_kernel_ext.moe, "NEONMXFP4_MOE", None),
 }
 
 # OCP MXFP4 (E2M1) codepoints — same order as the kernel's LUT.
@@ -83,32 +91,36 @@ def quantize_mxfp4_tensor(weights: torch.Tensor, group_size: int):
     return packed, scales
 
 
-def build_synth_weights():
-    torch.manual_seed(0)
-    gate = torch.randn((EXPERT_NUM, INTER, HIDDEN), dtype=torch.float32) / 100
-    up = torch.randn((EXPERT_NUM, INTER, HIDDEN), dtype=torch.float32) / 100
-    down = torch.randn((EXPERT_NUM, HIDDEN, INTER), dtype=torch.float32) / 100
-    gw, gs = quantize_mxfp4_tensor(gate, K_GROUP_SIZE)
-    uw, us = quantize_mxfp4_tensor(up, K_GROUP_SIZE)
-    dw, ds = quantize_mxfp4_tensor(down, K_GROUP_SIZE)
+def build_synth_weights(seed: int = 0, expert_num: int = EXPERT_NUM,
+                        hidden: int = HIDDEN, inter: int = INTER,
+                        group_size: int = K_GROUP_SIZE):
+    torch.manual_seed(seed)
+    gate = torch.randn((expert_num, inter, hidden), dtype=torch.float32) / 100
+    up = torch.randn((expert_num, inter, hidden), dtype=torch.float32) / 100
+    down = torch.randn((expert_num, hidden, inter), dtype=torch.float32) / 100
+    gw, gs = quantize_mxfp4_tensor(gate, group_size)
+    uw, us = quantize_mxfp4_tensor(up, group_size)
+    dw, ds = quantize_mxfp4_tensor(down, group_size)
     return {
         "gate_w": gw, "up_w": uw, "down_w": dw,
         "gate_s": gs, "up_s": us, "down_s": ds,
     }
 
 
-def build_moe(backend: str, weights, cpu_infer):
+def build_moe(backend: str, weights, cpu_infer, expert_num: int = EXPERT_NUM,
+              hidden: int = HIDDEN, inter: int = INTER,
+              group_size: int = K_GROUP_SIZE):
     cls = BACKENDS.get(backend)
     if cls is None:
         raise RuntimeError(
             f"backend={backend} not bound in this build. Available: "
             f"{[k for k, v in BACKENDS.items() if v is not None]}"
         )
-    cfg = kt_kernel_ext.moe.MOEConfig(EXPERT_NUM, TOP_K, HIDDEN, INTER, 0)
+    cfg = kt_kernel_ext.moe.MOEConfig(expert_num, TOP_K, hidden, inter, 0)
     cfg.max_len = max(DEFAULT_M_LIST)
     cfg.pool = cpu_infer.backend_
     cfg.quant_config.bits = 4
-    cfg.quant_config.group_size = K_GROUP_SIZE
+    cfg.quant_config.group_size = group_size
     cfg.quant_config.zero_point = False
     cfg.gate_projs = [[t.data_ptr() for t in weights["gate_w"]]]
     cfg.up_projs = [[t.data_ptr() for t in weights["up_w"]]]
@@ -117,7 +129,7 @@ def build_moe(backend: str, weights, cpu_infer):
     cfg.up_scales = [[t.data_ptr() for t in weights["up_s"]]]
     cfg.down_scales = [[t.data_ptr() for t in weights["down_s"]]]
     moe = cls(cfg)
-    p2l = torch.arange(EXPERT_NUM, dtype=torch.int64).contiguous()
+    p2l = torch.arange(expert_num, dtype=torch.int64).contiguous()
     cpu_infer.submit(moe.load_weights_task(p2l.data_ptr()))
     cpu_infer.sync()
     return moe
@@ -209,6 +221,238 @@ def print_compare_table(all_rows: dict, routing: str):
             ratio = all_rows[be][i]['per_iter_us'] / all_rows[base][i]['per_iter_us']
             line += f"  {ratio:>8.3f}"
         print(line)
+
+
+# ----- pack-bank: 经 write_weight_scale_to_buffer_task 黄金路径落盘
+# pre-sharded MXFP4 bank tile。tile 字节 = 生产 shm 像(同一 C++ writer
+# 排版, ue8m0->bf16 加宽在 convert_or_copy 内); manifest.json 全键
+# sort_keys=True。消费侧: sglang 侧 --kt-direct-bank-dma(默认开)校验加载。
+BANK_FIELDS = (
+    "w13_weight",
+    "w13_weight_scale_inv",
+    "w2_weight",
+    "w2_weight_scale_inv",
+)
+PACK_WEIGHT_KEYS = ("gate_w", "up_w", "down_w", "gate_s", "up_s", "down_s")
+PACK_BACKEND_PRIORITY = ("neon", "v1", "v2")
+# task_tag = (kind << 32) | expert_id; kind 1 = write_weight_scale_to_buffer。
+PACK_TASK_KIND = 1
+
+PACK_PTR_ARG_NAMES = {
+    "w13_weight": "w13_weight_ptrs",
+    "w13_weight_scale_inv": "w13_scale_ptrs",
+    "w2_weight": "w2_weight_ptrs",
+    "w2_weight_scale_inv": "w2_scale_ptrs",
+}
+
+_PACK_TASK_TAG_ABI_CHECKED = False
+
+
+def _ensure_pack_task_tag_abi(moe) -> None:
+    """Fail fast when kt_kernel_ext predates the task_tag arg (D8 probe).
+
+    pack-bank passes task_tag to write_weight_scale_to_buffer_task; an
+    extension built before CPUInfer::enqueue_tagged binds no such arg and
+    would fail deep in the submit path with an opaque pybind error.
+    Mirrors _ensure_forward_task_abi in kt-kernel/python/experts_base.py;
+    the escape valve is intentionally the same env var.
+    """
+    global _PACK_TASK_TAG_ABI_CHECKED
+    if _PACK_TASK_TAG_ABI_CHECKED:
+        return
+    # Escape hatch for mock-based tests or a knowingly patched binding.
+    if os.environ.get("SGLANG_KT_SKIP_FORWARD_TASK_ABI_CHECK") == "1":
+        _PACK_TASK_TAG_ABI_CHECKED = True
+        return
+    doc = type(moe).write_weight_scale_to_buffer_task.__doc__ or ""
+    if "task_tag" not in doc:
+        raise RuntimeError(
+            "kt_kernel_ext write_weight_scale_to_buffer_task lacks the "
+            "'task_tag' parameter; the installed extension predates the "
+            "CPUInfer::enqueue_tagged ABI. Rebuild kt-kernel (python "
+            "setup.py build_ext --inplace), or set "
+            "SGLANG_KT_SKIP_FORWARD_TASK_ABI_CHECK=1 to bypass this check."
+        )
+    _PACK_TASK_TAG_ABI_CHECKED = True
+
+
+def bank_field_row_bytes(hidden: int, inter: int, group_size: int, tp_count: int):
+    """One expert's per-rank bank row bytes under the MXFP4 writer geometry."""
+    if inter % tp_count != 0:
+        raise ValueError(f"inter={inter} not divisible by tp={tp_count}")
+    if hidden % group_size != 0:
+        raise ValueError(f"hidden={hidden} not divisible by group={group_size}")
+    if (inter // tp_count) % group_size != 0:
+        raise ValueError(
+            f"inter/tp={inter // tp_count} not divisible by group={group_size}")
+    row_bytes = {
+        # W13 splits global-N: two mats (gate, up) of (inter/tp) x hidden nibbles.
+        "w13_weight": 2 * ((inter // tp_count) * hidden // 2),
+        "w13_weight_scale_inv": 2 * ((inter // tp_count) * (hidden // group_size)) * 2,
+        # W2 splits global-K: hidden rows of (inter/tp) nibbles.
+        "w2_weight": hidden * (inter // tp_count) // 2,
+        "w2_weight_scale_inv": (hidden * (inter // tp_count) // group_size) * 2,
+    }
+    misaligned = [f for f, n in row_bytes.items() if n % 16 != 0]
+    if misaligned:
+        raise ValueError(f"bank rows not 16B aligned: {misaligned}")
+    return row_bytes
+
+
+def _tensor_byte_view(t: torch.Tensor) -> torch.Tensor:
+    # bf16 has no numpy dtype; hash the raw little-endian byte view instead.
+    return t.contiguous().view(torch.uint8)
+
+
+def _canonical_json_sha256(payload) -> str:
+    blob = json.dumps(payload, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def _pack_backend_name(requested: str) -> str:
+    if requested != "auto":
+        return requested
+    for candidate in PACK_BACKEND_PRIORITY:
+        if BACKENDS.get(candidate) is not None:
+            return candidate
+    raise RuntimeError("no MXFP4 backend bound in this build for pack-bank")
+
+
+def _pack_layer_weights(args, layer_idx: int):
+    if args.weights_dir is None:
+        # 合成源 scale 为 bf16(照 AMX 先例); 生产打包必须 --weights-dir 喂
+        # checkpoint 源 dtype, 由 C++ load/writer 同一转换路径排版。
+        return build_synth_weights(
+            seed=args.seed + layer_idx, expert_num=args.experts,
+            hidden=args.hidden, inter=args.inter, group_size=args.group_size)
+    path = os.path.join(args.weights_dir, f"layer{layer_idx}.pt")
+    payload = torch.load(path, map_location="cpu")
+    return {k: payload[k].contiguous() for k in PACK_WEIGHT_KEYS}
+
+
+def _pack_drive_experts(moe, cpu_infer, bufs, row_bytes, experts: int, tp_count: int):
+    """Golden per-expert write loop into flat [experts] rows per field per rank."""
+    for expert_id in range(experts):
+        call_args = {"gpu_tp_count": tp_count, "expert_id": expert_id}
+        for field in BANK_FIELDS:
+            call_args[PACK_PTR_ARG_NAMES[field]] = [
+                bufs[field][rank].data_ptr() + expert_id * row_bytes[field]
+                for rank in range(tp_count)
+            ]
+        call_args["task_tag"] = (PACK_TASK_KIND << 32) | expert_id
+        cpu_infer.submit(moe.write_weight_scale_to_buffer_task(**call_args))
+        cpu_infer.sync()
+
+
+def _pack_dump_tile(out_dir: str, layer_idx: int, rank: int, bufs, row_bytes,
+                    experts: int):
+    name = f"tile_layer{layer_idx}_rank{rank}.bin"
+    entries = []
+    with open(os.path.join(out_dir, name), "wb") as fh:
+        for field in BANK_FIELDS:
+            payload = bufs[field][rank].numpy().tobytes()
+            fh.write(payload)
+            entries.append({
+                "field": field,
+                "rows": experts,
+                "nbytes": row_bytes[field],
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            })
+    return name, {"layer": layer_idx, "rank": rank, "fields": entries}
+
+
+def pack_bank(args):
+    backend = _pack_backend_name(requested=args.backend)
+    row_bytes = bank_field_row_bytes(hidden=args.hidden, inter=args.inter,
+                                     group_size=args.group_size, tp_count=args.tp)
+    worker_pool = kt_kernel_ext.WorkerPoolConfig()
+    worker_pool.subpool_count = args.numa
+    worker_pool.subpool_numa_map = list(range(args.numa))
+    worker_pool.subpool_thread_count = [args.threads_per_numa] * args.numa
+    cpu_infer = kt_kernel_ext.CPUInfer(worker_pool)
+    bufs = {
+        field: [torch.empty(args.experts * row_bytes[field], dtype=torch.uint8)
+                for _ in range(args.tp)]
+        for field in BANK_FIELDS
+    }
+    os.makedirs(args.out, exist_ok=True)
+    tiles = {}
+    weights_hasher = hashlib.sha256()
+    for layer_idx in range(args.layers):
+        weights = _pack_layer_weights(args=args, layer_idx=layer_idx)
+        for key in PACK_WEIGHT_KEYS:
+            weights_hasher.update(_tensor_byte_view(t=weights[key]).numpy().tobytes())
+        moe = build_moe(backend=backend, weights=weights, cpu_infer=cpu_infer,
+                        expert_num=args.experts, hidden=args.hidden,
+                        inter=args.inter, group_size=args.group_size)
+        _ensure_pack_task_tag_abi(moe=moe)  # D8: first call per process
+        _pack_drive_experts(moe=moe, cpu_infer=cpu_infer, bufs=bufs,
+                            row_bytes=row_bytes, experts=args.experts,
+                            tp_count=args.tp)
+        for rank in range(args.tp):
+            name, record = _pack_dump_tile(out_dir=args.out, layer_idx=layer_idx,
+                                           rank=rank, bufs=bufs,
+                                           row_bytes=row_bytes, experts=args.experts)
+            tiles[name] = record
+        del moe, weights
+    topo = {"gpu_tp_count": args.tp}
+    dims = {"num_layers": args.layers, "num_experts": args.experts,
+            "hidden_size": args.hidden, "intermediate_size": args.inter,
+            "group_size": args.group_size}
+    dtype = {field: ("bfloat16" if field.endswith("scale_inv") else "uint8")
+             for field in BANK_FIELDS}
+    tile_map = {"fields": list(BANK_FIELDS), "rows_per_tile": args.experts,
+                "tile_naming": "tile_layer{layer}_rank{rank}.bin"}
+    manifest = {
+        "layout_version": 1,
+        "backend": BACKENDS[backend].__name__,
+        "topo": topo,
+        "dims": dims,
+        "dtype": dtype,
+        "map": tile_map,
+        "keys_sha256": {group: _canonical_json_sha256(payload=payload)
+                        for group, payload in (("topo", topo), ("dims", dims),
+                                               ("dtype", dtype), ("map", tile_map))},
+        "weights_sha256": weights_hasher.hexdigest(),
+        "tiles": tiles,
+    }
+    with open(os.path.join(args.out, "manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    return manifest
+
+
+def pack_main(argv):
+    p = argparse.ArgumentParser(
+        prog="bench_fp4_moe.py pack-bank",
+        description="经黄金写入路径落盘 pre-sharded MXFP4 bank tile + manifest")
+    p.add_argument("--out", required=True,
+                   help="bank 输出目录(tile_layer{L}_rank{R}.bin + manifest.json)")
+    p.add_argument("--layers", type=int, default=1)
+    p.add_argument("--experts", type=int, default=EXPERT_NUM)
+    p.add_argument("--hidden", type=int, default=HIDDEN)
+    p.add_argument("--inter", type=int, default=INTER)
+    p.add_argument("--group-size", type=int, default=K_GROUP_SIZE)
+    p.add_argument("--tp", type=int, default=4, help="gpu_tp_count(写盘切分数)")
+    p.add_argument("--backend", default="auto",
+                   help="auto 探测顺序: " + ",".join(PACK_BACKEND_PRIORITY))
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--weights-dir", default=None,
+                   help="真权重目录(layer{L}.pt, 键 " + "/".join(PACK_WEIGHT_KEYS)
+                        + "), 缺省按 --seed 合成")
+    p.add_argument("--numa", type=int, default=WORKER_NUMA)
+    p.add_argument("--threads-per-numa", type=int, default=WORKER_THREADS_PER_NUMA)
+    args = p.parse_args(argv)
+    start = time.perf_counter()
+    manifest = pack_bank(args=args)
+    elapsed = time.perf_counter() - start
+    total_bytes = sum(
+        entry["nbytes"] * entry["rows"]
+        for tile in manifest["tiles"].values() for entry in tile["fields"])
+    print(f"[pack-bank] layers={args.layers} experts={args.experts} tp={args.tp} "
+          f"backend={manifest['backend']} tiles={len(manifest['tiles'])} "
+          f"bytes={total_bytes} elapsed={elapsed:.1f}s")
+    print(f"[pack-bank] manifest -> {os.path.join(args.out, 'manifest.json')}")
 
 
 def get_git_commit():
@@ -310,4 +554,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "pack-bank":
+        pack_main(sys.argv[2:])
+    else:
+        main()
