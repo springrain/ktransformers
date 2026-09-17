@@ -83,6 +83,8 @@
 - **G2** xysa10 全矩阵(dual × NUMA × N,含一次 CONTENDED=1);退出=归入 (a)/(b) 之一且支撑数字齐,verdict JSON 交付二期排序。
 - **G3** 常驻:拓扑/驱动变更后或二期重排前复跑;与基线漂移 <10%。全程与服务器互斥;探针失败只损失一次测量,生产零影响。
 
+> 执行规程(2026-09-17 收口):G1/G2 在 xysa10 停服窗口的具体指令序列、verdict → 梯队决策翻译表,见 [ft-kt-xysa10-runbook.md](ft-kt-xysa10-runbook.md)(reserve 三档同窗口搭车)。
+
 ## 6. 热更新交互 / collectives / CUDA graph(核销)
 
 - 独立进程,从不 import kt_ep_wrapper;`:2473-2491` 更新窗口、`:2253-2275` 共识、`:2042-2050` all_reduce、`:1323-1324` barrier、`:4504-4513/:4689-4732` serial 热更新 —— **全无路径交叉**(rollout 互斥挡硬件并发)。集合通信数=0(不 init 任何 process group,协调全走 localhost mp.Barrier/Event)。

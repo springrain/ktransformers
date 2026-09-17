@@ -160,6 +160,10 @@ class KTMoEWrapper:
         # MiniMax M3 swigluoai sigmoid alpha. 0.0 = standard silu (default).
         # Non-zero triggers gate * sigmoid(gate * alpha) * (up + 1) in act_fn.
         swiglu_alpha: float = 0.0,
+        # Decode-side CPUInfer pool guardrails (inference mode only; the SFT
+        # branch below rejects non-default values rather than dropping them).
+        reserve_cores: Optional[int] = None,
+        watchdog_timeout_ms: int = 0,
     ):
         """
         Factory method to create the appropriate backend implementation.
@@ -232,6 +236,8 @@ class KTMoEWrapper:
                 numa_nodes=numa_nodes,
                 swiglu_limit=swiglu_limit,
                 swiglu_alpha=swiglu_alpha,
+                reserve_cores=reserve_cores,
+                watchdog_timeout_ms=watchdog_timeout_ms,
             )
         else:  # mode == "sft"
             # SFT factory does not plumb swiglu_limit; reject non-zero
@@ -241,6 +247,15 @@ class KTMoEWrapper:
                     f"swiglu_limit={swiglu_limit} is not supported in "
                     f"mode='sft' (method={method!r}); SFT backends do not "
                     f"implement the V4-2604B clamp."
+                )
+            # Pool-global guardrails likewise must not be silently dropped:
+            # co-resident inference wrappers share the same CPUInfer pool.
+            if reserve_cores or watchdog_timeout_ms:
+                raise ValueError(
+                    f"reserve_cores={reserve_cores}/watchdog_timeout_ms="
+                    f"{watchdog_timeout_ms} are not supported in mode='sft' "
+                    f"(method={method!r}); the decode-side CPUInfer pool "
+                    f"guardrails are inference-mode only this phase."
                 )
             return _create_sft_wrapper(
                 layer_idx=layer_idx,
@@ -332,6 +347,8 @@ def _create_inference_wrapper(
     numa_nodes: Optional[List[int]] = None,
     swiglu_limit: float = 0.0,
     swiglu_alpha: float = 0.0,
+    reserve_cores: Optional[int] = None,
+    watchdog_timeout_ms: int = 0,
 ) -> BaseMoEWrapper:
     """
     Create an inference wrapper based on the method.
@@ -404,6 +421,8 @@ def _create_inference_wrapper(
         max_deferred_experts_per_token=max_deferred_experts_per_token,
         method=method,
         numa_nodes=numa_nodes,
+        reserve_cores=reserve_cores,
+        watchdog_timeout_ms=watchdog_timeout_ms,
         **extra_kwargs,
     )
 

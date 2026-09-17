@@ -96,6 +96,7 @@ unit-test-admission 三族归类,逐用例"哪个未来 diff 使其变红"已可
 | N11 | 关键路径簿记 | env parse/非法值 warn-once;冻结值胜出 + drift warn 一次;MIN 协商脚本化;`_submit_window_writes` 缺 geometry raise;DEBUG=1 digest 每观察一行 + 脚本 mismatch → sticky |
 
 回归盘:`kt_slot_ownership_assert_test.py` N1–N5、`kt_degrade_reason_test.py` N4/N5/N6 全绿。
+(**追记 2026-09-17**:N12 于 fence×window 兜底复合批次补入——窗容量探测失败软降级恰一行 "ring-or-legacy" warn、geometry 保 None、同开窗态 fence 协商照常冻结全件环几何,钉死窗降级接管者 = ring 而非 legacy;断言对象与设计归 [ft-kt-phase2-plan-dma-event-fence.md](ft-kt-phase2-plan-dma-event-fence.md) §6-24,本文档 §1 互斥裁决不受影响。)
 
 ## 5. 静态验证记录(2026-09-16,全部已执行)
 

@@ -51,6 +51,8 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
         numa_nodes: Optional[List[int]] = None,
         swiglu_limit: float = 0.0,
         swiglu_alpha: float = 0.0,
+        reserve_cores: Optional[int] = None,
+        watchdog_timeout_ms: int = 0,
     ):
         """
         Initialize Llamafile MoE Wrapper.
@@ -147,6 +149,8 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
             method=method,
             numa_nodes=numa_nodes,
             swiglu_limit=swiglu_limit,
+            reserve_cores=reserve_cores,
+            watchdog_timeout_ms=watchdog_timeout_ms,
         )
 
         self.weights_to_keep = None

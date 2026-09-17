@@ -10,7 +10,9 @@
 #ifndef CPUINFER_CPUINFER_H
 #define CPUINFER_CPUINFER_H
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -71,8 +73,21 @@ class CPUInfer {
     ggml_cpu_init();
   }
 
+  // watchdog_timeout_ms <= 0 keeps the exact legacy 1-arg behavior: no
+  // monitor thread is spawned, so default builds pay zero watchdog cost.
+  CPUInfer(WorkerPoolConfig config, int watchdog_timeout_ms) {
+    printf("CPUInfer[0x%lx]: Hello\n", (intptr_t)this);
+    backend_ = new WorkerPool(config);
+    task_queue_ = new TaskQueue();
+    ggml_cpu_init();
+    start_watchdog_(watchdog_timeout_ms);
+  }
+
   ~CPUInfer() {
     printf("CPUInfer[0x%lx]: Goodbye\n", (intptr_t)this);
+    // Stop the watchdog before task_queue_ below is freed (it dereferences it).
+    watchdog_stop_.store(true, std::memory_order_release);
+    if (watchdog_thread_.joinable()) watchdog_thread_.join();
     delete task_queue_;  // joins the worker first; queued tasks dereference backend_
     delete backend_;
   }
@@ -102,7 +117,7 @@ class CPUInfer {
       } catch (const std::exception& e) {
         throw std::runtime_error(describe_task_tag(task_tag, e.what()));
       }
-    });
+    }, task_tag);  // the tag also feeds the watchdog heartbeat display
   }
 
   void submit(std::pair<intptr_t, intptr_t> params) {
@@ -167,9 +182,43 @@ class CPUInfer {
 #endif
   }
 #endif
+
+  // Probed from Python between decode steps; both are cheap because the
+  // poison state is a latched atomic flag plus a mutex-guarded string.
+  bool watchdog_tripped() { return task_queue_->poisoned(); }
+  std::string watchdog_text() { return task_queue_->poison_text(); }
+
+ private:
+  void start_watchdog_(int watchdog_timeout_ms) {
+    if (watchdog_timeout_ms <= 0) return;
+    const int64_t budget_ns = int64_t(watchdog_timeout_ms) * 1000000;
+    watchdog_thread_ = std::thread([this, watchdog_timeout_ms, budget_ns]() {
+      // Poll in 10 slices of the budget so destructor shutdown stays prompt.
+      const auto slice = std::chrono::milliseconds(
+          std::max<int64_t>(1, int64_t(watchdog_timeout_ms) / 10));
+      while (!watchdog_stop_.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(slice);
+        if (watchdog_stop_.load(std::memory_order_acquire)) return;
+        int64_t start_ns = task_queue_->current_task_start_ns();
+        if (start_ns == 0) continue;
+        int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (now_ns - start_ns > budget_ns) {
+          task_queue_->poison("[kt watchdog] cpu pool no progress >" +
+                              std::to_string(watchdog_timeout_ms) + "ms " +
+                              describe_task_tag(task_queue_->current_task_tag(),
+                                                "task still running"));
+          return;  // latched poison: fire once, then let the dtor reclaim us
+        }
+      }
+    });
+  }
+
  public:
   WorkerPool* backend_;
   TaskQueue* task_queue_;
+  std::atomic<bool> watchdog_stop_{false};
+  std::thread watchdog_thread_;
 };
 
 #endif

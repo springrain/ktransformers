@@ -50,6 +50,8 @@ class GeneralMoEWrapper(BaseMoEWrapper):
         max_deferred_experts_per_token: Optional[int] = None,
         method: str = "MOE_INT8",
         numa_nodes: Optional[List[int]] = None,
+        reserve_cores: Optional[int] = None,
+        watchdog_timeout_ms: int = 0,
     ):
         """
         Initialize general MoE Wrapper.
@@ -99,6 +101,8 @@ class GeneralMoEWrapper(BaseMoEWrapper):
             max_deferred_experts_per_token=max_deferred_experts_per_token,
             method=method,
             numa_nodes=numa_nodes,
+            reserve_cores=reserve_cores,
+            watchdog_timeout_ms=watchdog_timeout_ms,
         )
 
         # moe-specific: Check if we should load merged safetensor weights

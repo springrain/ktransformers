@@ -72,7 +72,7 @@ struct alignas(64) ThreadState {
 class InNumaPool {
  public:
   InNumaPool(int thread_count);
-  InNumaPool(int max_thread_num, int numa_id, int threads_id_start);
+  InNumaPool(int max_thread_num, int numa_id, int threads_id_start, int reserve_cores = 0);
   ~InNumaPool();
   int get_thread_num();
   void set_restricted_worker_count(int count);
@@ -133,6 +133,9 @@ struct WorkerPoolConfig {
   int subpool_count;
   std::vector<int> subpool_numa_map;
   std::vector<int> subpool_thread_count;
+  // Cores reserved per NUMA node ahead of the pinned worker range; the
+  // default keeps the legacy layout (pybind default-constructs this struct).
+  int reserve_cores_per_numa = 0;
 };
 
 class WorkerPool {

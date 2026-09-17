@@ -18,7 +18,9 @@
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <map>
 #include <stdexcept>
+#include <string>
 
 #include "hwloc.h"
 
@@ -38,7 +40,7 @@ InNumaPool::InNumaPool(int max_thread_num) {
   }
 }
 
-InNumaPool::InNumaPool(int max_thread_num, int numa_id, int threads_id_start) {
+InNumaPool::InNumaPool(int max_thread_num, int numa_id, int threads_id_start, int reserve_cores) {
   printf("===========In NumaPool============\n");
   hwloc_topology_t topology;
   hwloc_obj_t numa_obj, core_obj;
@@ -77,7 +79,9 @@ InNumaPool::InNumaPool(int max_thread_num, int numa_id, int threads_id_start) {
       // throw std::runtime_error("NUMA node not found");
       continue;
     }
-    core_obj = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, i + threads_id_start);
+    // reserve_cores shifts the pinned window past the reserved head block of
+    // this NUMA node's cores; thread names keep the legacy 0-based index.
+    core_obj = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, reserve_cores + i + threads_id_start);
     if (!core_obj) {
       fprintf(stderr, "Core %d inside NUMA node %d not found\n", i, numa_id);
       // throw std::runtime_error("Core not found inside NUMA node");
@@ -418,6 +422,40 @@ void WorkerPool::init(WorkerPoolConfig config) {
   }
   printf("\n");
 
+  if (config.reserve_cores_per_numa != 0) {
+    // Validate on the caller thread: a throw inside the per-subpool
+    // std::thread below would be swallowed into std::terminate.
+    if (config.reserve_cores_per_numa < 0) {
+      throw std::runtime_error("WorkerPoolConfig.reserve_cores_per_numa must be >= 0");
+    }
+    hwloc_topology_t topology;
+    hwloc_topology_init(&topology);
+    hwloc_topology_load(topology);
+    // Aggregate by NUMA id: subpools may repeat a node and ids are arbitrary,
+    // so a fixed subpool_count-sized vector indexed by numa id would be wrong.
+    std::map<int, int> pinned_per_numa;
+    for (int i = 0; i < config.subpool_count; i++) {
+      pinned_per_numa[config.subpool_numa_map[i]] += config.subpool_thread_count[i];
+    }
+    for (const auto& entry : pinned_per_numa) {
+      hwloc_obj_t numa_obj = hwloc_get_obj_by_type(topology, HWLOC_OBJ_NUMANODE, entry.first);
+      if (!numa_obj) {
+        hwloc_topology_destroy(topology);
+        throw std::runtime_error("reserve_cores_per_numa: NUMA node " + std::to_string(entry.first) +
+                                 " not found");
+      }
+      int cores = hwloc_get_nbobjs_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE);
+      if (config.reserve_cores_per_numa + entry.second > cores) {
+        hwloc_topology_destroy(topology);
+        throw std::runtime_error("reserve_cores_per_numa: reserving " +
+                                 std::to_string(config.reserve_cores_per_numa) + " core(s) plus " +
+                                 std::to_string(entry.second) + " pinned thread(s) exceeds " +
+                                 std::to_string(cores) + " core(s) on NUMA " + std::to_string(entry.first));
+      }
+    }
+    hwloc_topology_destroy(topology);
+  }
+
   for (int i = 0; i < config.subpool_count; i++) {
     numa_worker_pools.push_back(nullptr);
   }
@@ -426,10 +464,11 @@ void WorkerPool::init(WorkerPoolConfig config) {
     auto this_numa = config.subpool_numa_map[i];
     auto this_thread_count = config.subpool_thread_count[i];
     auto this_thread_id_start = numa_threads_count[this_numa];
-    std::thread([this, i, this_numa, this_thread_count, this_thread_id_start]() {
+    auto this_reserve = config.reserve_cores_per_numa;
+    std::thread([this, i, this_numa, this_thread_count, this_thread_id_start, this_reserve]() {
       set_to_numa(this_numa);
-      numa_worker_pools[i] =
-          std::move(std::unique_ptr<InNumaPool>(new InNumaPool(this_thread_count, this_numa, this_thread_id_start)));
+      numa_worker_pools[i] = std::move(std::unique_ptr<InNumaPool>(
+          new InNumaPool(this_thread_count, this_numa, this_thread_id_start, this_reserve)));
       // numa_worker_pools[i] = std::move(std::unique_ptr<InNumaPool>(new InNumaPool(this_thread_count)));
     }).join();
     numa_threads_count[this_numa] += this_thread_count;

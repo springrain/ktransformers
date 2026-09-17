@@ -653,13 +653,17 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def(py::init<>())
       .def_readwrite("subpool_count", &WorkerPoolConfig::subpool_count)
       .def_readwrite("subpool_numa_map", &WorkerPoolConfig::subpool_numa_map)
-      .def_readwrite("subpool_thread_count", &WorkerPoolConfig::subpool_thread_count);
+      .def_readwrite("subpool_thread_count", &WorkerPoolConfig::subpool_thread_count)
+      .def_readwrite("reserve_cores_per_numa", &WorkerPoolConfig::reserve_cores_per_numa);
 
   py::class_<CPUInfer>(m, "CPUInfer")
       .def(py::init<int>())
       .def(py::init<WorkerPoolConfig>())
+      .def(py::init<WorkerPoolConfig, int>())
       .def("submit", &CPUInfer::submit)
       .def("sync", &CPUInfer::sync, py::arg("allow_n_pending") = 0)
+      .def("watchdog_tripped", &CPUInfer::watchdog_tripped)
+      .def("watchdog_text", &CPUInfer::watchdog_text)
       .def_readwrite("backend_", &CPUInfer::backend_)
 #ifndef KTRANSFORMERS_CPU_ONLY
       .def("sync_with_cuda_stream", &CPUInfer::sync_with_cuda_stream, py::arg("user_cuda_stream"),

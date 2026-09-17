@@ -519,6 +519,8 @@ class AMXMoEWrapper(BaseMoEWrapper):
         max_deferred_experts_per_token: Optional[int] = None,
         method: str = "AMXINT4",
         numa_nodes: Optional[List[int]] = None,
+        reserve_cores: Optional[int] = None,
+        watchdog_timeout_ms: int = 0,
     ):
         """
         Initialize AMX MoE Wrapper.
@@ -570,6 +572,8 @@ class AMXMoEWrapper(BaseMoEWrapper):
             max_deferred_experts_per_token=max_deferred_experts_per_token,
             method=method,
             numa_nodes=numa_nodes,
+            reserve_cores=reserve_cores,
+            watchdog_timeout_ms=watchdog_timeout_ms,
         )
 
         # AMX-specific: Check if we should load merged safetensor weights
@@ -819,6 +823,8 @@ class NativeMoEWrapper(BaseMoEWrapper):
         numa_nodes: Optional[List[int]] = None,
         swiglu_limit: float = 0.0,
         swiglu_alpha: float = 0.0,
+        reserve_cores: Optional[int] = None,
+        watchdog_timeout_ms: int = 0,
     ):
         self._swiglu_alpha = float(swiglu_alpha)
         # Defence in depth: reject swiglu_limit on methods whose native MoE
@@ -918,6 +924,8 @@ class NativeMoEWrapper(BaseMoEWrapper):
             method=method,
             numa_nodes=numa_nodes,
             swiglu_limit=swiglu_limit,
+            reserve_cores=reserve_cores,
+            watchdog_timeout_ms=watchdog_timeout_ms,
         )
 
         if NativeMoEWrapper._native_loader_instance is None:

@@ -1,4 +1,4 @@
-# Phase-2 计划:cpu-off-datapath(per-rank pinned bank)+ event-fence(E_chunk 环块)—— ✅ 代码落盘,静态验证全过;✅ 2026-09-17 参数化落盘(8 env → `--kt-*` CLI,两主开关默认开,§6-21);❌ 2026-09-17 用户裁定移除 cpu-off-datapath(bank)整支(pinned 镜像 ≈+1 份专家权重 RAM、单机专家桶 ≈×2 不可接受,§6-23);参数总表 8→4 枚,剩者全 fence 系
+# Phase-2 计划:cpu-off-datapath(per-rank pinned bank)+ event-fence(E_chunk 环块)—— ✅ 代码落盘,静态验证全过;✅ 2026-09-17 参数化落盘(8 env → `--kt-*` CLI,两主开关默认开,§6-21);❌ 2026-09-17 用户裁定移除 cpu-off-datapath(bank)整支(pinned 镜像 ≈+1 份专家权重 RAM、单机专家桶 ≈×2 不可接受,§6-23);参数总表 8→4 枚,剩者全 fence 系;✅ 2026-09-17 fence×window 兜底复合落盘(§6-24,mutex 互斥废止,F8 翻转 + N12 钉死窗降级⇒ring 接管,四套件 30 测绿)
 
 > 日期:2026-09-16。第 2 梯队 Prefill 史诗**第二批**,即梯队 2 余下两项,用户裁定**同批一次性**落盘。
 > 上游依据:[ft-kt-optimization-tiers.md](ft-kt-optimization-tiers.md) §梯队2、
@@ -28,13 +28,13 @@
 | `--kt-prefill-stage-chunk-experts`(`kt_prefill_stage_chunk_experts`,int) | {0,16,32,64}(argparse choices 启动期拦截非法值,原非法值 warn 链随删) | 64 | `_event_fence_chunk_env` `:3056`(直读袋);折叠 `intent = fence and chunk != 0` | 探测失败降级阶梯 64→32→16→1(MIN 统一);chunk=1 ≡ legacy 2×E 节拍(48h 退火基线,choices 不含 1,由阶梯地板达成,§7) |
 | `--kt-prefill-no-device-sync 0|1`(`kt_prefill_no_device_sync`,int 注解推导 type + `Arg(choices=[0,1])`) | {0,1} | 0 | 一期恒按 0 处理(grep 门白名单本期为空);=1 恰一行 inert warn(`_validate_kt_args` 承担) | 独立二分预留;fence 关时计入 ignored warn |
 | `--kt-prefill-fence-debug 0|1`(`kt_prefill_fence_debug`,int 注解推导 type + `Arg(choices=[0,1])`) | {0,1} | 0 | `_fence_debug_env_local` `:3062`(直读袋)→ `_any_tp_rank_true` MAX 冻结入 `geometry.debug_rows` | 每块首 4KB head digest all_gather_object 对拍;mismatch 入 sticky |
-**互斥矩阵**:**FENCE×WINDOW≥1 ⇒ FENCE inert + warn-once**(mutex,staging window 本期拥有 host 传输);FENCE 不接 INT4/FP8/BF16(仅 MXFP4)。
+**复合矩阵(2026-09-17 §6-24 兜底复合,原互斥矩阵废止)**:FENCE×WINDOW≥1 ⇒ **双几何皆冻结、协商零互斥、零 warn**;窗口健康 ⇒ window 道独占 host 传输(共识账本 2/层逐位不变),冻结环 standby(环行 SHM 一次性 standby 占用);窗口软降级 ⇒ **ring 接管**(2×⌈E/chunk⌉)而非 legacy;深复合(窗内分块流水)显式出范围。FENCE 不接 INT4/FP8/BF16(仅 MXFP4)。
 
 ### 1.1 参数逐枚说明(白话版:叫什么、管什么、本期干什么)
 
 > 形态总纲(**2026-09-17 用户三裁**):开关类一律 `0|1` 显式取值,0=关 1=开,int 字段 `Arg(choices=[0,1])`;不派生 `--no-*` 形态,显式关闭统一写作 `--kt-<name> 0`;唯一非开关是 chunk(值域 {0,16,32,64})。读法:wrapper 直读 `get_exec().moe.<field>`;CLI 参数冻结于启动、运行期不可变(drift 机制随参数化废止,§6-20/§6-21)。
 
-- **`--kt-prefill-event-fence 0|1`(默认 1)**——**事件栅栏环块传输总闸**。CPU 专家按 chunk 尺寸成块经双环搬运,每层付 2×⌈E/chunk⌉ 次设备共识,替代 legacy 的 2×E;控制面收紧是恢复线速的一号手段(§2.2/§6-14)。intent MIN 每 rank 恒跑(含 0)防 collective 挂死;显式 0 ⇒ 分配尺寸与协议逐位冻结(R20),三个子参数被忽略恰一行 warn(prepare `_validate_kt_args` 承担)。与 window≥1 互斥(inert + warn-once);INT4/FP8/BF16 层不接。
+- **`--kt-prefill-event-fence 0|1`(默认 1)**——**事件栅栏环块传输总闸**。CPU 专家按 chunk 尺寸成块经双环搬运,每层付 2×⌈E/chunk⌉ 次设备共识,替代 legacy 的 2×E;控制面收紧是恢复线速的一号手段(§2.2/§6-14)。intent MIN 每 rank 恒跑(含 0)防 collective 挂死;显式 0 ⇒ 分配尺寸与协议逐位冻结(R20),三个子参数被忽略恰一行 warn(prepare `_validate_kt_args` 承担)。与 window≥1 兜底复合(§6-24:双几何皆冻结、协商零互斥零 warn,环 standby;窗降级 ⇒ ring 接管);INT4/FP8/BF16 层不接。
 - **`--kt-prefill-stage-chunk-experts={0,16,32,64}`(默认 64,非开关)**——**环块尺寸**。0 折叠 fence intent 为 off(结构同一性,F8);容量探测失败走 64→32→16→1 降级阶梯,全 rank MIN 统一(F5),地板 = legacy 双槽大小(chunk=1 ≡ legacy 节拍,48h 退火基线;choices 不含 1,由阶梯达成)。非法值 argparse 启动期拦截。
 - **`--kt-prefill-no-device-sync 0|1`(默认 0)**——**护栏同步精减的二分总闸(预留)**。payload 是「去掉守卫式 host 阻塞同步」的 grep 白名单门:二期逐个评估裁撤哪根护栏、出竞态时二分定位哪根在救命。R10 红线已钉死两处热更新全设备同步**不可移除**,本闸与护栏语义正交,只覆盖白名单登记的其余点位。**本期白名单为空 ⇒ 恒按 0 处理、生产零消费点;传 1 仅启动期恰一行 inert warn**(`_validate_kt_args` 承担);fence 关时计入子参数 ignored warn。
 - **`--kt-prefill-fence-debug 0|1`(默认 0)**——**环块取证对拍器**。开时每个环块取首 4KB head digest,all_gather_object 跨 rank 对拍,mismatch 记 sticky(一次性弹出,F7);取值 init 期经 all-rank MAX 冻结入 `geometry.debug_rows`,rank 间永不一半开一半关。纯诊断钩,不改传输语义。
@@ -49,12 +49,12 @@
 ### 2.2 F:E_chunk 环块
 
 - msgspec `_Mxfp4RingGeometry{e_chunk, num_slots=2, ring_rows=2*e_chunk, num_experts, bank_expert_nbytes, total_nbytes, debug_rows}` `:2693`,冻结于 init。
-- 协商编舞 `_negotiate_event_fence` `:1468-1516`(在 `_create_cpu_buffers()` 前):`chunk_requested` → `intent = fence 参数 and chunk != 0` → intent 经 `_all_tp_ranks_succeeded` MIN(**参数关也走**,集合序列零分叉)→ frozen 真 ⇒ 提前 `_staging_window_mode_frozen()`(`:1416`,缓存 MISS 跑一次窗口 MIN)做 mutex 检查 → `_ring_bank_expert_nbytes(` `:1427`,16B 硬断言)→ `_ring_chunk_candidates` `:1450`(阶梯 64→32→16→1,探测失败落 1)→ chunk 经 `_tp_int_min_all_reduce` MIN(降档恰一行 warn)→ debug `_any_tp_rank_true` MAX → 冻结 geometry + `_event_fence_frozen`。
+- 协商编舞 `_negotiate_event_fence` `:1441-1481`(在 `_create_cpu_buffers()` 前):`chunk_requested` → `intent = fence 参数 and chunk != 0` → intent 经 `_all_tp_ranks_succeeded` MIN(**参数关也走**,集合序列零分叉)→ frozen 真 ⇒ `_ring_bank_expert_nbytes(` `:1399`,16B 硬断言)→ `_ring_chunk_candidates` `:1422`(阶梯 64→32→16→1,探测失败落 1)→ chunk 经 `_tp_int_min_all_reduce` MIN(降档恰一行 warn)→ debug `_any_tp_rank_true` MAX → 冻结 geometry + `_event_fence_frozen`。(**§6-24 注记**:mutex 检查段与提前 `_staging_window_mode_frozen()` 调用随解禁删除;协商自此不消费窗口 knob,窗口 MIN 恒单站点于 `_create_staging_windows`。)
 - `_create_cpu_buffers`:FENCE=1 分支升 `ring_rows = 2*e_chunk` 行(register/指针收集/unlink 段不变);FENCE=0 分支**逐字**;行数经模块级纯助手 `_ring_row_count(geometry)`(裁定 §6-7)。
 - 块内 op 严格序(镜像 window):begin-fence((epoch,generation) key 进程单调不回卷 + live-without-owner assert)→ 环块共识#1(sticky pop 并入;相位文本 `ring slot {s} reuse for layer {L} generation {g}`;过期 free-event sync 计 `h2d_stall_ms`)→ ownership assert R(A/B 哨兵结构性 inert + 一次性 skip note)→ TP0-only submit×块长 + 单 `sync_write_weight_scale_to_buffer()`(计入既有 `host_write_ms`)→ 共识#2(sticky pop 并入;`host writes for layer {L} block {i}`)→ debug_rows ⇒ 每块恰一条 4KB head digest → H2D 平拷(`destination[expert_id].copy_(cpu_buffer[src_row], non_blocking=True)`,`src_row = slot*e_chunk + position`;bytes_h2d 仅整块成功后入账)→ finally `was_used=True` 后 `event.record(transfer_stream)`(发布失败回退本地 `transfer_stream.synchronize()`)。
 - sticky `_pending_ring_error` 镜像 `pending_h2d_error` 模式:块首共识#1 pop 并入、写共识#2 pop 并入、`_load_slot` raw-fence pop 孪生;enqueue 失败入 sticky,下块 raise 出环;末块 last_error 由 raw-fence commit 收。`abort_round` 清 sticky/shadow 镜像;`_ring_generation` 进程级单调不回卷(`_advance_round` 漂移孪生 warn 随参数化废止,§6-21)。
 - **共识计数精确口径**:legacy = 2×E;FENCE=1 ⇒ 2×⌈E/E_chunk⌉;window(w1/w2)= 2/层。集合通信运行时**零新增**。
-- **init 集合计数增量**:intent MIN(+1)+ 窗口缓存 MISS 时窗口 MIN(+0/1)+ chunk MIN(+1)+ debug MAX(+1)= 相对 legacy init +1～+3 次(fence 参数关时恰 +1),实机入库复核(尾项④)。
+- **init 集合计数增量**:intent MIN(+1)+ chunk MIN(+1)+ debug MAX(+1)= 相对 legacy init +1～+3 次(fence 参数关时恰 +1);程序内窗口 MIN(mode≥1 时)恒由 `_create_staging_windows` 单站点跑一次,fence 协商不再触发(§6-24),init 集合总数零分叉。实机入库复核(尾项④)。
 
 ## 3. 逐笔施工清单
 
@@ -64,7 +64,7 @@
 
 ### 步骤 D(F wrapper 侧)
 
-`__init__` ring 七字段 None-init(`_ring_generation/_ring_free_events/_ring_was_used/_ring_owner/_ring_freed/_ring_last_chunk_key/_pending_ring_error` + `_ring_skip_note_logged`);msgspec `_Mxfp4RingGeometry`;`_mxfp4_prefill_expert_bytes` 除数推广 `shape[0]`(裁定 §6-8);参数直读助手(袋读 `:3050-3065` 区)+ 单枚 mutex latch(`:3068`;原七枚 latch 与 drift 三检查/三基线字段随参数化整体删除,§6-21);`_staging_window_mode_frozen` 提前协商;`_negotiate_event_fence` 编舞;`_create_cpu_buffers` FENCE=1 分支;环块方法族(begin-fence / `_ring_pre_write_phase` / `_ownership_record_ring` / `_submit_ring_writes` / `_ring_debug_row` / `_enqueue_ring_block` / `_load_ring_cpu_experts`);`_load_slot` dispatch `elif ring_geometry is not None:`(`:4649`,window 后 legacy 前);raw-fence pop 孪生;`abort_round` 孪生清洗。`_submit_host_write` 闭包 `numel() // 2` 不改(裁定 §6-9);账本零新 JSON 字段。
+`__init__` ring 七字段 None-init(`_ring_generation/_ring_free_events/_ring_was_used/_ring_owner/_ring_freed/_ring_last_chunk_key/_pending_ring_error` + `_ring_skip_note_logged`);msgspec `_Mxfp4RingGeometry`;`_mxfp4_prefill_expert_bytes` 除数推广 `shape[0]`(裁定 §6-8);参数直读助手(袋读 `:3050-3065` 区;原七枚 latch 与 drift 三检查/三基线字段随参数化整体删除,§6-21,mutex latch 后续随 §6-24 一并删除);`_negotiate_event_fence` 编舞;`_create_cpu_buffers` FENCE=1 分支;环块方法族(begin-fence / `_ring_pre_write_phase` / `_ownership_record_ring` / `_submit_ring_writes` / `_ring_debug_row` / `_enqueue_ring_block` / `_load_ring_cpu_experts`);`_load_slot` dispatch `elif ring_geometry is not None:`(`:4649`,window 后 legacy 前);raw-fence pop 孪生;`abort_round` 孪生清洗。`_submit_host_write` 闭包 `numel() // 2` 不改(裁定 §6-9);账本零新 JSON 字段。
 
 ## 4. 测试映射(F1–F8;CPU stub,无 GPU 无 dist;D1–D9 随 §6-23 消亡,编号留档)
 
@@ -80,7 +80,7 @@ unit-test-admission 三族归类。回归盘:`kt_batch_dma_window_test.py` N1–
 | F5 | 派生性质 | 阶梯:探测 None 落 1、逐档阈值、跳过高于 request 的档(非法值 argparse choices 启动期拦截,原 warn 段随删);peer MIN 降档恰一行 warn、MIN 恰一次 |
 | F6 | — | (随 env→CLI 迁移**删除**:no-device-sync 一期恒 False 语义与 inert warn 已上收 server_args `_validate_kt_args`,无 wrapper 侧对象可测;fence 关子参数 ignored warn 同属 prepare 校验面,§6-21;编号跳档) |
 | F7 | 关键路径簿记 | DEBUG MAX 冻结恰一次;单 rank 每块恰一条 digest;cross-rank mismatch 入 sticky 不就地 raise |
-| F8 | 派生性质 | chunk=0 折叠进 intent(frozen off,`--kt-prefill-stage-chunk-experts=0`);WINDOW mutex 冻结 off + 恰一行 warn(漂移段随参数化删除,§6-21) |
+| F8 | 派生性质 | chunk=0 折叠进 intent(frozen off,`--kt-prefill-stage-chunk-experts=0`);复合断言(§6-24):window≥1 激活下 fence 协商照常冻结全件 geometry、零 warn、窗口 MIN 缓存不预热(单站点钉死);N12 钉死窗降级 ⇒ ring 接管而非 legacy |
 
 ## 5. 静态验证记录(2026-09-16,全部已执行)
 

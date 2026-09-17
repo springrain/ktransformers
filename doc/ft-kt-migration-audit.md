@@ -89,7 +89,7 @@ critic 修正:host 写实为 **~340GiB/chunk**(rank0 经 do_numa_job 遍历全�
 | event-fence | `SGLANG_KT_PREFILL_EVENT_FENCE` + `SGLANG_KT_PREFILL_NO_DEVICE_SYNC`(独立二分)+ `SGLANG_KT_PREFILL_FENCE_DEBUG`(rank1 每块首 4KB D2H digest 对 rank0 broadcast);`FENCE=0 ⇒ 分配尺寸与协议逐位冻结` | 权重 sha256 逐位相等 + 5 批 4096tok logits parity + **热更新开启态**固定批(:3416 起选择器同输入可复现)+ overlap 双请求交错 + collective 计数断言 ==2×⌈E/E_chunk⌉ + NCCL 单 rank kill 失败注入;E_chunk=1×48h 退火→16/32/64 各 24h |
 | lru-hit-d2d | `SGLANG_KT_PREFILL_HIT_D2D`(主开关)+ POOL_SLOTS(生产只经 config 732/1464)+ ADMISSION(evicted\|miss)+ MIN_RATE(默认 0.02 滚动熔断)+ CONSENSUS(灰度期强制)+ DEBUG(hit-set 哈希对拍) | 热更新开启态逐层对拍;均匀路由回放强制触发熔断(两秩同轮停用);容量触顶逐出确定性;单 rank 人为 OOM → 全 rank 一致回落用例 |
 
-> **历史注记(2026-09-17)**:event-fence 行三枚 env(`SGLANG_KT_PREFILL_EVENT_FENCE/NO_DEVICE_SYNC/FENCE_DEBUG`)连同第二批其余五枚,已随 [ft-kt-phase2-plan-bank-dma-event-fence.md](ft-kt-phase2-plan-bank-dma-event-fence.md) §6-21 参数化裁定改为 `--kt-*` CLI 参数(两主开关默认 1,显式置 0 opt-out);本表保留原 env 设计仅作审计史,现行形态以该文档 §1 参数总表为准。**追记(2026-09-17 §6-23)**:参数化后 8 枚中 bank 系 4 枚(`--kt-direct-bank-dma/--kt-dump-slot-bytes/--kt-bank-dma-batch/--kt-bank-dma-lean`)已随 bank 特性整体移除删除;现行 4 枚全 fence 系,此后「两主开关默认开」仅指 `--kt-prefill-event-fence` 一枚。
+> **历史注记(2026-09-17)**:event-fence 行三枚 env(`SGLANG_KT_PREFILL_EVENT_FENCE/NO_DEVICE_SYNC/FENCE_DEBUG`)连同第二批其余五枚,已随 [ft-kt-phase2-plan-dma-event-fence.md](ft-kt-phase2-plan-dma-event-fence.md) §6-21 参数化裁定改为 `--kt-*` CLI 参数(两主开关默认 1,显式置 0 opt-out);本表保留原 env 设计仅作审计史,现行形态以该文档 §1 参数总表为准。**追记(2026-09-17 §6-23)**:参数化后 8 枚中 bank 系 4 枚(`--kt-direct-bank-dma/--kt-dump-slot-bytes/--kt-bank-dma-batch/--kt-bank-dma-lean`)已随 bank 特性整体移除删除;现行 4 枚全 fence 系,此后「两主开关默认开」仅指 `--kt-prefill-event-fence` 一枚。
 
 **batch-dma 灰度阶梯**(验证者重排):
 - w0 = 仅批次化 H2D 入列(每专家 4→batch 条目)+ 常驻流/事件池;零新共识、零 DRAM;

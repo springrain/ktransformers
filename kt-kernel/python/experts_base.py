@@ -111,6 +111,21 @@ def _ensure_ascend_callback_worker() -> None:
         atexit.register(kt_kernel_ext.shutdown_ascend_callback_worker)
 
 
+def _cpuinfer_watchdog_raise(cpu_infer) -> None:
+    """Raise a latched Python error once the C++ CPU-pool watchdog tripped.
+
+    Probed at the top of every sync path; the poison is latched, so a tripped
+    pool keeps failing loudly instead of hanging every later sync. Extensions
+    built before the watchdog (no ``watchdog_tripped`` probe) pass silently.
+    """
+    tripped = getattr(cpu_infer, "watchdog_tripped", None)
+    if tripped is None:
+        return
+    if tripped():
+        text = getattr(cpu_infer, "watchdog_text", None)
+        raise RuntimeError(text() if text is not None else "[kt watchdog] cpu pool watchdog tripped")
+
+
 def _sglang_is_capture_mode() -> bool:
     """True when sglang is inside ``model_capture_mode()`` (graph capture).
 
@@ -395,6 +410,8 @@ class _MoEBase:
         cpuinfer_threads: int,
         threadpool_count: int,
         numa_nodes=None,
+        reserve_cores: Optional[int] = None,
+        watchdog_timeout_ms: int = 0,
     ):
         """
         Get or create the CPUInfer singleton instance.
@@ -403,6 +420,11 @@ class _MoEBase:
             cpuinfer_threads: Total number of CPU inference threads
             threadpool_count: Number of NUMA subpools (TP count)
             numa_nodes: Explicit list of NUMA node IDs. If None, defaults to sequential.
+            reserve_cores: Cores reserved per NUMA node ahead of the pinned
+                pool range. None/0 keeps the legacy topology; the WorkerPoolConfig
+                field is only written when set, so extensions predating it work.
+            watchdog_timeout_ms: No-progress budget for the CPUInfer watchdog
+                thread; 0 keeps it off (the legacy 1-arg ctor path).
 
         Returns:
             CPUInfer singleton instance
@@ -431,7 +453,19 @@ class _MoEBase:
             worker_config.subpool_count = threadpool_count
             worker_config.subpool_numa_map = subpool_numa_map
             worker_config.subpool_thread_count = subpool_thread_count
-            cls._cpu_infer_instance = kt_kernel_ext.CPUInfer(worker_config)
+            if reserve_cores:
+                if reserve_cores < 0:
+                    raise ValueError(f"reserve_cores must be non-negative, got {reserve_cores}")
+                worker_config.reserve_cores_per_numa = int(reserve_cores)
+            if watchdog_timeout_ms:
+                cls._cpu_infer_instance = kt_kernel_ext.CPUInfer(worker_config, int(watchdog_timeout_ms))
+            else:
+                cls._cpu_infer_instance = kt_kernel_ext.CPUInfer(worker_config)
+            if reserve_cores:
+                # Keep torch intra-op threads inside a subpool's core budget so
+                # ad-hoc torch kernels cannot spill onto the reserved head
+                # block. Gated on reserve to keep the default path bit-exact.
+                torch.set_num_threads(min(torch.get_num_threads(), min(subpool_thread_count)))
 
         return cls._cpu_infer_instance
 
@@ -487,6 +521,8 @@ class BaseMoEWrapper(_MoEBase, ABC):
         method: str = "AMXINT4",
         numa_nodes: Optional[List[int]] = None,
         swiglu_limit: float = 0.0,
+        reserve_cores: Optional[int] = None,
+        watchdog_timeout_ms: int = 0,
     ):
         """
         Initialize base MoE Wrapper.
@@ -510,6 +546,10 @@ class BaseMoEWrapper(_MoEBase, ABC):
             method: Backend method string
             numa_nodes: Explicit list of NUMA node IDs for subpool mapping.
                         If None, defaults to [0, 1, ..., threadpool_count-1].
+            reserve_cores: Cores reserved per NUMA node ahead of the pinned
+                           CPUInfer pool range (None/0 = legacy topology).
+            watchdog_timeout_ms: CPUInfer no-progress watchdog budget in
+                                 milliseconds; 0 keeps the watchdog off.
         """
         self.layer_idx = layer_idx
         self.num_experts = num_experts
@@ -548,7 +588,13 @@ class BaseMoEWrapper(_MoEBase, ABC):
         self.swiglu_limit = float(swiglu_limit)
 
         # Initialize CPU inference engine (singleton via shared base class)
-        self.cpu_infer = self._get_cpu_infer(cpuinfer_threads, threadpool_count, numa_nodes=numa_nodes)
+        self.cpu_infer = self._get_cpu_infer(
+            cpuinfer_threads,
+            threadpool_count,
+            numa_nodes=numa_nodes,
+            reserve_cores=reserve_cores,
+            watchdog_timeout_ms=watchdog_timeout_ms,
+        )
 
         # Backend-specific initialization happens in subclasses
         self.moe = None
@@ -961,6 +1007,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
 
         current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
         allow_pending = 1 if BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx, False) else 0
+        _cpuinfer_watchdog_raise(self.cpu_infer)
         bypass = _should_bypass_stream_callback(hidden_states.device)
         if bypass:
             self.cpu_infer.sync(allow_pending)

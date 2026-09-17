@@ -14,6 +14,7 @@
 
 #include <chrono>
 #include <iostream>
+#include <stdexcept>
 #include <thread>
 
 TaskQueue::TaskQueue() : done(false), pending(0) {
@@ -39,10 +40,10 @@ TaskQueue::~TaskQueue() {
   }
 }
 
-void TaskQueue::enqueue(std::function<void()> task) {
+void TaskQueue::enqueue(std::function<void()> task, int64_t task_tag) {
   // Allocate first: a throw after fetch_add would credit pending with no node
   // ever linked, and every later sync() would hang forever.
-  Node* node = new Node(task);
+  Node* node = new Node(task, task_tag);
   pending.fetch_add(1, std::memory_order_acq_rel);
   Node* prev = tail.exchange(node, std::memory_order_acq_rel);
   prev->next.store(node, std::memory_order_release);
@@ -58,12 +59,48 @@ void TaskQueue::sync(size_t allow_n_pending) {
     std::unique_lock<std::mutex> lock(mtx);
     cv.wait(lock, [&] {
       return pending.load(std::memory_order_acquire) <= allow_n_pending
-          || done.load(std::memory_order_acquire);
+          || done.load(std::memory_order_acquire)
+          || poisoned_flag.load(std::memory_order_acquire);
     });
-    task_exception = first_exception;
-    first_exception = nullptr;
+    // Poison wins over first_exception and stays latched: every later sync()
+    // rethrows the same poison instead of draining it once.
+    if (poisoned_flag.load(std::memory_order_acquire) && poison_exception) {
+      task_exception = poison_exception;
+    } else {
+      task_exception = first_exception;
+      first_exception = nullptr;
+    }
   }
   if (task_exception) std::rethrow_exception(task_exception);
+}
+
+void TaskQueue::poison(const std::string& what) {
+  {
+    std::lock_guard<std::mutex> lock(mtx);
+    bool expected = false;
+    if (!poisoned_flag.compare_exchange_strong(expected, true,
+                                               std::memory_order_acq_rel)) {
+      return;  // set-once: the first poison wins
+    }
+    poison_what = what;
+    poison_exception = std::make_exception_ptr(std::runtime_error(what));
+  }
+  cv.notify_all();
+}
+
+bool TaskQueue::poisoned() const { return poisoned_flag.load(std::memory_order_acquire); }
+
+std::string TaskQueue::poison_text() {
+  std::lock_guard<std::mutex> lock(mtx);
+  return poison_what;
+}
+
+int64_t TaskQueue::current_task_start_ns() const {
+  return task_start_ns.load(std::memory_order_acquire);
+}
+
+int64_t TaskQueue::current_task_tag() const {
+  return pending_task_tag.load(std::memory_order_relaxed);
 }
 
 void TaskQueue::worker() {
@@ -72,6 +109,12 @@ void TaskQueue::worker() {
     Node* next = curr->next.load(std::memory_order_acquire);
     if (next) {
       std::exception_ptr task_exception;
+      // Heartbeat before the task body runs: an external monitor treats an
+      // overdue nonzero start as "no progress" and may poison the queue.
+      pending_task_tag.store(next->task_tag, std::memory_order_relaxed);
+      task_start_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch()).count(),
+                          std::memory_order_release);
       if (next->task) {
         try {
           next->task();
@@ -79,6 +122,8 @@ void TaskQueue::worker() {
           task_exception = std::current_exception();
         }
       }
+      task_start_ns.store(0, std::memory_order_release);
+      pending_task_tag.store(0, std::memory_order_relaxed);
       delete curr;
       curr = next;
       head.store(curr, std::memory_order_release);
