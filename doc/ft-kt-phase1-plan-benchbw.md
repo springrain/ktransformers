@@ -35,7 +35,7 @@
 脚本启动查双卡 `memory.used`(nvidia-smi / `torch.cuda.mem_get_info`)与进程表,显存占用超阈值或检出 sglang 进程即**拒绝运行**,除非 `SGLANG_KT_BENCHBW_FORCE=1`(与 config-first 相称;生产同机误跑会抢 DRAM/PCIe + cudaHostRegister page-lock 压力扰动 graph 捕获期)。
 
 ### 判定树(终版)
-- **(a)** dual_sum/solo ≈1(≤1.15)→ 上游共享。查 P1 写腿:跨 NUMA 供给 ≈11/卡 → 归属 host 供给(二期优先 NUMA 感知 bank 放置);写腿供给 ≫ → 归属 PCIe 链路/RC 共享(带宽类收益上限锁死,控制面/CPU 侧特性上调)。
+- **(a)** dual_sum/solo ≈1(≤1.15)→ 上游共享。查 P1 写腿:跨 NUMA 供给 ≈11/卡 → 归属 host 供给(二期 host 供给优化:跨 NUMA 供给/放置治理,属梯队 4 装载与运维侧评估);写腿供给 ≫ → 归属 PCIe 链路/RC 共享(带宽类收益上限锁死,控制面/CPU 侧特性上调)。
 - **(b)** dual_sum/solo ≥1.7 → 硬件可达双线速 → 生产缺口归协议控制面(`:2253/:2273` 每专家 2 次设备共识、`:1324` barrier、`:2042-2050` all_reduce+.item()),二期把 E_chunk 批拷贝/fence 流水/共识合并排最高;contended 差值写入支撑字段。
 - **(c)** solo 出校准带 → rig-invalid,先修 rig(分配路径/IOMMU/NUMA 误标),不出判读。
 - **(d)** P3 膝点 x:x≫22 CPU 不吃亏;x≈22 两侧同顶,热更新窗口形状特性优先。
