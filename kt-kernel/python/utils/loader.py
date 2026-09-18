@@ -1198,27 +1198,33 @@ class GPTQSafeTensorLoader(FP8SafeTensorLoader):
 
 
 class MXFP4SafeTensorLoader(SafeTensorLoader):
-    """Loader for native MXFP4 expert weights (DeepSeek-V4-Flash format).
+    """Loader for native MXFP4 expert weights.
 
-    Per expert layout:
-      {base}.ffn.experts.{i}.w1.weight  I8       [N, K/2]   nibble-packed E2M1 (gate)
-      {base}.ffn.experts.{i}.w1.scale   F8_E8M0  [N, K/32]  ue8m0 group scale
-      {base}.ffn.experts.{i}.w3.{weight,scale}              up
-      {base}.ffn.experts.{i}.w2.{weight,scale}              down
+    Supported per-expert layouts (PROJ_NAMES order is gate, up, down):
+      DeepSeek-V4-Flash:
+        {base}.ffn.experts.{i}.{proj}.weight        I8       [N, K/2]   nibble-packed E2M1
+        {base}.ffn.experts.{i}.{proj}.scale         F8_E8M0  [N, K/32]  ue8m0 group scale
+      Kimi-K3 (compressed-tensors mxfp4):
+        {base}.mlp.experts.{i}.{proj}.weight_packed I8       [N, K/2]   nibble-packed E2M1
+        {base}.mlp.experts.{i}.{proj}.weight_scale  F8_E8M0  [N, 1, K/32, 1] ue8m0 group scale
 
     V4 ckpt keys are not prefixed with ``model.``; we also probe the stripped form so
-    callers can keep passing ``base_key="model.layers.{L}"``. ue8m0 → bf16 is a lossless
+    callers can keep passing ``base_key="model.layers.{L}"``. Weight and scale key
+    suffixes are auto-detected per ckpt (``weight``/``weight_packed``,
+    ``scale``/``weight_scale``). ue8m0 -> bf16 is a lossless
     bit shift (both have an 8-bit exponent and zero mantissa for ue8m0), and the AMX
     FP4 backend already consumes bf16 scales.
     """
 
-    EXPERTS_PATH_TPL = "{base}.ffn.experts"
+    EXPERTS_PATH_TPLS = ("{base}.ffn.experts", "{base}.mlp.experts")
     PROJ_NAMES = ("w1", "w3", "w2")  # (gate, up, down)
 
     def _experts_prefix_candidates(self, base_key: str) -> list[str]:
-        candidates = [self.EXPERTS_PATH_TPL.format(base=base_key)]
-        if base_key.startswith("model."):
-            candidates.append(self.EXPERTS_PATH_TPL.format(base=base_key[len("model.") :]))
+        candidates = []
+        for tpl in self.EXPERTS_PATH_TPLS:
+            candidates.append(tpl.format(base=base_key))
+            if base_key.startswith("model."):
+                candidates.append(tpl.format(base=base_key[len("model.") :]))
         return list(dict.fromkeys(candidates))
 
     @staticmethod
@@ -1235,18 +1241,28 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
     def load_experts(self, base_key: str, device: str = "cpu"):
         gate_name, up_name, down_name = self.PROJ_NAMES
         prefix = None
+        weight_suffix = None
         expert_count = 0
         for cand in self._experts_prefix_candidates(base_key):
-            expert_count = 0
-            while self.has_tensor(f"{cand}.{expert_count}.{gate_name}.weight"):
-                expert_count += 1
-            if expert_count > 0:
-                prefix = cand
+            # Count experts by whichever weight suffix the ckpt uses: V4-Flash
+            # `.weight`, Kimi-K3 compressed-tensors `weight_packed`.
+            for wsfx in ("weight", "weight_packed"):
+                expert_count = 0
+                while self.has_tensor(f"{cand}.{expert_count}.{gate_name}.{wsfx}"):
+                    expert_count += 1
+                if expert_count > 0:
+                    prefix, weight_suffix = cand, wsfx
+                    break
+            if prefix is not None:
                 break
         if prefix is None:
             raise ValueError(
                 f"No MXFP4 experts found under any of: {self._experts_prefix_candidates(base_key)}"
             )
+
+        # Scale suffix follows the format: V4-Flash uses `.scale`, Kimi-K3 `.weight_scale`.
+        gate0 = f"{prefix}.0.{gate_name}"
+        scale_suffix = "weight_scale" if self.has_tensor(f"{gate0}.weight_scale") else "scale"
 
         gate_weights = [None] * expert_count
         up_weights = [None] * expert_count
@@ -1261,7 +1277,8 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
                 (up_name, up_weights),
                 (down_name, down_weights),
             ):
-                w = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight", device).contiguous()
+                # Weight key suffix was auto-detected from the ckpt above (V4 `.weight` / K3 `weight_packed`).
+                w = self.load_tensor(f"{prefix}.{exp_id}.{proj}.{weight_suffix}", device).contiguous()
                 if w.dtype != torch.uint8:
                     w = w.view(torch.uint8)
                 dst[exp_id] = w
@@ -1271,10 +1288,15 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
                 (up_name, up_scales),
                 (down_name, down_scales),
             ):
-                s = self.load_tensor(f"{prefix}.{exp_id}.{proj}.scale", device)
+                s = self.load_tensor(f"{prefix}.{exp_id}.{proj}.{scale_suffix}", device)
+                # K3 stores per-expert scales as [N, 1, G, 1]; squeeze to [N, G] before the
+                # ue8m0 -> bf16 bit shift, mirroring kimi_k3.py (V4 loads [N, G] untouched).
+                if s.ndim == 4:
+                    s = s[:, 0, :, 0]
                 dst[exp_id] = self._ue8m0_to_bf16(s)
 
-        print(f"[MXFP4SafeTensorLoader] Loaded {expert_count} experts from {prefix}")
+        print(f"[MXFP4SafeTensorLoader] Loaded {expert_count} experts from {prefix} "
+              f"(weight=.{weight_suffix}, scale=.{scale_suffix})")
         return {
             "gate": gate_weights,
             "up": up_weights,

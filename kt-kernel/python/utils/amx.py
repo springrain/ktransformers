@@ -1009,14 +1009,21 @@ class NativeMoEWrapper(BaseMoEWrapper):
             f"model.language_model.layers.{self.layer_idx}",
         ]
         weights = None
+        _fail_reasons = []
         for base_key in _candidates:
             try:
                 weights = self.loader.load_experts(base_key)
                 break
-            except (ValueError, KeyError):
+            except (ValueError, KeyError) as e:
+                # Keep per-prefix failure detail: a swallowed KeyError from a missing
+                # scale/weight key otherwise surfaces as the same generic message.
+                _fail_reasons.append(f"{base_key}: {e}")
                 continue
         if weights is None:
-            raise ValueError(f"No experts found for layer {self.layer_idx} under any prefix: {_candidates}")
+            raise ValueError(
+                f"No experts found for layer {self.layer_idx} under any prefix: {_candidates}. "
+                f"Reasons: {'; '.join(_fail_reasons)}"
+            )
         t1 = time.time()
 
         # Keep individual tensors instead of stacking - avoid expensive memory copy

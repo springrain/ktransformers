@@ -34,6 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     numactl \
     git \
+    ffmpeg \
     ca-certificates \
     software-properties-common \
     python3.12 \
