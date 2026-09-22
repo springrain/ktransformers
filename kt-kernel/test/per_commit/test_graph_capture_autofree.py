@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import sys
 import types
@@ -16,6 +17,7 @@ from ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="default")
 
 EXPERTS_BASE_PATH = Path(__file__).resolve().parents[2] / "python" / "experts_base.py"
+AMX_UTILS_PATH = Path(__file__).resolve().parents[2] / "python" / "utils" / "amx.py"
 
 
 @pytest.fixture
@@ -217,3 +219,94 @@ def test_wait_device_rejects_unknown_capture_state(
 
     with pytest.raises(RuntimeError, match="capture state is unavailable"):
         experts_base._wait_device(_device(device_type))
+
+
+@pytest.mark.parametrize("fail_during_load", [False, True])
+def test_temporary_all_cpu_experts_mask_restores_in_place(
+    experts_base,
+    fail_during_load,
+):
+    mask = torch.tensor([True, False, True, True], dtype=torch.bool)
+    original = mask.clone()
+    original_ptr = mask.data_ptr()
+    observations = []
+
+    def run_load():
+        with experts_base._temporary_all_cpu_experts_mask(mask, enabled=True):
+            # Both asynchronous submit and its matching sync must observe the
+            # all-CPU mask through the same pinned-memory address.
+            observations.append(("submit", mask.data_ptr(), mask.clone()))
+            observations.append(("sync", mask.data_ptr(), mask.clone()))
+            if fail_during_load:
+                raise RuntimeError("load failed")
+
+    if fail_during_load:
+        with pytest.raises(RuntimeError, match="load failed"):
+            run_load()
+    else:
+        run_load()
+
+    assert [phase for phase, _, _ in observations] == ["submit", "sync"]
+    assert all(ptr == original_ptr for _, ptr, _ in observations)
+    assert all(not observed_mask.any() for _, _, observed_mask in observations)
+    assert mask.data_ptr() == original_ptr
+    assert torch.equal(mask, original)
+
+
+def test_temporary_all_cpu_experts_mask_is_noop_when_disabled(experts_base):
+    mask = torch.tensor([True, False, True], dtype=torch.bool)
+    original = mask.clone()
+    original_ptr = mask.data_ptr()
+
+    with experts_base._temporary_all_cpu_experts_mask(mask, enabled=False):
+        assert mask.data_ptr() == original_ptr
+        assert torch.equal(mask, original)
+
+    assert mask.data_ptr() == original_ptr
+    assert torch.equal(mask, original)
+
+
+def test_native_loader_masks_only_after_constructing_moe():
+    tree = ast.parse(AMX_UTILS_PATH.read_text(encoding="utf-8"))
+    native_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "NativeMoEWrapper"
+    )
+    load_weights = next(
+        node
+        for node in native_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "load_weights"
+    )
+
+    moe_assignment_lines = []
+    mask_context = None
+    for node in ast.walk(load_weights):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "self"
+            and target.attr == "moe"
+            for target in node.targets
+        ):
+            moe_assignment_lines.append(node.lineno)
+        if isinstance(node, ast.With) and any(
+            isinstance(item.context_expr, ast.Call)
+            and isinstance(item.context_expr.func, ast.Name)
+            and item.context_expr.func.id == "_temporary_all_cpu_experts_mask"
+            for item in node.items
+        ):
+            mask_context = node
+
+    assert moe_assignment_lines
+    assert mask_context is not None
+    assert max(moe_assignment_lines) < mask_context.lineno
+
+    called_methods = {
+        node.func.attr
+        for node in ast.walk(mask_context)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"submit", "sync"}
+    }
+    assert called_methods == {"submit", "sync"}

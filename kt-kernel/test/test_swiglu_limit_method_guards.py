@@ -32,6 +32,22 @@ class _Recorder:
         self.kwargs = kwargs
 
 
+class _AMXRecorder(_Recorder):
+    pass
+
+
+class _NativeRecorder(_Recorder):
+    pass
+
+
+class _LlamafileRecorder(_Recorder):
+    pass
+
+
+class _GeneralRecorder(_Recorder):
+    pass
+
+
 def _compile_factory():
     tree = ast.parse(EXPERTS_PATH.read_text(encoding="utf-8"))
     function = next(
@@ -54,10 +70,10 @@ def _compile_factory():
         )
     )
     namespace = {
-        "AMXMoEWrapper": _Recorder,
-        "NativeMoEWrapper": _Recorder,
-        "LlamafileMoEWrapper": _Recorder,
-        "GeneralMoEWrapper": _Recorder,
+        "AMXMoEWrapper": _AMXRecorder,
+        "NativeMoEWrapper": _NativeRecorder,
+        "LlamafileMoEWrapper": _LlamafileRecorder,
+        "GeneralMoEWrapper": _GeneralRecorder,
     }
     exec(compile(module, str(EXPERTS_PATH), "exec"), namespace)
     return namespace["_create_inference_wrapper"]
@@ -145,6 +161,18 @@ class TestSwigluLimitMethodGuards(unittest.TestCase):
             with self.subTest(method=method):
                 with self.assertRaisesRegex(ValueError, "only supported"):
                     factory(**_factory_kwargs(method, 10.0))
+
+    def test_factory_forwards_dynamic_load_flag_only_to_native_backend(self):
+        factory = _compile_factory()
+        native_kwargs = _factory_kwargs("RAWINT4", 0.0)
+        native_kwargs["pack_all_experts_on_load"] = True
+        native_wrapper = factory(**native_kwargs)
+        self.assertIs(native_wrapper.kwargs["pack_all_experts_on_load"], True)
+
+        amx_kwargs = _factory_kwargs("AMXINT4", 0.0)
+        amx_kwargs["pack_all_experts_on_load"] = True
+        amx_wrapper = factory(**amx_kwargs)
+        self.assertNotIn("pack_all_experts_on_load", amx_wrapper.kwargs)
 
     def test_both_native_wrapper_guards_have_the_same_exact_allow_list(self):
         init_guard = _native_guard("__init__")

@@ -13,6 +13,7 @@ import torch
 from typing import Dict, List, Optional, Tuple
 from abc import ABC, abstractmethod
 from collections import OrderedDict
+from contextlib import contextmanager
 import ctypes
 import logging
 import os
@@ -195,6 +196,29 @@ def _forward_task_autofree(sync_submit: bool, device: torch.device) -> bool:
     into the graph and re-invoked by every replay, so it must stay alive.
     """
     return sync_submit or not _graph_capture_active(device)
+
+
+@contextmanager
+def _temporary_all_cpu_experts_mask(
+    gpu_experts_mask: torch.Tensor,
+    enabled: bool,
+):
+    """Temporarily make every expert loadable by CPU backends.
+
+    C++ retains ``gpu_experts_mask.data_ptr()``, so the tensor must be modified
+    and restored in place. The caller must keep this context active until the
+    asynchronous load task has been synchronized.
+    """
+    if not enabled:
+        yield
+        return
+
+    saved_mask = gpu_experts_mask.clone()
+    try:
+        gpu_experts_mask.zero_()
+        yield
+    finally:
+        gpu_experts_mask.copy_(saved_mask)
 
 
 def generate_gpu_experts_masks(

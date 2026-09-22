@@ -160,6 +160,8 @@ class KTMoEWrapper:
         # MiniMax M3 swigluoai sigmoid alpha. 0.0 = standard silu (default).
         # Non-zero triggers gate * sigmoid(gate * alpha) * (up + 1) in act_fn.
         swiglu_alpha: float = 0.0,
+        # Dynamic placement requires CPU-packed copies of initially resident experts.
+        pack_all_experts_on_load: bool = False,
     ):
         """
         Factory method to create the appropriate backend implementation.
@@ -181,6 +183,8 @@ class KTMoEWrapper:
             chunked_prefill_size: Maximum prefill chunk size
             cpu_save: Whether to save weights to CPU memory (inference only)
             max_deferred_experts_per_token: Experts per token to defer (inference only)
+            pack_all_experts_on_load: Pack GPU-resident experts into the CPU
+                                      backend too, for later dynamic eviction.
             numa_nodes: Explicit list of NUMA node IDs for subpool mapping. If None, defaults to sequential.
             method: Backend method (see INFERENCE_METHODS and SFT_METHODS)
             mode: Operation mode ("inference" or "sft")
@@ -228,6 +232,7 @@ class KTMoEWrapper:
                 chunked_prefill_size=chunked_prefill_size,
                 cpu_save=cpu_save,
                 max_deferred_experts_per_token=max_deferred_experts_per_token,
+                pack_all_experts_on_load=pack_all_experts_on_load,
                 method=method,
                 numa_nodes=numa_nodes,
                 swiglu_limit=swiglu_limit,
@@ -329,6 +334,7 @@ def _create_inference_wrapper(
     cpu_save: bool,
     max_deferred_experts_per_token: Optional[int],
     method: str,
+    pack_all_experts_on_load: bool = False,
     numa_nodes: Optional[List[int]] = None,
     swiglu_limit: float = 0.0,
     swiglu_alpha: float = 0.0,
@@ -376,6 +382,8 @@ def _create_inference_wrapper(
     # validates the GGUF tensor types while loading and applies the clamp in its
     # scalar/NEON-independent activation step.
     extra_kwargs = {}
+    if backend_cls is NativeMoEWrapper:
+        extra_kwargs["pack_all_experts_on_load"] = pack_all_experts_on_load
     if method in ("FP8", "MXFP4", "MXFP8", "LLAMAFILE"):
         extra_kwargs["swiglu_limit"] = swiglu_limit
         extra_kwargs["swiglu_alpha"] = swiglu_alpha

@@ -9,7 +9,7 @@ from typing import List, Optional
 logger = logging.getLogger(__name__)
 
 # Use relative imports for package structure
-from ..experts_base import BaseMoEWrapper
+from ..experts_base import BaseMoEWrapper, _temporary_all_cpu_experts_mask
 from .loader import (
     SafeTensorLoader,
     CompressedSafeTensorLoader,
@@ -802,8 +802,10 @@ class NativeMoEWrapper(BaseMoEWrapper):
         numa_nodes: Optional[List[int]] = None,
         swiglu_limit: float = 0.0,
         swiglu_alpha: float = 0.0,
+        pack_all_experts_on_load: bool = False,
     ):
         self._swiglu_alpha = float(swiglu_alpha)
+        self.pack_all_experts_on_load = bool(pack_all_experts_on_load)
         # Defence in depth: reject swiglu_limit on methods whose native MoE
         # activation contract has not been validated.  The block-FP8 backend
         # shares the same MOEConfig/act_fn path as MXFP4/MXFP8 and is required
@@ -1327,8 +1329,13 @@ class NativeMoEWrapper(BaseMoEWrapper):
 
         # Pass the wrapper-owned mapping to the asynchronous native loader;
         # the C++ MoE retains this pointer for later layerwise staging calls.
-        self.cpu_infer.submit(self.moe.load_weights_task(self.physical_to_logical_map_cpu.data_ptr()))
-        self.cpu_infer.sync()
+        load_task = self.moe.load_weights_task(self.physical_to_logical_map_cpu.data_ptr())
+        with _temporary_all_cpu_experts_mask(
+            self.gpu_experts_mask,
+            self.pack_all_experts_on_load and self.num_gpu_experts > 0,
+        ):
+            self.cpu_infer.submit(load_task)
+            self.cpu_infer.sync()
         t5 = time.time()
 
         del self.gate_weights
