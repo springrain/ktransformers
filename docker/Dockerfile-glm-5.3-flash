@@ -11,8 +11,8 @@
 ### numactl --interleave=all ##轮询分配, 均匀使用所有节点的内存
 
 
-# 使用 NVIDIA CUDA 13.0.3 + cuDNN 开发镜像作为基础
-FROM nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04
+# 使用 NVIDIA CUDA 13.4.1 + cuDNN 开发镜像作为基础
+FROM nvidia/cuda:13.4.1-cudnn-devel-ubuntu24.04
 
 # 解决 apt 安装时的交互式弹窗 (如时区选择) 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -36,6 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     numactl \
     git \
+    ffmpeg \
     ca-certificates \
     software-properties-common \
     python3.12 \
@@ -82,13 +83,14 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 COPY ./ /workspace/ktransformers
 
-
-# 如果 install.sh 在里面, 给执行权限并运行
-RUN chmod +x /workspace/ktransformers/install.sh && \
-    bash /workspace/ktransformers/install.sh
-
+## 如果 install.sh 在里面, 给执行权限并运行
+## https://github.com/NVIDIA/nccl/issues/2353   多卡卡死!!!
 ## 升级 tilelang 兼容 PRO6000 SM120
-RUN pip install tilelang==0.1.14
+RUN --mount=type=cache,target=/root/.cache/pip \
+chmod +x /workspace/ktransformers/install.sh \
+&& bash /workspace/ktransformers/install.sh \
+&& pip install nvidia-nccl-cu13==2.31.2 \ 
+&& pip install tilelang==0.1.14 
 
 # 默认进入 bash
 CMD ["/bin/bash"]

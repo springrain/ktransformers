@@ -90,7 +90,7 @@ init_submodules() {
   fi
 
   cd "$REPO_ROOT"
-  git submodule update --init --recursive
+  #git submodule update --init --recursive
   log_info "Submodules initialized successfully."
 }
 
