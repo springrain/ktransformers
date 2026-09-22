@@ -1,4 +1,4 @@
-### docker build -t fedimoss/kt-sglang:v0.5.19 -f docker/Dockerfile-fedimoss .
+### docker build -t fedimoss/kt-sglang:v0.5.20 -f docker/Dockerfile-fedimoss .
 
 ### 多线程加载模型
 ### --model-loader-extra-config '{"enable_multithread_load":true,"num_threads":2}'
