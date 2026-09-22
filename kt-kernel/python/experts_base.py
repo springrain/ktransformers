@@ -189,11 +189,11 @@ def _graph_capture_active(device: torch.device) -> bool:
 
 
 def _forward_task_autofree(sync_submit: bool, device: torch.device) -> bool:
-    """True iff the forward-task Args may self-free in inner() after enqueuing.
+    """Return the legacy single-use hint carried by forward-task bindings.
 
-    ``submit`` runs inner() inline, so the Args is dead at submit() return.
-    A ``submit_with_cuda_stream`` Args created during graph capture is baked
-    into the graph and re-invoked by every replay, so it must stay alive.
+    CPUInfer now owns actual task destruction. The hint remains in the binding
+    ABI, while stream submissions separately pass the authoritative capture
+    state to CPUInfer.
     """
     return sync_submit or not _graph_capture_active(device)
 
@@ -732,7 +732,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
             input_tensor_cpu[current_slot].data_ptr(),
             output_cpu[current_slot].data_ptr(),
             incremental,
-            True,  # submit() runs inner() inline, so the Args may self-free
+            True,  # Direct submit is a single-use task.
         )
         if bypass:
             self.cpu_infer.submit(immediate_task)
@@ -772,7 +772,11 @@ class BaseMoEWrapper(_MoEBase, ABC):
             if bypass:
                 self.cpu_infer.submit(deferred_task)
             else:
-                self.cpu_infer.submit_with_cuda_stream(cuda_stream, deferred_task)
+                self.cpu_infer.submit_with_cuda_stream(
+                    cuda_stream,
+                    deferred_task,
+                    _graph_capture_active(hidden_states.device),
+                )
             BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
 
     def run_pinned_forward_sync(
@@ -811,7 +815,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
             input_tensor_cpu[current_slot].data_ptr(),
             output_cpu[current_slot].data_ptr(),
             incremental,
-            True,  # submit() runs inner() inline, so the Args may self-free
+            True,  # Direct submit is a single-use task.
         )
         self.cpu_infer.submit(immediate_task)
         BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
@@ -827,7 +831,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
                 input_tensor_cpu[current_slot].data_ptr(),
                 output_cpu[next_slot].data_ptr(),
                 False,
-                True,  # submit() runs inner() inline, so the Args may self-free
+                True,  # Direct submit is a single-use task.
             )
             self.cpu_infer.submit(deferred_task)
             BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
@@ -873,8 +877,8 @@ class BaseMoEWrapper(_MoEBase, ABC):
         # the WorkerPool and overlaps the device experts queued after it.
         # CUDA keeps the upstream async submit_with_cuda_stream path unchanged.
         sync_submit = bypass or hidden_states.device.type == "npu"
-        # Single-use unless the stream is capturing: capture bakes the Args
-        # pointer into a host node that replays it, so only eager submits self-free.
+        # Preserve the legacy hint; CPUInfer receives the capture state
+        # separately and owns the actual task lifetime.
         autofree = _forward_task_autofree(sync_submit, hidden_states.device)
         if sync_submit:
             # The synchronous submit reads input_tensor_cpu immediately -> the input
@@ -906,7 +910,11 @@ class BaseMoEWrapper(_MoEBase, ABC):
                 kt_kernel_ext.subscribe_ascend_stream(int(cuda_stream))
             self.cpu_infer.submit(immediate_task)
         else:
-            self.cpu_infer.submit_with_cuda_stream(cuda_stream, immediate_task)
+            self.cpu_infer.submit_with_cuda_stream(
+                cuda_stream,
+                immediate_task,
+                _graph_capture_active(hidden_states.device),
+            )
 
         BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
         if deferred_ids is not None:
@@ -925,7 +933,11 @@ class BaseMoEWrapper(_MoEBase, ABC):
             if sync_submit:
                 self.cpu_infer.submit(deferred_task)
             else:
-                self.cpu_infer.submit_with_cuda_stream(cuda_stream, deferred_task)
+                self.cpu_infer.submit_with_cuda_stream(
+                    cuda_stream,
+                    deferred_task,
+                    _graph_capture_active(hidden_states.device),
+                )
             BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
 
     def copy_forward_output_to_device(self, hidden_states: torch.Tensor) -> torch.Tensor:

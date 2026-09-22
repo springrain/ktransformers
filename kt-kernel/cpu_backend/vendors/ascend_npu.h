@@ -55,6 +55,14 @@ static inline cudaError_t cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t f
   return aclrtLaunchCallback(fn, userData, ACL_CALLBACK_NO_BLOCK, stream);
 }
 
+static inline cudaError_t cudaStreamSynchronize(cudaStream_t stream) {
+  return aclrtSynchronizeStream(stream);
+}
+
+static inline cudaError_t cudaDeviceSynchronize() {
+  return aclrtSynchronizeDevice();
+}
+
 // ---- error reporting -------------------------------------------------------
 // CUDA gives a static string per error code; ACL only exposes the *most recent*
 // error message on the current thread. Best-effort emulation.

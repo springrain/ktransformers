@@ -36,9 +36,7 @@ class TaskQueue {
   // The first pending exception wins, matching worker-thread semantics.
   void record_exception(std::exception_ptr exception) noexcept;
 
-  // Re-throw and consume the first latched exception at a normal C++/Python
-  // boundary where exception propagation is safe.
-  void rethrow_pending_exception();
+  bool has_pending_exception() noexcept;
 
  private:
   struct Node {
@@ -58,6 +56,7 @@ class TaskQueue {
   std::exception_ptr first_exception;
 
   void wait_for_pending(size_t allow_n_pending);
+  static void log_exception(std::exception_ptr exception) noexcept;
   void worker();
 };
 

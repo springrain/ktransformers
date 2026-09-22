@@ -232,7 +232,7 @@ def run_benchmark(args):
             )
 
             if args.use_cuda_stream:
-                cpu_infer.submit_with_cuda_stream(cuda_stream, task)
+                cpu_infer.submit_with_cuda_stream(cuda_stream, task, False)
                 cpu_infer.sync_with_cuda_stream(cuda_stream, 0, False)
             else:
                 cpu_infer.submit(task)
@@ -279,7 +279,7 @@ def run_benchmark(args):
             if args.use_cuda_stream:
                 if args.profile:
                     torch.cuda.nvtx.range_push("submit")
-                cpu_infer.submit_with_cuda_stream(cuda_stream, task)
+                cpu_infer.submit_with_cuda_stream(cuda_stream, task, False)
                 if args.profile:
                     torch.cuda.nvtx.range_pop()
                     torch.cuda.nvtx.range_push("sync")

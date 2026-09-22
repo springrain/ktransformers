@@ -474,6 +474,14 @@ if(KTRANSFORMERS_CPU_DEBUG)
     )
     target_link_libraries(test_task_queue PRIVATE Threads::Threads)
     add_executable(
+        test_cpuinfer_task
+        ${CMAKE_CURRENT_SOURCE_DIR}/cpu_backend/test/test_cpuinfer_task.cpp
+    )
+    add_executable(
+        test_cpuinfer_header
+        ${CMAKE_CURRENT_SOURCE_DIR}/cpu_backend/test/test_cpuinfer_header.cpp
+    )
+    add_executable(
         test_shared_mem_buffer_lifetime
         ${CMAKE_CURRENT_SOURCE_DIR}/cpu_backend/test/test_shared_mem_buffer_lifetime.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/cpu_backend/shared_mem_buffer.cpp

@@ -888,6 +888,7 @@ class BaseSFTMoEWrapper(_MoEBase, ABC):
                 save_for_backward=False,
                 autofree=_forward_task_autofree(False, flat_hidden_states.device),
             ),
+            _graph_capture_active(flat_hidden_states.device),
         )
 
     def sync_forward_inference(self, cuda_stream) -> torch.Tensor:
