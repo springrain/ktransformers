@@ -111,6 +111,7 @@ def main():
                 inputs.data_ptr(),
                 output.data_ptr(),
                 True,
+                True,
             )
         )
         cpu.sync()
@@ -127,6 +128,7 @@ def main():
                 0,
                 accumulate,
                 0.25 if args.window_check else 1.0,
+                True,
             )
         )
         cpu.sync()

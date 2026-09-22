@@ -27,6 +27,32 @@ int main() {
   queue.sync(0);
   assert(completed.load() == 3);
 
+  {
+    TaskQueue callback_queue;
+    std::atomic<int> callback_completed{0};
+
+    callback_queue.enqueue([&] { callback_completed.fetch_add(1); });
+    callback_queue.enqueue(
+        [] { throw std::runtime_error("callback task failure"); });
+    callback_queue.enqueue([&] { callback_completed.fetch_add(1); });
+
+    // Host callbacks must only wait for queued work. The exception remains
+    // pending until execution returns to a normal, exception-safe sync point.
+    callback_queue.sync_noexcept(0);
+    assert(callback_completed.load() == 2);
+
+    bool callback_error_caught = false;
+    try {
+      callback_queue.sync(0);
+    } catch (const std::runtime_error& error) {
+      callback_error_caught =
+          std::string(error.what()) == "callback task failure";
+    }
+    assert(callback_error_caught);
+
+    callback_queue.sync(0);
+  }
+
   queue.enqueue([] { throw std::runtime_error("first"); });
   queue.enqueue([] { throw std::runtime_error("second"); });
   try {

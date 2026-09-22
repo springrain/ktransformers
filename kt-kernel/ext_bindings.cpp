@@ -84,6 +84,7 @@ static const bool _is_plain_ = false;
 #include <pybind11/stl.h>  // std::vector/std::pair/std::string conversions
 
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <type_traits>
 
@@ -198,9 +199,13 @@ class MOEBindings {
       CPUInfer* cpuinfer;
       TP_MOE<T>* moe;
     };
-    static void inner(void* args) {
-      Args* args_ = (Args*)args;
-      args_->cpuinfer->enqueue(&TP_MOE<T>::warm_up, args_->moe);
+    static void inner(void* args) noexcept {
+      std::unique_ptr<Args> args_((Args*)args);
+      try {
+        args_->cpuinfer->enqueue(&TP_MOE<T>::warm_up, args_->moe);
+      } catch (...) {
+        args_->cpuinfer->record_callback_exception(std::current_exception());
+      }
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe) {
       Args* args = new Args{nullptr, moe.get()};
@@ -213,9 +218,13 @@ class MOEBindings {
       CPUInfer* cpuinfer;
       TP_MOE<T>* moe;
     };
-    static void inner(void* args) {
-      Args* args_ = (Args*)args;
-      args_->cpuinfer->enqueue(&TP_MOE<T>::load_weights, args_->moe);
+    static void inner(void* args) noexcept {
+      std::unique_ptr<Args> args_((Args*)args);
+      try {
+        args_->cpuinfer->enqueue(&TP_MOE<T>::load_weights, args_->moe);
+      } catch (...) {
+        args_->cpuinfer->record_callback_exception(std::current_exception());
+      }
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe,
                                                             const uintptr_t physical_to_logical_map = 0) {
@@ -248,10 +257,14 @@ class MOEBindings {
       // after enqueuing. Graph-recorded Args are re-invoked by every replay.
       bool autofree;
     };
-    static void inner(void* args) {
+    static void inner(void* args) noexcept {
       Args* args_ = (Args*)args;
-      args_->cpuinfer->enqueue(&TP_MOE<T>::forward_binding, args_->moe, args_->qlen, args_->k, args_->expert_ids,
-                               args_->weights, args_->input, args_->output, args_->incremental);
+      try {
+        args_->cpuinfer->enqueue(&TP_MOE<T>::forward_binding, args_->moe, args_->qlen, args_->k, args_->expert_ids,
+                                 args_->weights, args_->input, args_->output, args_->incremental);
+      } catch (...) {
+        args_->cpuinfer->record_callback_exception(std::current_exception());
+      }
       if (args_->autofree) delete args_;
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe, intptr_t qlen, int k,
@@ -274,9 +287,13 @@ class MOESFTBindings {
       CPUInfer* cpuinfer;
       TP_MOE_SFT<T>* moe;
     };
-    static void inner(void* args) {
-      Args* args_ = (Args*)args;
-      args_->cpuinfer->enqueue(&TP_MOE_SFT<T>::warm_up, args_->moe);
+    static void inner(void* args) noexcept {
+      std::unique_ptr<Args> args_((Args*)args);
+      try {
+        args_->cpuinfer->enqueue(&TP_MOE_SFT<T>::warm_up, args_->moe);
+      } catch (...) {
+        args_->cpuinfer->record_callback_exception(std::current_exception());
+      }
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE_SFT<T>> moe) {
       Args* args = new Args{nullptr, moe.get()};
@@ -290,9 +307,13 @@ class MOESFTBindings {
       CPUInfer* cpuinfer;
       TP_MOE_SFT<T>* moe;
     };
-    static void inner(void* args) {
-      Args* args_ = (Args*)args;
-      args_->cpuinfer->enqueue(&TP_MOE_SFT<T>::load_weights, args_->moe);
+    static void inner(void* args) noexcept {
+      std::unique_ptr<Args> args_((Args*)args);
+      try {
+        args_->cpuinfer->enqueue(&TP_MOE_SFT<T>::load_weights, args_->moe);
+      } catch (...) {
+        args_->cpuinfer->record_callback_exception(std::current_exception());
+      }
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE_SFT<T>> moe) {
       Args* args = new Args{nullptr, moe.get()};
@@ -312,17 +333,27 @@ class MOESFTBindings {
       intptr_t input;
       intptr_t output;
       bool save_for_backward;
+      // Single-use eager callbacks self-free; graph-recorded callbacks are
+      // replayed and therefore retain their Args for the graph lifetime.
+      bool autofree;
     };
-    static void inner(void* args) {
+    static void inner(void* args) noexcept {
       Args* args_ = (Args*)args;
-      args_->cpuinfer->enqueue(&TP_MOE_SFT<T>::forward_sft_binding, args_->moe, args_->qlen, args_->k,
-                               args_->expert_ids, args_->weights, args_->input, args_->output,
-                               args_->save_for_backward);
+      try {
+        args_->cpuinfer->enqueue(&TP_MOE_SFT<T>::forward_sft_binding, args_->moe, args_->qlen, args_->k,
+                                 args_->expert_ids, args_->weights, args_->input, args_->output,
+                                 args_->save_for_backward);
+      } catch (...) {
+        args_->cpuinfer->record_callback_exception(std::current_exception());
+      }
+      if (args_->autofree) delete args_;
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE_SFT<T>> moe, intptr_t qlen, int k,
-                                                            intptr_t expert_ids, intptr_t weights, intptr_t input,
-                                                            intptr_t output, bool save_for_backward) {
-      Args* args = new Args{nullptr, moe.get(), qlen, k, expert_ids, weights, input, output, save_for_backward};
+                                                             intptr_t expert_ids, intptr_t weights, intptr_t input,
+                                                             intptr_t output, bool save_for_backward,
+                                                             bool autofree = false) {
+      Args* args =
+          new Args{nullptr, moe.get(), qlen, k, expert_ids, weights, input, output, save_for_backward, autofree};
       return std::make_pair((intptr_t)&inner, (intptr_t)args);
     }
   };
@@ -346,20 +377,27 @@ class MOESFTBindings {
       intptr_t grad_down_proj;
       bool accumulate_optimizer_grads;
       float optimizer_grad_scale;
+      bool autofree;
     };
-    static void inner(void* args) {
+    static void inner(void* args) noexcept {
       Args* args_ = (Args*)args;
-      args_->cpuinfer->enqueue(&TP_MOE_SFT<T>::backward_binding, args_->moe, args_->grad_output, args_->grad_input,
-                               args_->grad_gate_lora_a, args_->grad_gate_lora_b, args_->grad_up_lora_a,
-                               args_->grad_up_lora_b, args_->grad_down_lora_a, args_->grad_down_lora_b,
-                               args_->grad_weights, args_->grad_gate_proj, args_->grad_up_proj, args_->grad_down_proj,
-                               args_->accumulate_optimizer_grads, args_->optimizer_grad_scale);
+      try {
+        args_->cpuinfer->enqueue(&TP_MOE_SFT<T>::backward_binding, args_->moe, args_->grad_output, args_->grad_input,
+                                 args_->grad_gate_lora_a, args_->grad_gate_lora_b, args_->grad_up_lora_a,
+                                 args_->grad_up_lora_b, args_->grad_down_lora_a, args_->grad_down_lora_b,
+                                 args_->grad_weights, args_->grad_gate_proj, args_->grad_up_proj, args_->grad_down_proj,
+                                 args_->accumulate_optimizer_grads, args_->optimizer_grad_scale);
+      } catch (...) {
+        args_->cpuinfer->record_callback_exception(std::current_exception());
+      }
+      if (args_->autofree) delete args_;
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(
         std::shared_ptr<TP_MOE_SFT<T>> moe, intptr_t grad_output, intptr_t grad_input, intptr_t grad_gate_lora_a,
         intptr_t grad_gate_lora_b, intptr_t grad_up_lora_a, intptr_t grad_up_lora_b, intptr_t grad_down_lora_a,
         intptr_t grad_down_lora_b, intptr_t grad_weights, intptr_t grad_gate_proj, intptr_t grad_up_proj,
-        intptr_t grad_down_proj, bool accumulate_optimizer_grads = false, float optimizer_grad_scale = 1.0f) {
+        intptr_t grad_down_proj, bool accumulate_optimizer_grads = false, float optimizer_grad_scale = 1.0f,
+        bool autofree = false) {
       Args* args = new Args{nullptr,
                             moe.get(),
                             grad_output,
@@ -373,9 +411,10 @@ class MOESFTBindings {
                             grad_weights,
                             grad_gate_proj,
                             grad_up_proj,
-                            grad_down_proj,
-                            accumulate_optimizer_grads,
-                            optimizer_grad_scale};
+                             grad_down_proj,
+                             accumulate_optimizer_grads,
+                             optimizer_grad_scale,
+                             autofree};
       return std::make_pair((intptr_t)&inner, (intptr_t)args);
     }
   };
@@ -392,17 +431,21 @@ class MOESFTBindings {
       intptr_t down_lora_a;
       intptr_t down_lora_b;
     };
-    static void inner(void* args) {
+    static void inner(void* args) noexcept {
       // Debug code for Bug #18 - commented out after fix verified
       // printf("[DEBUG UpdateLoRAWeightsBindings::inner] called\n");
-      Args* args_ = (Args*)args;
+      std::unique_ptr<Args> args_((Args*)args);
       // printf("  moe=%p, gate_lora_a=%p, gate_lora_b=%p\n", (void*)args_->moe, (void*)args_->gate_lora_a,
       // (void*)args_->gate_lora_b); printf("  up_lora_a=%p, up_lora_b=%p\n", (void*)args_->up_lora_a,
       // (void*)args_->up_lora_b); printf("  down_lora_a=%p, down_lora_b=%p\n", (void*)args_->down_lora_a,
       // (void*)args_->down_lora_b);
-      args_->cpuinfer->enqueue(&TP_MOE_SFT<T>::update_lora_weights_binding, args_->moe, args_->gate_lora_a,
-                               args_->gate_lora_b, args_->up_lora_a, args_->up_lora_b, args_->down_lora_a,
-                               args_->down_lora_b);
+      try {
+        args_->cpuinfer->enqueue(&TP_MOE_SFT<T>::update_lora_weights_binding, args_->moe, args_->gate_lora_a,
+                                 args_->gate_lora_b, args_->up_lora_a, args_->up_lora_b, args_->down_lora_a,
+                                 args_->down_lora_b);
+      } catch (...) {
+        args_->cpuinfer->record_callback_exception(std::current_exception());
+      }
       // printf("[DEBUG UpdateLoRAWeightsBindings::inner] enqueue done\n");
     }
     static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE_SFT<T>> moe, intptr_t gate_lora_a,
@@ -425,12 +468,15 @@ void bind_moe_sft_module(py::module_& moe_module, const char* name) {
       .def(py::init<MOESFTConfig>())
       .def("warm_up_task", &MoeBindings::WarmUpBindings::cpuinfer_interface)
       .def("load_weights_task", &MoeBindings::LoadWeightsBindings::cpuinfer_interface)
-      .def("forward_sft_task", &MoeBindings::ForwardSFTBindings::cpuinfer_interface)
+      .def("forward_sft_task", &MoeBindings::ForwardSFTBindings::cpuinfer_interface, py::arg("qlen"), py::arg("k"),
+           py::arg("expert_ids"), py::arg("weights"), py::arg("input"), py::arg("output"),
+           py::arg("save_for_backward"), py::arg("autofree") = false)
       .def("backward_task", &MoeBindings::BackwardBindings::cpuinfer_interface, py::arg("grad_output"),
            py::arg("grad_input"), py::arg("grad_gate_lora_a"), py::arg("grad_gate_lora_b"), py::arg("grad_up_lora_a"),
            py::arg("grad_up_lora_b"), py::arg("grad_down_lora_a"), py::arg("grad_down_lora_b"), py::arg("grad_weights"),
            py::arg("grad_gate_proj"), py::arg("grad_up_proj"), py::arg("grad_down_proj"),
-           py::arg("accumulate_optimizer_grads") = false, py::arg("optimizer_grad_scale") = 1.0f)
+           py::arg("accumulate_optimizer_grads") = false, py::arg("optimizer_grad_scale") = 1.0f,
+           py::arg("autofree") = false)
       .def("update_lora_weights_task", &MoeBindings::UpdateLoRAWeightsBindings::cpuinfer_interface)
       .def("warm_up", &MoeClass::warm_up)
       .def("load_weights", &MoeClass::load_weights)
@@ -494,14 +540,15 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
         std::vector<uintptr_t> w2_scale_ptrs;
       };
 
-      static void inner(void* args) {
-        Args* args_ = (Args*)args;
-        args_->cpuinfer->enqueue(&MoeClass::write_weight_scale_to_buffer, args_->moe, args_->gpu_tp_count,
-                                 args_->expert_id, args_->w13_weight_ptrs, args_->w13_scale_ptrs, args_->w2_weight_ptrs,
-                                 args_->w2_scale_ptrs);
-        // Submit-only path: never replayed as a CUDA-graph host node, so Args is freed here.
-        // The forward bindings must NOT do this; their Args are reused by every graph replay.
-        delete args_;
+      static void inner(void* args) noexcept {
+        std::unique_ptr<Args> args_((Args*)args);
+        try {
+          args_->cpuinfer->enqueue(&MoeClass::write_weight_scale_to_buffer, args_->moe, args_->gpu_tp_count,
+                                   args_->expert_id, args_->w13_weight_ptrs, args_->w13_scale_ptrs,
+                                   args_->w2_weight_ptrs, args_->w2_scale_ptrs);
+        } catch (...) {
+          args_->cpuinfer->record_callback_exception(std::current_exception());
+        }
       }
 
       static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<MoeClass> moe, int gpu_tp_count,
@@ -660,7 +707,7 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def_readwrite("backend_", &CPUInfer::backend_)
 #ifndef KTRANSFORMERS_CPU_ONLY
       .def("sync_with_cuda_stream", &CPUInfer::sync_with_cuda_stream, py::arg("user_cuda_stream"),
-           py::arg("allow_n_pending") = 0)
+           py::arg("allow_n_pending") = 0, py::arg("capture_active") = true)
       .def("submit_with_cuda_stream", &CPUInfer::submit_with_cuda_stream)
 #endif
       ;

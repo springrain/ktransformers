@@ -18,7 +18,12 @@ import torch
 from typing import Optional, Tuple
 from abc import ABC, abstractmethod
 
-from ..experts_base import KExpertsCPUBuffer, _MoEBase
+from ..experts_base import (
+    KExpertsCPUBuffer,
+    _MoEBase,
+    _forward_task_autofree,
+    _graph_capture_active,
+)
 from .backend import is_fp8_sft_method, is_int8_sft_method, is_rawint4_sft_method
 
 
@@ -180,7 +185,7 @@ class BaseSFTMoEWrapper(_MoEBase, ABC):
     Base class for SFT MoE CPU operations with concrete buffer management.
 
     Subclasses implement:
-    - _make_forward_task(buffer, save_for_backward) -> C++ task object
+    - _make_forward_task(buffer, save_for_backward, autofree) -> C++ task object
     - _make_backward_task(buffer) -> C++ task object
     - load_weights(physical_to_logical_map_cpu)
     - init_lora_weights(...)
@@ -482,7 +487,12 @@ class BaseSFTMoEWrapper(_MoEBase, ABC):
     # ========== Abstract methods for subclasses ==========
 
     @abstractmethod
-    def _make_forward_task(self, buffer: KExpertsSFTBuffer, save_for_backward: bool):
+    def _make_forward_task(
+        self,
+        buffer: KExpertsSFTBuffer,
+        save_for_backward: bool,
+        autofree: bool,
+    ):
         """Construct the C++ forward task object. Backend-specific."""
         ...
 
@@ -693,7 +703,9 @@ class BaseSFTMoEWrapper(_MoEBase, ABC):
         self._copy_inputs_to_buffer(buffer, hidden_states, expert_ids, weights, qlen)
 
         self._wait_for_pending_backward_repack()
-        self.cpu_infer.submit(self._make_forward_task(buffer, save_for_backward))
+        self.cpu_infer.submit(
+            self._make_forward_task(buffer, save_for_backward, autofree=True)
+        )
         self.cpu_infer.sync()
 
         if save_for_backward and self._cache_depth == 0:
@@ -741,8 +753,8 @@ class BaseSFTMoEWrapper(_MoEBase, ABC):
                     optimizer_grad_scale=optimizer_grad_scale,
                 )
             else:
-                # Preserve the historical task signature for single-rank
-                # legacy backends and older compatible extension builds.
+                # Let the backend apply its default optimizer settings and
+                # task-ownership policy for the common single-rank path.
                 backward_task = self._make_backward_task(buffer)
             self._wait_for_pending_backward_repack()
             self.cpu_infer.submit(backward_task)
@@ -782,7 +794,9 @@ class BaseSFTMoEWrapper(_MoEBase, ABC):
         self._pending_qlen = qlen
 
         self._wait_for_pending_backward_repack()
-        self.cpu_infer.submit(self._make_forward_task(buffer, save_for_backward))
+        self.cpu_infer.submit(
+            self._make_forward_task(buffer, save_for_backward, autofree=True)
+        )
 
     def sync_forward(self, output_device: Optional[torch.device] = None) -> torch.Tensor:
         """Synchronize and retrieve forward results. Must be called after submit_forward()."""
@@ -869,7 +883,11 @@ class BaseSFTMoEWrapper(_MoEBase, ABC):
         self._wait_for_pending_backward_repack()
         self.cpu_infer.submit_with_cuda_stream(
             cuda_stream,
-            self._make_forward_task(buffer_view, save_for_backward=False),
+            self._make_forward_task(
+                buffer_view,
+                save_for_backward=False,
+                autofree=_forward_task_autofree(False, flat_hidden_states.device),
+            ),
         )
 
     def sync_forward_inference(self, cuda_stream) -> torch.Tensor:
@@ -894,7 +912,11 @@ class BaseSFTMoEWrapper(_MoEBase, ABC):
             if isinstance(cuda_stream, torch.cuda.Stream)
             else torch.cuda.ExternalStream(cuda_stream, device=self._pending_inference_output_gpu.device)
         )
-        self.cpu_infer.sync_with_cuda_stream(cuda_stream)
+        self.cpu_infer.sync_with_cuda_stream(
+            cuda_stream,
+            0,
+            _graph_capture_active(self._pending_inference_output_gpu.device),
+        )
         with torch.cuda.stream(torch_stream):
             self._pending_inference_output_gpu.copy_(self._pending_inference_output_cpu, non_blocking=True)
         output = self._pending_inference_output_gpu

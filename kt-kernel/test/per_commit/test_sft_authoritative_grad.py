@@ -117,7 +117,7 @@ class _FakeAuthoritativeWrapper(BaseSFTMoEWrapper):
     def clear_checkpoint_output(self):
         return None
 
-    def _make_forward_task(self, _buffer, _save_for_backward):
+    def _make_forward_task(self, _buffer, _save_for_backward, _autofree):
         raise NotImplementedError
 
     def _make_backward_task(
@@ -215,6 +215,10 @@ class _RecordingMoe:
         self.calls = []
 
     def backward_task(self, *args):
+        self.calls.append(args)
+        return args
+
+    def forward_sft_task(self, *args):
         self.calls.append(args)
         return args
 
@@ -431,20 +435,21 @@ def test_legacy_map_retains_at_least_expert_count_contract():
     "method",
     ["AMXBF16_SFT", "INT8_SFT", "AMXINT8_SFT", "AMXINT4_SFT"],
 )
-def test_legacy_amx_task_uses_scaled_tail_only_when_required(method):
+def test_amx_backward_task_marks_direct_args_autofree(method):
     backend = _fake_amx_backend(method)
     buffer = _fake_amx_backward_buffer()
 
     backend._make_backward_task(buffer)
-    assert len(backend.moe.calls[-1]) == 12
+    assert len(backend.moe.calls[-1]) == 15
+    assert backend.moe.calls[-1][-3:] == (False, 1.0, True)
 
     backend._make_backward_task(buffer, accumulate_optimizer_grads=False, optimizer_grad_scale=0.5)
     scaled_call = backend.moe.calls[-1]
-    assert len(scaled_call) == 14
-    assert scaled_call[-2:] == (False, 0.5)
+    assert len(scaled_call) == 15
+    assert scaled_call[-3:] == (False, 0.5, True)
 
 
-def test_skip_lora_task_keeps_legacy_signature_when_scale_is_supplied():
+def test_skip_lora_backward_task_marks_direct_args_autofree():
     backend = _fake_amx_backend("AMXBF16_SFT_SkipLoRA", skip_lora=True)
 
     backend._make_backward_task(
@@ -454,9 +459,10 @@ def test_skip_lora_task_keeps_legacy_signature_when_scale_is_supplied():
     )
 
     call = backend.moe.calls[-1]
-    assert len(call) == 12
+    assert len(call) == 15
     assert call[2:8] == (0, 0, 0, 0, 0, 0)
     assert call[9:12] == (0, 0, 0)
+    assert call[-3:] == (False, 1.0, True)
 
 
 def test_forward_waits_for_pending_backward_repack_before_pool_submit():
@@ -471,7 +477,13 @@ def test_forward_waits_for_pending_backward_repack_before_pool_submit():
     backend._validate_forward_inputs = lambda *_args: None
     backend._get_buffer = lambda _qlen: SimpleNamespace()
     backend._copy_inputs_to_buffer = lambda *_args: None
-    backend._make_forward_task = lambda *_args: (lambda: None)
+    forward_task_args = []
+
+    def make_forward_task(_buffer, save_for_backward, autofree):
+        forward_task_args.append((save_for_backward, autofree))
+        return lambda: None
+
+    backend._make_forward_task = make_forward_task
 
     backend.submit_backward_repack()
     backend.submit_forward(
@@ -482,7 +494,24 @@ def test_forward_waits_for_pending_backward_repack_before_pool_submit():
     )
 
     assert events == ["repack_submit", "repack_wait", "pool_submit"]
+    assert forward_task_args == [(True, True)]
     assert not backend._backward_repack_pending
+
+
+def test_amx_forward_task_forwards_autofree_to_binding():
+    backend = _fake_amx_backend("AMXBF16_SFT")
+    backend.num_experts_per_tok = 2
+    buffer = SimpleNamespace(
+        bsz_tensor=torch.zeros(1, dtype=torch.int64),
+        expert_ids_cpu=torch.zeros(1, 2, dtype=torch.int64),
+        weights_cpu=torch.zeros(1, 2),
+        input_cpu=torch.zeros(1, 4, dtype=torch.bfloat16),
+        output_cpu=torch.zeros(1, 4, dtype=torch.bfloat16),
+    )
+
+    backend._make_forward_task(buffer, save_for_backward=False, autofree=True)
+
+    assert backend.moe.calls[-1][-2:] == (False, True)
 
 
 def test_sync_backward_overwrite_accumulate_publish_and_step_release():

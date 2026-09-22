@@ -228,11 +228,12 @@ def run_benchmark(args):
                 input_tensor.data_ptr(),
                 output_tensor.data_ptr(),
                 False,  # incremental
+                True,  # eager/direct callback Args are single-use
             )
 
             if args.use_cuda_stream:
                 cpu_infer.submit_with_cuda_stream(cuda_stream, task)
-                cpu_infer.sync_with_cuda_stream(cuda_stream)
+                cpu_infer.sync_with_cuda_stream(cuda_stream, 0, False)
             else:
                 cpu_infer.submit(task)
                 cpu_infer.sync()
@@ -272,6 +273,7 @@ def run_benchmark(args):
                 input_tensor.data_ptr(),
                 output_tensor.data_ptr(),
                 False,
+                True,
             )
 
             if args.use_cuda_stream:
@@ -281,7 +283,7 @@ def run_benchmark(args):
                 if args.profile:
                     torch.cuda.nvtx.range_pop()
                     torch.cuda.nvtx.range_push("sync")
-                cpu_infer.sync_with_cuda_stream(cuda_stream)
+                cpu_infer.sync_with_cuda_stream(cuda_stream, 0, False)
                 if args.profile:
                     torch.cuda.nvtx.range_pop()
             else:

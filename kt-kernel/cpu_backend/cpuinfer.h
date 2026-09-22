@@ -12,9 +12,12 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <queue>
+#include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 #if defined(KTRANSFORMERS_USE_CUDA) || defined(KTRANSFORMERS_USE_CUDA_HOST_CALLBACKS)
@@ -87,10 +90,17 @@ class CPUInfer {
     void (*func)(void*) = (void (*)(void*))params.first;
     void* args = (void*)params.second;
     *((CPUInfer**)args) = this;
-    cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)func, args);
+    cudaError_t err = cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)func, args);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(std::string("Failed to launch CPUInfer host callback: ") + cudaGetErrorString(err));
+    }
 #endif
   }
 #endif
+
+  void record_callback_exception(std::exception_ptr exception) noexcept {
+    task_queue_->record_exception(exception);
+  }
 
   struct SyncArgs {
     CPUInfer* cpuinfer;
@@ -100,27 +110,29 @@ class CPUInfer {
     bool autofree;
   };
 
-  static void sync_(void* sync_args) {
+  static void sync_(void* sync_args) noexcept {
     SyncArgs* args = (SyncArgs*)sync_args;
     CPUInfer* cpuinfer = args->cpuinfer;
     size_t allow_n_pending = args->allow_n_pending;
     bool autofree = args->autofree;
-    cpuinfer->task_queue_->sync(allow_n_pending);
+    // Host callbacks cannot propagate C++ exceptions. Keep any worker error
+    // latched in TaskQueue until the next normal CPUInfer entry point.
+    cpuinfer->task_queue_->sync_noexcept(allow_n_pending);
     if (autofree) delete args;
   }
 
   void sync(size_t allow_n_pending = 0) {
-    SyncArgs args{this, allow_n_pending, false};
-    sync_(&args);
+    task_queue_->sync(allow_n_pending);
   }
 #ifndef KTRANSFORMERS_CPU_ONLY
-  void sync_with_cuda_stream(intptr_t user_cuda_stream, size_t allow_n_pending = 0) {
+  void sync_with_cuda_stream(intptr_t user_cuda_stream, size_t allow_n_pending = 0, bool capture_active = true) {
 #if defined(KTRANSFORMERS_USE_CUDA) || defined(KTRANSFORMERS_USE_CUDA_HOST_CALLBACKS) || \
     defined(KTRANSFORMERS_USE_MUSA) || defined(KTRANSFORMERS_USE_ROCM) || defined(KTRANSFORMERS_USE_MACA) || \
     defined(KTRANSFORMERS_USE_ASCEND_NPU)
     // Single-use unless the stream is capturing: capture records the args pointer
     // into a host node that replays it forever, so only eager launches self-free.
-    bool autofree = false;
+    // The default capture_active=true keeps older non-CUDA callers conservative.
+    bool autofree = !capture_active;
 #if defined(KTRANSFORMERS_USE_CUDA)
     cudaStreamCaptureStatus capture_status{};
     cudaError_t err = cudaStreamGetCaptureInfo((cudaStream_t)user_cuda_stream, &capture_status, nullptr);
@@ -131,7 +143,16 @@ class CPUInfer {
     }
 #endif
     SyncArgs* args = new SyncArgs{this, allow_n_pending, autofree};
-    cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)&sync_, (void*)args);
+    cudaError_t launch_err = cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)&sync_, (void*)args);
+    if (launch_err != cudaSuccess) {
+      delete args;
+      throw std::runtime_error(std::string("Failed to launch CPUInfer sync callback: ")
+                               + cudaGetErrorString(launch_err));
+    }
+    // Check only after the matching sync callback has been scheduled. This
+    // keeps a newly submitted stream task paired with a drain even when an
+    // earlier asynchronous callback left an exception pending.
+    task_queue_->rethrow_pending_exception();
 #endif
   }
 #endif

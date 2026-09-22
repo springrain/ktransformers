@@ -125,51 +125,66 @@ def _sglang_is_capture_mode() -> bool:
         return False
 
 
+def _get_torch_device_module(device: torch.device):
+    get_device_module = getattr(torch, "get_device_module", None)
+    if callable(get_device_module):
+        try:
+            return get_device_module(device)
+        except Exception:
+            pass
+    return getattr(torch, device.type, None)
+
+
+def _device_graph_capture_state(device: torch.device) -> Optional[bool]:
+    """Return capture state, or None when the backend cannot report it."""
+    if _sglang_is_capture_mode():
+        return True
+    if device.type in ("cpu", "meta"):
+        return False
+
+    backend = _get_torch_device_module(device)
+    capture_probe = getattr(backend, "is_current_stream_capturing", None)
+    if not callable(capture_probe):
+        return None
+    try:
+        return bool(capture_probe())
+    except Exception:
+        return None
+
+
 def _wait_device(device: torch.device) -> None:
     """Block until pending async copies on `device`'s current stream finish.
 
-    NOTE on graph capture: torch.{cuda,npu}.synchronize() raises during cuda /
-    NPU graph capture (NPU returns ERR 107027 "stream is captured"). Skip sync
-    while capturing; graph MoE uses ``_launch_host_func`` + pinned buffers
-    (see ``kt_ep_wrapper``).
+    Synchronization raises while a stream is being captured, so captured paths
+    rely on stream-ordered host callbacks and retain their pinned buffers.
     """
-    if device.type == "npu":
-        try:
-            if torch.npu.is_current_stream_capturing():
-                return
-        except Exception:
-            pass
-        # Defensive fallback: torch.npu.is_current_stream_capturing() reliability
-        # during torch_npu graph capture is unconfirmed; if it returns False (or
-        # raises) while capturing, the synchronize() below would attempt a
-        # stream sync on a captured stream and crash (107027/107030). Mirror the
-        # capture detection used by kt_ep_wrapper._npu_use_graph_host_callback by
-        # also consulting sglang's global capture flag, which model_capture_mode()
-        # sets reliably around the whole capture loop.
-        if _sglang_is_capture_mode():
-            return
-        torch.npu.synchronize(device)
-    elif device.type == "cuda":
-        try:
-            if torch.cuda.is_current_stream_capturing():
-                return
-        except Exception:
-            pass
-        if _sglang_is_capture_mode():
-            return
-        torch.cuda.synchronize(device)
+    if device.type in ("cpu", "meta"):
+        return
+
+    capture_state = _device_graph_capture_state(device)
+    if capture_state is True:
+        return
+    if capture_state is None:
+        raise RuntimeError(
+            f"Cannot safely synchronize torch.{device.type}: graph capture "
+            "state is unavailable."
+        )
+
+    backend = _get_torch_device_module(device)
+    synchronize = getattr(backend, "synchronize", None)
+    if not callable(synchronize):
+        raise RuntimeError(
+            f"Cannot safely drain pending KT callbacks: torch.{device.type} "
+            "does not provide synchronize()."
+        )
+    synchronize(device)
 
 
 def _graph_capture_active(device: torch.device) -> bool:
     """True while a stream capture may still record host nodes referencing our buffers."""
-    try:
-        if device.type == "cuda":
-            return bool(torch.cuda.is_current_stream_capturing()) or _sglang_is_capture_mode()
-        if device.type == "npu":
-            return bool(torch.npu.is_current_stream_capturing()) or _sglang_is_capture_mode()  # type: ignore[attr-defined]
-    except Exception:
-        return True
-    return False
+    # Unknown accelerator backends fail closed: freeing a callback argument
+    # during graph replay is a use-after-free.
+    return _device_graph_capture_state(device) is not False
 
 
 def _forward_task_autofree(sync_submit: bool, device: torch.device) -> bool:
@@ -947,7 +962,11 @@ class BaseMoEWrapper(_MoEBase, ABC):
                 _wait_device(hidden_states.device)
                 self.cpu_infer.sync(allow_pending)
             else:
-                self.cpu_infer.sync_with_cuda_stream(cuda_stream, allow_pending)
+                self.cpu_infer.sync_with_cuda_stream(
+                    cuda_stream,
+                    allow_pending,
+                    _graph_capture_active(hidden_states.device),
+                )
 
         return self.copy_forward_output_to_device(hidden_states)
 
@@ -1015,4 +1034,3 @@ class BaseMoEWrapper(_MoEBase, ABC):
         if cpu_infer is not None:
             cpu_infer.sync(0)
         KExpertsCPUBuffer.temp_buffers.clear()
-

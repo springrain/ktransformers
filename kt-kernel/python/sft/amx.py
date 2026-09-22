@@ -202,7 +202,12 @@ class AMXSFTMoEWrapper(BaseSFTMoEWrapper):
 
     # ========== Template method: C++ task construction ==========
 
-    def _make_forward_task(self, buffer: KExpertsSFTBuffer, save_for_backward: bool):
+    def _make_forward_task(
+        self,
+        buffer: KExpertsSFTBuffer,
+        save_for_backward: bool,
+        autofree: bool,
+    ):
         return self.moe.forward_sft_task(
             buffer.bsz_tensor.data_ptr(),
             self.num_experts_per_tok,
@@ -211,6 +216,7 @@ class AMXSFTMoEWrapper(BaseSFTMoEWrapper):
             buffer.input_cpu.data_ptr(),
             buffer.output_cpu.data_ptr(),
             save_for_backward,
+            autofree,
         )
 
     def _make_backward_task(
@@ -233,6 +239,9 @@ class AMXSFTMoEWrapper(BaseSFTMoEWrapper):
                 0,
                 0,
                 0,  # grad_gate_proj, grad_up_proj, grad_down_proj
+                False,
+                1.0,
+                True,
             )
 
         # Base weight grad pointers (nullptr if not in full mode)
@@ -260,17 +269,12 @@ class AMXSFTMoEWrapper(BaseSFTMoEWrapper):
             grad_up_proj_ptr,
             grad_down_proj_ptr,
         )
-        if (
-            self._uses_authoritative_optimizer_grads
-            or bool(accumulate_optimizer_grads)
-            or float(optimizer_grad_scale) != 1.0
-        ):
-            return self.moe.backward_task(
-                *backward_args,
-                bool(accumulate_optimizer_grads),
-                float(optimizer_grad_scale),
-            )
-        return self.moe.backward_task(*backward_args)
+        return self.moe.backward_task(
+            *backward_args,
+            bool(accumulate_optimizer_grads),
+            float(optimizer_grad_scale),
+            True,
+        )
 
     # ========== Weight loading ==========
 

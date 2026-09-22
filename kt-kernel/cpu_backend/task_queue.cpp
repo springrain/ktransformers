@@ -52,6 +52,34 @@ void TaskQueue::enqueue(std::function<void()> task) {
   cv.notify_one();
 }
 
+void TaskQueue::wait_for_pending(size_t allow_n_pending) {
+  std::unique_lock<std::mutex> lock(mtx);
+  cv.wait(lock, [&] {
+    return pending.load(std::memory_order_acquire) <= allow_n_pending
+        || done.load(std::memory_order_acquire);
+  });
+}
+
+void TaskQueue::record_exception(std::exception_ptr exception) noexcept {
+  if (!exception) return;
+  try {
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!first_exception) first_exception = exception;
+  } catch (...) {
+    // There is no safe way to report a mutex failure from a C host callback.
+  }
+}
+
+void TaskQueue::rethrow_pending_exception() {
+  std::exception_ptr task_exception;
+  {
+    std::lock_guard<std::mutex> lock(mtx);
+    task_exception = first_exception;
+    first_exception = nullptr;
+  }
+  if (task_exception) std::rethrow_exception(task_exception);
+}
+
 void TaskQueue::sync(size_t allow_n_pending) {
   std::exception_ptr task_exception;
   {
@@ -64,6 +92,14 @@ void TaskQueue::sync(size_t allow_n_pending) {
     first_exception = nullptr;
   }
   if (task_exception) std::rethrow_exception(task_exception);
+}
+
+void TaskQueue::sync_noexcept(size_t allow_n_pending) noexcept {
+  try {
+    wait_for_pending(allow_n_pending);
+  } catch (...) {
+    record_exception(std::current_exception());
+  }
 }
 
 void TaskQueue::worker() {
