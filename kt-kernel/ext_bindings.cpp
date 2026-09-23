@@ -535,45 +535,133 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
     struct WriteWeightScaleToBufferBindings {
       struct Args {
         CPUInfer* cpuinfer;
-        MoeClass* moe;
+        std::shared_ptr<MoeClass> moe;
         int gpu_tp_count;
         int expert_id;
         std::vector<uintptr_t> w13_weight_ptrs;
         std::vector<uintptr_t> w13_scale_ptrs;
         std::vector<uintptr_t> w2_weight_ptrs;
         std::vector<uintptr_t> w2_scale_ptrs;
+        std::shared_ptr<TaskCompletion> completion;
+        bool enqueued = false;
       };
 
-      static void inner(void* args) noexcept {
-        Args* args_ = (Args*)args;
-        try {
-          args_->cpuinfer->enqueue(&MoeClass::write_weight_scale_to_buffer, args_->moe, args_->gpu_tp_count,
-                                   args_->expert_id, args_->w13_weight_ptrs, args_->w13_scale_ptrs,
-                                   args_->w2_weight_ptrs, args_->w2_scale_ptrs);
-        } catch (...) {
-          args_->cpuinfer->record_callback_exception(std::current_exception());
+      static void destroy_args(void* opaque) noexcept {
+        auto* args = static_cast<Args*>(opaque);
+        if (args->completion && !args->enqueued) {
+          try {
+            args->completion->finish(std::make_exception_ptr(
+                std::runtime_error("tracked expert writer task was cancelled before enqueue")));
+          } catch (...) {
+            args->completion->finish(std::current_exception());
+          }
         }
+        delete args;
+      }
+
+      static void inner(void* args) noexcept {
+        auto* args_ = static_cast<Args*>(args);
+        try {
+          auto moe = args_->moe;
+          auto gpu_tp_count = args_->gpu_tp_count;
+          auto expert_id = args_->expert_id;
+          auto w13_weight_ptrs = args_->w13_weight_ptrs;
+          auto w13_scale_ptrs = args_->w13_scale_ptrs;
+          auto w2_weight_ptrs = args_->w2_weight_ptrs;
+          auto w2_scale_ptrs = args_->w2_scale_ptrs;
+          auto writer = [moe, gpu_tp_count, expert_id,
+                         w13_weight_ptrs = std::move(w13_weight_ptrs),
+                         w13_scale_ptrs = std::move(w13_scale_ptrs),
+                         w2_weight_ptrs = std::move(w2_weight_ptrs),
+                         w2_scale_ptrs = std::move(w2_scale_ptrs)]() {
+            moe->write_weight_scale_to_buffer(
+                gpu_tp_count, expert_id, w13_weight_ptrs, w13_scale_ptrs,
+                w2_weight_ptrs, w2_scale_ptrs);
+          };
+          if (args_->completion) {
+            args_->cpuinfer->enqueue_tracked(args_->completion, std::move(writer));
+          } else {
+            args_->cpuinfer->enqueue(std::move(writer));
+          }
+          args_->enqueued = true;
+        } catch (...) {
+          if (args_->completion) {
+            args_->completion->finish(std::current_exception());
+          } else {
+            args_->cpuinfer->record_callback_exception(std::current_exception());
+          }
+        }
+      }
+
+      static Args* make_args(std::shared_ptr<MoeClass> moe, int gpu_tp_count,
+                             int expert_id, py::list w13_weight_ptrs,
+                             py::list w13_scale_ptrs, py::list w2_weight_ptrs,
+                             py::list w2_scale_ptrs,
+                             std::shared_ptr<TaskCompletion> completion) {
+        std::vector<uintptr_t> w13_weight_vec, w13_scale_vec, w2_weight_vec,
+            w2_scale_vec;
+
+        for (auto item : w13_weight_ptrs)
+          w13_weight_vec.push_back(py::cast<uintptr_t>(item));
+        for (auto item : w13_scale_ptrs)
+          w13_scale_vec.push_back(py::cast<uintptr_t>(item));
+        for (auto item : w2_weight_ptrs)
+          w2_weight_vec.push_back(py::cast<uintptr_t>(item));
+        for (auto item : w2_scale_ptrs)
+          w2_scale_vec.push_back(py::cast<uintptr_t>(item));
+
+        return new Args{nullptr,
+                        std::move(moe),
+                        gpu_tp_count,
+                        expert_id,
+                        std::move(w13_weight_vec),
+                        std::move(w13_scale_vec),
+                        std::move(w2_weight_vec),
+                        std::move(w2_scale_vec),
+                        std::move(completion),
+                        false};
       }
 
       static CPUInferTask cpuinfer_interface(std::shared_ptr<MoeClass> moe, int gpu_tp_count, int expert_id,
                                              py::list w13_weight_ptrs, py::list w13_scale_ptrs,
                                              py::list w2_weight_ptrs, py::list w2_scale_ptrs) {
-        // Convert Python lists to std::vector<uintptr_t>
-        std::vector<uintptr_t> w13_weight_vec, w13_scale_vec, w2_weight_vec, w2_scale_vec;
+        return make_cpuinfer_owned_task(
+            &inner,
+            make_args(moe, gpu_tp_count, expert_id, w13_weight_ptrs,
+                      w13_scale_ptrs, w2_weight_ptrs, w2_scale_ptrs, nullptr),
+            &destroy_args);
+      }
 
-        for (auto item : w13_weight_ptrs) w13_weight_vec.push_back(py::cast<uintptr_t>(item));
-        for (auto item : w13_scale_ptrs) w13_scale_vec.push_back(py::cast<uintptr_t>(item));
-        for (auto item : w2_weight_ptrs) w2_weight_vec.push_back(py::cast<uintptr_t>(item));
-        for (auto item : w2_scale_ptrs) w2_scale_vec.push_back(py::cast<uintptr_t>(item));
-
-        Args* args = new Args{nullptr,        moe.get(),     gpu_tp_count,  expert_id,
-                              w13_weight_vec, w13_scale_vec, w2_weight_vec, w2_scale_vec};
-        return make_cpuinfer_task(&inner, args);
+      static py::tuple tracked_cpuinfer_interface(
+          std::shared_ptr<MoeClass> moe, int gpu_tp_count, int expert_id,
+          py::list w13_weight_ptrs, py::list w13_scale_ptrs,
+          py::list w2_weight_ptrs, py::list w2_scale_ptrs) {
+        auto completion = std::make_shared<TaskCompletion>();
+        auto task = make_cpuinfer_owned_task(
+            &inner,
+            make_args(moe, gpu_tp_count, expert_id, w13_weight_ptrs,
+                      w13_scale_ptrs, w2_weight_ptrs, w2_scale_ptrs,
+                      completion),
+            &destroy_args);
+        try {
+          return py::make_tuple(task, completion);
+        } catch (...) {
+          // CPUInferTask is an integer pair rather than an RAII type.  If
+          // tuple construction fails, release the owned payload explicitly
+          // so the Moe shared_ptr and completion cannot leak.
+          destroy_cpuinfer_task(task);
+          throw;
+        }
       }
     };
 
     moe_cls.def("write_weight_scale_to_buffer_task", &WriteWeightScaleToBufferBindings::cpuinfer_interface,
                 py::arg("gpu_tp_count"), py::arg("expert_id"), py::arg("w13_weight_ptrs"), py::arg("w13_scale_ptrs"),
+                py::arg("w2_weight_ptrs"), py::arg("w2_scale_ptrs"));
+    moe_cls.def("write_weight_scale_to_buffer_tracked_task",
+                &WriteWeightScaleToBufferBindings::tracked_cpuinfer_interface,
+                py::arg("gpu_tp_count"), py::arg("expert_id"),
+                py::arg("w13_weight_ptrs"), py::arg("w13_scale_ptrs"),
                 py::arg("w2_weight_ptrs"), py::arg("w2_scale_ptrs"));
 
     moe_cls.def(
@@ -701,6 +789,12 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def_readwrite("subpool_count", &WorkerPoolConfig::subpool_count)
       .def_readwrite("subpool_numa_map", &WorkerPoolConfig::subpool_numa_map)
       .def_readwrite("subpool_thread_count", &WorkerPoolConfig::subpool_thread_count);
+
+  py::class_<TaskCompletion, std::shared_ptr<TaskCompletion>>(
+      m, "CPUInferTaskCompletion")
+      .def("ready", &TaskCompletion::ready)
+      .def("wait", &TaskCompletion::wait,
+           py::call_guard<py::gil_scoped_release>());
 
   py::class_<CPUInfer>(m, "CPUInfer")
       .def(py::init<int>())

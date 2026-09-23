@@ -1379,13 +1379,34 @@ class NativeMoEWrapper(BaseMoEWrapper):
         if self.moe is None:
             raise RuntimeError("MoE instance not initialized; cannot submit write_weight_scale_to_buffer task.")
 
-        if not hasattr(self.moe, "write_weight_scale_to_buffer_task"):
+        tracked_task = getattr(
+            self.moe, "write_weight_scale_to_buffer_tracked_task", None
+        )
+        legacy_task = getattr(self.moe, "write_weight_scale_to_buffer_task", None)
+        if tracked_task is None and legacy_task is None:
             raise NotImplementedError(
                 "write_weight_scale_to_buffer_task is not available for this backend implementation."
             )
 
+        if tracked_task is not None:
+            task, completion = tracked_task(
+                gpu_tp_count,
+                expert_id,
+                w13_weight_ptrs,
+                w13_scale_ptrs,
+                w2_weight_ptrs,
+                w2_scale_ptrs,
+            )
+            self.cpu_infer.submit(task)
+            pending = getattr(self, "_pending_writer_completions", None)
+            if pending is None:
+                pending = []
+                self._pending_writer_completions = pending
+            pending.append(completion)
+            return completion
+
         self.cpu_infer.submit(
-            self.moe.write_weight_scale_to_buffer_task(
+            legacy_task(
                 gpu_tp_count,
                 expert_id,
                 w13_weight_ptrs,
@@ -1394,12 +1415,31 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 w2_scale_ptrs,
             )
         )
+        return None
 
-    def sync_write_weight_scale_to_buffer(self):
+    def sync_write_weight_scale_to_buffer(self, completion=None):
         """
-        Block until previously submitted write_weight_scale_to_buffer tasks finish.
+        Block until a submitted write task finishes.
+
+        New extensions return a task-specific completion from
+        :meth:`submit_write_weight_scale_to_buffer`; waiting on it does not
+        drain writer or inference tasks submitted later.  Older extensions
+        return ``None`` and retain the legacy whole-queue synchronization.
         """
-        # The CPUInfer.sync() call blocks until pending tasks complete.
+        pending = getattr(self, "_pending_writer_completions", None)
+        if completion is None and pending:
+            completion = pending.pop(0)
+        elif completion is not None and pending:
+            try:
+                pending.remove(completion)
+            except ValueError:
+                pass
+
+        if completion is not None:
+            completion.wait()
+            return
+
+        # Compatibility path for extensions without tracked writer tasks.
         self.cpu_infer.sync()
 
     def run_layerwise_fp8_batch(

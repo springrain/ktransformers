@@ -81,6 +81,33 @@ class CPUInfer {
     task_queue_->enqueue([=]() { std::invoke(f, *obj, args...); });
   }
 
+  void enqueue(std::function<void()> task) {
+    task_queue_->enqueue(std::move(task));
+  }
+
+  template <typename Func, typename Obj, typename... Args>
+  std::shared_ptr<TaskCompletion> enqueue_tracked(Func f, Obj* obj, Args... args) {
+    return task_queue_->enqueue_tracked([=]() {
+      std::invoke(f, *obj, args...);
+    });
+  }
+
+  std::shared_ptr<TaskCompletion> enqueue_tracked(std::function<void()> task) {
+    return task_queue_->enqueue_tracked(std::move(task));
+  }
+
+  template <typename Func, typename Obj, typename... Args>
+  void enqueue_tracked(const std::shared_ptr<TaskCompletion>& completion,
+                       Func f, Obj* obj, Args... args) {
+    task_queue_->enqueue_tracked(
+        [=]() { std::invoke(f, *obj, args...); }, completion);
+  }
+
+  void enqueue_tracked(const std::shared_ptr<TaskCompletion>& completion,
+                       std::function<void()> task) {
+    task_queue_->enqueue_tracked(std::move(task), completion);
+  }
+
   void submit(CPUInferTask params) {
     CPUInferTaskCancelGuard task_guard(params);
     if (task_queue_->has_pending_exception()) {

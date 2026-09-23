@@ -15,7 +15,42 @@
 #include <chrono>
 #include <cstdio>
 #include <iostream>
+#include <memory>
+#include <stdexcept>
 #include <thread>
+
+bool TaskCompletion::ready() const noexcept {
+  try {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return done_;
+  } catch (...) {
+    return false;
+  }
+}
+
+void TaskCompletion::wait() {
+  std::exception_ptr task_exception;
+  {
+    std::unique_lock<std::mutex> lock(mtx_);
+    cv_.wait(lock, [&] { return done_; });
+    task_exception = exception_;
+  }
+  if (task_exception) std::rethrow_exception(task_exception);
+}
+
+void TaskCompletion::finish(std::exception_ptr exception) noexcept {
+  try {
+    {
+      std::lock_guard<std::mutex> lock(mtx_);
+      if (done_) return;
+      exception_ = exception;
+      done_ = true;
+    }
+    cv_.notify_all();
+  } catch (...) {
+    // Completion notification is best effort in an asynchronous worker.
+  }
+}
 
 TaskQueue::TaskQueue() : done(false), pending(0) {
   Node* dummy = new Node();
@@ -35,22 +70,54 @@ TaskQueue::~TaskQueue() {
   Node* node = head.load(std::memory_order_relaxed);
   while (node) {
     Node* next = node->next.load(std::memory_order_relaxed);
+    if (node->completion) {
+      try {
+        node->completion->finish(std::make_exception_ptr(
+            std::runtime_error("TaskQueue destroyed before tracked task completed")));
+      } catch (...) {
+        node->completion->finish(std::current_exception());
+      }
+    }
     delete node;
     node = next;
   }
 }
 
 void TaskQueue::enqueue(std::function<void()> task) {
+  enqueue_tracked(std::move(task), nullptr);
+}
+
+void TaskQueue::enqueue_tracked(
+    std::function<void()> task,
+    const std::shared_ptr<TaskCompletion>& completion) {
   // Allocate first: a throw after fetch_add would credit pending with no node
   // ever linked, and every later sync() would hang forever.
-  Node* node = new Node(task);
-  pending.fetch_add(1, std::memory_order_acq_rel);
-  Node* prev = tail.exchange(node, std::memory_order_acq_rel);
-  prev->next.store(node, std::memory_order_release);
-  {
+  Node* node = nullptr;
+  try {
+    node = new Node(std::move(task), completion);
+    // Publish while holding the same mutex used by the worker's condition
+    // variable.  Without this lock, a notification can land between the
+    // worker's predicate check and its atomic wait transition and be lost.
+    // Lock acquisition is the last throwing operation before publication.
     std::lock_guard<std::mutex> lock(mtx);
+    pending.fetch_add(1, std::memory_order_acq_rel);
+    Node* prev = tail.exchange(node, std::memory_order_acq_rel);
+    prev->next.store(node, std::memory_order_release);
+  } catch (...) {
+    delete node;
+    if (completion) completion->finish(std::current_exception());
+    throw;
   }
+  // From publication onward enqueue cannot throw: a tracked caller must not
+  // observe a failed completion while that same task can still write buffers.
   cv.notify_one();
+}
+
+std::shared_ptr<TaskCompletion> TaskQueue::enqueue_tracked(
+    std::function<void()> task) {
+  auto completion = std::make_shared<TaskCompletion>();
+  enqueue_tracked(std::move(task), completion);
+  return completion;
 }
 
 void TaskQueue::wait_for_pending(size_t allow_n_pending) {
@@ -143,13 +210,18 @@ void TaskQueue::worker() {
           task_exception = std::current_exception();
         }
       }
+      if (next->completion) next->completion->finish(task_exception);
       delete curr;
       curr = next;
       head.store(curr, std::memory_order_release);
       bool recorded_exception = false;
       {
         std::lock_guard<std::mutex> lock(mtx);
-        if (task_exception && !first_exception) {
+        // A tracked task reports its exception through TaskCompletion.  Do
+        // not also poison the whole CPUInfer queue: the cache loader may
+        // recover by immediately submitting a CPU fallback task.  Untracked
+        // tasks retain the legacy first-exception latch.
+        if (task_exception && !next->completion && !first_exception) {
           first_exception = task_exception;
           recorded_exception = true;
         }
