@@ -779,13 +779,15 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
                                const std::vector<uintptr_t>& w13_weight_ptrs,
                                const std::vector<uintptr_t>& w13_scale_ptrs,
                                const std::vector<uintptr_t>& w2_weight_ptrs,
-                               const std::vector<uintptr_t>& w2_scale_ptrs) const {
+                               const std::vector<uintptr_t>& w2_scale_ptrs,
+                               WorkerPool* work_pool = nullptr) const {
     if (expert_id < 0 || expert_id >= config_.expert_num || gate_bb_[expert_id] == nullptr ||
         up_bb_[expert_id] == nullptr || down_bb_[expert_id] == nullptr)
       throw std::runtime_error("MXFP4 AVX2 write_weights_to_buffer: invalid expert");
 
     const int group_size = config_.quant_config.group_size;
-    auto pool = config_.pool->get_subpool(tp_part_idx);
+    auto* selected_pool = work_pool != nullptr ? work_pool : config_.pool;
+    auto pool = selected_pool->get_subpool(tp_part_idx);
 
     size_t cpu_tp_weight_bytes = (size_t)config_.intermediate_size * config_.hidden_size / 2;
     size_t cpu_tp_scale_elem_count = (size_t)config_.intermediate_size * config_.hidden_size / group_size;
@@ -1072,14 +1074,40 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
                                     const std::vector<uintptr_t>& w13_scale_ptrs,
                                     const std::vector<uintptr_t>& w2_weight_ptrs,
                                     const std::vector<uintptr_t>& w2_scale_ptrs) {
+    write_weight_scale_to_buffer_with_pool(this->config.pool, gpu_tp_count, expert_id, w13_weight_ptrs,
+                                           w13_scale_ptrs, w2_weight_ptrs, w2_scale_ptrs);
+  }
+
+  void write_weight_scale_to_buffer_with_pool(
+      WorkerPool* writer_pool, int gpu_tp_count, int expert_id,
+      const std::vector<uintptr_t>& w13_weight_ptrs,
+      const std::vector<uintptr_t>& w13_scale_ptrs,
+      const std::vector<uintptr_t>& w2_weight_ptrs,
+      const std::vector<uintptr_t>& w2_scale_ptrs) {
     if (!this->weights_loaded) throw std::runtime_error("Not Loaded");
+    if (this->tps.empty()) throw std::runtime_error("No TP parts initialized");
+    if (writer_pool == nullptr) throw std::runtime_error("MXFP4 AVX2 staging: writer pool is null");
     if ((int)w13_weight_ptrs.size() != gpu_tp_count || (int)w13_scale_ptrs.size() != gpu_tp_count ||
         (int)w2_weight_ptrs.size() != gpu_tp_count || (int)w2_scale_ptrs.size() != gpu_tp_count) {
       throw std::runtime_error("Pointer arrays size must match gpu_tp_count");
     }
-    this->config.pool->dispense_backend()->do_numa_job([&, this](int i) {
-      this->tps[i]->write_weights_to_buffer(gpu_tp_count, this->tp_count, expert_id, this->config, w13_weight_ptrs,
-                                            w13_scale_ptrs, w2_weight_ptrs, w2_scale_ptrs);
+    int physical_expert_id = expert_id;
+    const uint64_t* map = static_cast<const uint64_t*>(this->config.physical_to_logical_map);
+    if (map != nullptr) {
+      physical_expert_id = -1;
+      for (int i = 0; i < this->config.expert_num; ++i) {
+        if (map[i] == static_cast<uint64_t>(expert_id)) {
+          physical_expert_id = i;
+          break;
+        }
+      }
+      if (physical_expert_id < 0)
+        throw std::runtime_error("MXFP4 AVX2 staging: expert is absent from physical-to-logical map");
+    }
+    writer_pool->dispense_backend()->do_numa_job([&, this, writer_pool, physical_expert_id](int i) {
+      this->tps[i]->write_weights_to_buffer(gpu_tp_count, this->tp_count, physical_expert_id, this->config,
+                                             w13_weight_ptrs,
+                                             w13_scale_ptrs, w2_weight_ptrs, w2_scale_ptrs, writer_pool);
     });
   }
 };

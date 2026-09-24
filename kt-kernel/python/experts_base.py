@@ -399,6 +399,9 @@ class _MoEBase:
     """
 
     _cpu_infer_instance = None
+    _cpu_infer_key = None
+    _writer_cpu_infer_instance = None
+    _writer_cpu_infer_key = None
 
     @classmethod
     def _get_cpu_infer(
@@ -418,6 +421,19 @@ class _MoEBase:
         Returns:
             CPUInfer singleton instance
         """
+        numa_map = (
+            list(numa_nodes)
+            if numa_nodes is not None
+            else list(range(threadpool_count))
+        )
+        key = (int(cpuinfer_threads), int(threadpool_count), tuple(numa_map))
+        if cls._cpu_infer_instance is not None:
+            if cls._cpu_infer_key != key:
+                raise RuntimeError(
+                    "CPUInfer was initialized with a different CPU/NUMA "
+                    "configuration in this process"
+                )
+            return cls._cpu_infer_instance
         if cls._cpu_infer_instance is None:
             if threadpool_count <= 0:
                 raise ValueError(
@@ -462,12 +478,100 @@ class _MoEBase:
                 subpool_thread_count,
             )
             cls._cpu_infer_instance = kt_kernel_ext.CPUInfer(worker_config)
+            cls._cpu_infer_key = key
             logger.info(
                 "[KT] CPUInfer initialized in %.2fs",
                 time.perf_counter() - started,
             )
 
         return cls._cpu_infer_instance
+
+    @classmethod
+    def _get_writer_cpu_infer(
+        cls,
+        cpuinfer_threads: int,
+        threadpool_count: int,
+        numa_nodes=None,
+    ):
+        """Return the process-wide streamed-expert writer executor.
+
+        Writers must not share CPUInfer's FIFO or WorkerPool with the main MoE
+        task: otherwise rolling candidate 3+ is queued behind the long CPU
+        GEMM. One auxiliary worker per CPU TP/NUMA partition keeps the default
+        bounded while allowing host export to overlap the main computation.
+        """
+
+        numa_map = (
+            list(numa_nodes)
+            if numa_nodes is not None
+            else list(range(threadpool_count))
+        )
+        if len(numa_map) != threadpool_count:
+            raise ValueError(
+                f"numa_nodes length ({len(numa_map)}) must match "
+                f"threadpool_count ({threadpool_count})"
+            )
+        key = (int(cpuinfer_threads), int(threadpool_count), tuple(numa_map))
+        if cls._writer_cpu_infer_instance is not None:
+            if cls._writer_cpu_infer_key != key:
+                raise RuntimeError(
+                    "streamed-expert writer CPUInfer was initialized with a "
+                    "different CPU/NUMA configuration"
+                )
+            return cls._writer_cpu_infer_instance
+
+        main_thread_counts = [
+            cpuinfer_threads // threadpool_count
+            + (1 if i < cpuinfer_threads % threadpool_count else 0)
+            for i in range(threadpool_count)
+        ]
+        main_threads_by_numa = {}
+        for numa_id, thread_count in zip(numa_map, main_thread_counts):
+            main_threads_by_numa[numa_id] = (
+                main_threads_by_numa.get(numa_id, 0) + thread_count
+            )
+        writer_seen_by_numa = {}
+        writer_thread_starts = []
+        for numa_id in numa_map:
+            writer_offset = writer_seen_by_numa.get(numa_id, 0)
+            writer_thread_starts.append(
+                main_threads_by_numa[numa_id] + writer_offset
+            )
+            writer_seen_by_numa[numa_id] = writer_offset + 1
+
+        writer_config = kt_kernel_ext.WorkerPoolConfig()
+        writer_config.subpool_count = threadpool_count
+        writer_config.subpool_numa_map = numa_map
+        writer_config.subpool_thread_count = [1] * threadpool_count
+        if not hasattr(writer_config, "subpool_thread_start"):
+            raise RuntimeError(
+                "kt-kernel lacks auxiliary writer core-offset support; rebuild "
+                "the extension from the kt-prefill-stream-top-n branch"
+            )
+        writer_config.subpool_thread_start = writer_thread_starts
+        logger.info(
+            "KT MXFP4 Stream-TopN CPU budget: total_threads=%d, "
+            "main_gemm_threads=%d, writer_threads=%d, numa_map=%s",
+            cpuinfer_threads + threadpool_count,
+            cpuinfer_threads,
+            threadpool_count,
+            numa_map,
+        )
+        cls._writer_cpu_infer_instance = kt_kernel_ext.CPUInfer(writer_config)
+        cls._writer_cpu_infer_key = key
+        return cls._writer_cpu_infer_instance
+
+    def _ensure_writer_cpu_infer(self):
+        if self.writer_cpu_infer is None:
+            cpuinfer_threads, threadpool_count, numa_nodes = (
+                self._writer_cpuinfer_config
+            )
+            self.writer_cpu_infer = self._get_writer_cpu_infer(
+                cpuinfer_threads,
+                threadpool_count,
+                numa_nodes=numa_nodes,
+            )
+        return self.writer_cpu_infer
 
     @staticmethod
     def _validate_base_config(
@@ -524,6 +628,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
         activation: str = "silu",
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        reserve_stream_writer_threads: bool = False,
     ):
         """
         Initialize base MoE Wrapper.
@@ -590,7 +695,37 @@ class BaseMoEWrapper(_MoEBase, ABC):
         )
 
         # Initialize CPU inference engine (singleton via shared base class)
-        self.cpu_infer = self._get_cpu_infer(cpuinfer_threads, threadpool_count, numa_nodes=numa_nodes)
+        main_cpuinfer_threads = int(cpuinfer_threads)
+        self._reserve_stream_writer_threads = bool(
+            reserve_stream_writer_threads
+        )
+        if self._reserve_stream_writer_threads:
+            if str(method).upper() != "MXFP4":
+                raise ValueError(
+                    "stream writer CPU reservation is only valid for MXFP4"
+                )
+            # Treat --kt-cpuinfer as the total MXFP4 CPU budget. Reserve one
+            # core per CPU TP/NUMA partition for the independent streaming
+            # writer so deployments that already use every allowed core do not
+            # need another tuning parameter.
+            main_cpuinfer_threads -= int(threadpool_count)
+            if main_cpuinfer_threads < int(threadpool_count):
+                raise ValueError(
+                    "MXFP4 Stream-TopN requires at least two CPU threads per "
+                    "threadpool (one GEMM worker and one writer worker)"
+                )
+        self.cpu_infer = self._get_cpu_infer(
+            main_cpuinfer_threads,
+            threadpool_count,
+            numa_nodes=numa_nodes,
+        )
+        # Created lazily only when Stream-TopN submits its first packed expert.
+        self._writer_cpuinfer_config = (
+            main_cpuinfer_threads,
+            int(threadpool_count),
+            None if numa_nodes is None else tuple(numa_nodes),
+        )
+        self.writer_cpu_infer = None
 
         # Backend-specific initialization happens in subclasses
         self.moe = None

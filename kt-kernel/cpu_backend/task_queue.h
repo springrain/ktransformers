@@ -14,10 +14,31 @@
 #include <condition_variable>
 #include <exception>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <queue>
+#include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
+
+class TaskCompletion {
+ public:
+  TaskCompletion() = default;
+
+  TaskCompletion(const TaskCompletion&) = delete;
+  TaskCompletion& operator=(const TaskCompletion&) = delete;
+
+  bool ready() const noexcept;
+  void wait();
+  void finish(std::exception_ptr exception = nullptr) noexcept;
+
+ private:
+  mutable std::mutex mtx_;
+  std::condition_variable cv_;
+  bool done_ = false;
+  std::exception_ptr exception_;
+};
 
 class TaskQueue {
  public:
@@ -25,6 +46,10 @@ class TaskQueue {
   ~TaskQueue();
 
   void enqueue(std::function<void()>);
+  void enqueue_tracked(
+      std::function<void()>,
+      const std::shared_ptr<TaskCompletion>& completion);
+  std::shared_ptr<TaskCompletion> enqueue_tracked(std::function<void()>);
 
   void sync(size_t allow_n_pending);
   // Host callbacks are C ABI boundaries and must not let C++ exceptions
@@ -37,13 +62,21 @@ class TaskQueue {
   void record_exception(std::exception_ptr exception) noexcept;
 
   bool has_pending_exception() noexcept;
+  // Rethrow a latched callback/worker exception without waiting for queued
+  // work.  Callers use this immediately after a CUDA host callback boundary to
+  // validate that the callback successfully enqueued its CPU task while the
+  // task itself remains free to run asynchronously.
+  void rethrow_pending_exception();
 
  private:
   struct Node {
     std::function<void()> task;
+    std::shared_ptr<TaskCompletion> completion;
     std::atomic<Node*> next;
-    Node() : task(nullptr), next(nullptr) {}
-    Node(const std::function<void()>& t) : task(t), next(nullptr) {}
+    Node() : task(nullptr), completion(nullptr), next(nullptr) {}
+    Node(std::function<void()> t,
+         std::shared_ptr<TaskCompletion> c = nullptr)
+        : task(std::move(t)), completion(std::move(c)), next(nullptr) {}
   };
 
   std::atomic<Node*> head;

@@ -8,10 +8,30 @@
 
 #include "../cpuinfer.h"
 
+#include <functional>
+#include <memory>
 #include <type_traits>
+#include <utility>
 
 int main() {
   static_assert(!std::is_copy_constructible_v<CPUInfer>);
   static_assert(!std::is_move_constructible_v<CPUInfer>);
+  static_assert(std::is_same_v<
+                decltype(std::declval<CPUInfer&>().enqueue(
+                    std::declval<std::function<void()>>())),
+                void>);
+  static_assert(std::is_same_v<
+                decltype(std::declval<CPUInfer&>().enqueue_tracked(
+                    std::declval<std::function<void()>>())),
+                std::shared_ptr<TaskCompletion>>);
+  static_assert(std::is_same_v<
+                decltype(std::declval<CPUInfer&>().enqueue_tracked(
+                    std::declval<const std::shared_ptr<TaskCompletion>&>(),
+                    std::declval<std::function<void()>>())),
+                void>);
+  static_assert(std::is_same_v<
+                decltype(std::declval<CPUInfer&>()
+                             .rethrow_pending_callback_exception()),
+                void>);
   return 0;
 }

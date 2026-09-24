@@ -174,6 +174,8 @@ class KTMoEWrapper:
         activation: Optional[str] = None,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        # Stream-TopN reserves one writer core per inference threadpool.
+        reserve_stream_writer_threads: bool = False,
     ):
         """
         Factory method to create the appropriate backend implementation.
@@ -253,6 +255,7 @@ class KTMoEWrapper:
                 activation=activation,
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
+                reserve_stream_writer_threads=reserve_stream_writer_threads,
             )
         else:  # mode == "sft"
             # SFT factory does not plumb swiglu_limit; reject non-zero
@@ -365,6 +368,7 @@ def _create_inference_wrapper(
     activation: Optional[str] = None,
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
+    reserve_stream_writer_threads: bool = False,
 ) -> BaseMoEWrapper:
     """
     Create an inference wrapper based on the method.
@@ -491,6 +495,9 @@ def _create_inference_wrapper(
         extra_kwargs["activation"] = activation
         extra_kwargs["situ_beta"] = situ_beta
         extra_kwargs["situ_linear_beta"] = situ_linear_beta
+        extra_kwargs["reserve_stream_writer_threads"] = (
+            reserve_stream_writer_threads
+        )
         # All Native methods use a shared CPU activation base, so an explicit
         # SwiGLU-OAI contract is independent of the weight quantization format.
         extra_kwargs["swiglu_alpha"] = swiglu_alpha

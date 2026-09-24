@@ -830,6 +830,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
         activation: Optional[str] = None,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        reserve_stream_writer_threads: bool = False,
     ):
         # Keep direct NativeMoEWrapper callers compatible with the factory's
         # pre-contract arguments. The exact K3 tuple is translated into the
@@ -989,6 +990,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
             activation=activation,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
+            reserve_stream_writer_threads=reserve_stream_writer_threads,
         )
 
         self._loader_key = NativeMoEWrapper._make_loader_key(method, weight_path)
@@ -1528,20 +1530,58 @@ class NativeMoEWrapper(BaseMoEWrapper):
         """
         Submit the write_weight_scale_to_buffer task for RAWINT4 KGroup AMX implementation.
 
-        This method submits the C++-exposed task `write_weight_scale_to_buffer_task` to the
-        shared CPUInfer queue. The pointer lists should be plain integer lists (e.g. from
-        tensor.data_ptr()).
+        This method submits the C++-exposed task
+        `write_weight_scale_to_buffer_task`. MXFP4 uses a dedicated auxiliary
+        CPUInfer queue so rolling Stream-TopN exports can overlap the main CPU
+        expert GEMM; other backends preserve the shared-queue behavior. The
+        pointer lists should be plain integers (for example tensor.data_ptr()).
         """
         if self.moe is None:
             raise RuntimeError("MoE instance not initialized; cannot submit write_weight_scale_to_buffer task.")
 
-        if not hasattr(self.moe, "write_weight_scale_to_buffer_task"):
+        tracked_task = getattr(
+            self.moe, "write_weight_scale_to_buffer_tracked_task", None
+        )
+        legacy_task = getattr(self.moe, "write_weight_scale_to_buffer_task", None)
+        if tracked_task is None and legacy_task is None:
             raise NotImplementedError(
                 "write_weight_scale_to_buffer_task is not available for this backend implementation."
             )
 
-        self.cpu_infer.submit(
-            self.moe.write_weight_scale_to_buffer_task(
+        if tracked_task is not None:
+            task, completion = tracked_task(
+                gpu_tp_count,
+                expert_id,
+                w13_weight_ptrs,
+                w13_scale_ptrs,
+                w2_weight_ptrs,
+                w2_scale_ptrs,
+            )
+            # MXFP4 Stream-TopN writers use an independent FIFO and a small
+            # dedicated WorkerPool. Other backends keep their historical queue
+            # because they do not expose the pool-aware writer contract.
+            writer_cpu_infer = (
+                self.ensure_mxfp4_stream_writer()
+                if str(self.method).upper() == "MXFP4"
+                and self._reserve_stream_writer_threads
+                else self.cpu_infer
+            )
+            writer_cpu_infer.submit(task)
+            pending = getattr(self, "_pending_writer_completions", None)
+            if pending is None:
+                pending = []
+                self._pending_writer_completions = pending
+            pending.append(completion)
+            return completion
+
+        writer_cpu_infer = (
+            self.ensure_mxfp4_stream_writer()
+            if str(self.method).upper() == "MXFP4"
+            and self._reserve_stream_writer_threads
+            else self.cpu_infer
+        )
+        writer_cpu_infer.submit(
+            legacy_task(
                 gpu_tp_count,
                 expert_id,
                 w13_weight_ptrs,
@@ -1550,13 +1590,56 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 w2_scale_ptrs,
             )
         )
+        return None
 
-    def sync_write_weight_scale_to_buffer(self):
+    def ensure_mxfp4_stream_writer(self):
+        """Create and validate the independent MXFP4 writer executor."""
+
+        if str(self.method).upper() != "MXFP4":
+            raise RuntimeError("independent streamed writer requires MXFP4")
+        if not self._reserve_stream_writer_threads:
+            raise RuntimeError(
+                "MXFP4 wrapper was not initialized with a reserved stream "
+                "writer thread"
+            )
+        if self.moe is None or not getattr(
+            self.moe, "_kt_pool_aware_writer", False
+        ):
+            raise RuntimeError(
+                "the selected MXFP4 CPU backend lacks pool-aware writer support"
+            )
+        return self._ensure_writer_cpu_infer()
+
+    def sync_write_weight_scale_to_buffer(self, completion=None):
         """
-        Block until previously submitted write_weight_scale_to_buffer tasks finish.
+        Block until a submitted write task finishes.
+
+        New extensions return a task-specific completion from
+        :meth:`submit_write_weight_scale_to_buffer`; waiting on it does not
+        drain writer or inference tasks submitted later.  Older extensions
+        return ``None`` and retain the legacy whole-queue synchronization.
         """
-        # The CPUInfer.sync() call blocks until pending tasks complete.
-        self.cpu_infer.sync()
+        pending = getattr(self, "_pending_writer_completions", None)
+        if completion is None and pending:
+            completion = pending.pop(0)
+        elif completion is not None and pending:
+            try:
+                pending.remove(completion)
+            except ValueError:
+                pass
+
+        if completion is not None:
+            completion.wait()
+            return
+
+        # Compatibility path for extensions without tracked writer tasks.
+        writer_cpu_infer = (
+            self.ensure_mxfp4_stream_writer()
+            if str(self.method).upper() == "MXFP4"
+            and self._reserve_stream_writer_threads
+            else self.cpu_infer
+        )
+        writer_cpu_infer.sync()
 
     def run_layerwise_fp8_batch(
         self,
