@@ -204,7 +204,7 @@ transferred, and lower-ranked experts are not backfilled.
 - 当前窗口不同 active experts 少于 `N_stream` 时，使用 `min(N_stream, unique_active_experts)`。
 - `decayed-lfu` 要求 `C > 0`。
 - 该参数只在 `--kt-expert-placement-strategy decayed-lfu` 下生效；其他 placement strategy 下显式配置时启动失败，避免无声忽略。
-- 推荐从 `1～4` 起步；更大的值会在默认双 staging 上串行更多 candidate，可能逐渐退化为权重 streaming，但允许用户在 `N_stream <= C` 范围内显式实验。
+- 推荐从 `1～4` 起步；V1.1 的 Top-N 统计允许 `N_stream <= C`，但当前窗口实际 GPU streaming 受双 staging 限制为前 2 个 missing candidates，其余仍由主 CPU task 计算。
 
 建议的首版内部默认值，而非性能承诺：
 
@@ -939,16 +939,16 @@ EXEC_DONE
 optional persistent install or FREE
 ```
 
-双 staging 的目标是流水化，而不是等待全部 `P` 一次性完成：
+V1.1 双 staging 的目标是让当前窗口前两个 missing candidates 尽早进入 GPU，而不是把更多候选排到 CPU GEMM 后形成串行尾部：
 
 ```text
 staging 0: candidate 1 GPU wave 2
 staging 1: candidate 2 H2D/repack
-candidate 1 consumed -> unpublished install D2D 或 FREE
-staging 0 复用给 candidate 3
+candidate 1/2 consumed -> unpublished install D2D 或 FREE
+candidate 3 及以后 -> 本窗口保持 CPU_CLAIMED
 ```
 
-ready queue 的规则是“有一个可算一个；若多个 candidate 已同时 ready，则合成一个小 grouped GEMM”。`ready_group_size` 不得超过当前 staging pool depth；默认双 staging 时 ready group 为 1～2 个，超过 2 个的 candidates 通过复用 staging 依次完成。禁止为了凑齐全部 `P` 人为增加 barrier。
+ready queue 的规则是“有一个可算一个；若多个 candidate 已同时 ready，则合成一个小 grouped GEMM”。`ready_group_size` 不得超过当前 staging pool depth；默认双 staging 时当前窗口 ready group 为 1～2 个。超过 2 个的 hot candidates 不在本轮复用 staging，而是保留在主 CPU task。未来具备独立 writer pool 后再恢复滚动复用。
 
 host 与 GPU staging 分别复用：host slot 在所有 TP ranks 完成该 shard H2D 并 release consensus 后即可复用；GPU raw/prepared slot 必须继续保留到最后一个读取权重的 wave 2 kernel 结束，并在需要 persistent install 时继续保留到 install D2D 完成。
 
@@ -1574,7 +1574,7 @@ Phase 5A 只能缓解饥饿；它要求旧 decode 全部 quiesce 后才能发布
 18. 参数边界：默认 `None -> min(4, C)`；显式 `0`、`1`、`C` 正常，负数或大于 `C` 启动失败；静态 strategy 下显式配置启动失败。
 19. `N_stream=0`：继续记录统计，但 stream/promotion loader、H2D、wave 2 和 resident replacement 数量均为 0。
 20. mixed prefill+decode batch 只记录 prefill 统计，stream loader 数量严格为 0，non-resident prefill assignments 全部走普通 CPU-only，而不是 late CPU fallback。
-21. 双 staging + `N_stream>2`：candidate 1 install/free 后 slot 才能复用给 candidate 3，无 buffer 提前覆盖。
+21. 双 staging + `N_stream>2`：只有前两个 missing candidates 获得当前窗口 GPU ownership；candidate 3 及以后保持 CPU ownership，不创建延迟 writer，三路 assignment 仍严格互斥且完整。
 22. 各 TP rank 的本地 ready 顺序不同，collective 仍按统一 candidate order 执行且不死锁。
 23. candidate 已 `CPU_CLAIMED`、但 loader 后续成功时，可以不等待 consumed event 而执行 persistent install。
 24. 主 CPU-only task 与 late fallback 使用独立 buffer，输出不互相覆盖。
