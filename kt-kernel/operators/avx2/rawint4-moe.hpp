@@ -10,6 +10,8 @@
 #ifndef CPUINFER_OPERATOR_AVX2_RAW_INT4_MOE_H
 #define CPUINFER_OPERATOR_AVX2_RAW_INT4_MOE_H
 
+#include <limits>
+
 #include "avx2_bf16_gemm.hpp"
 #include "avx2_bf16_utils.hpp"
 #include "gptq_int4_dequant.hpp"
@@ -86,8 +88,8 @@ struct GemmKernelAVX2RawInt4 {
       d = (float*)((uint8_t*)ptr + ((size_t)n * k / 2));
     }
 
-    // Scale-only allocation: b points to external (mmap'd) weight data; d owns scale_ptr.
-    // Used when weights are consumed directly from safetensor mmap without copying.
+    // Scale-only allocation: d owns scale_ptr; the backend assigns b to a
+    // separately owned packed-weight buffer after loading.
     BufferB(int n_, int k_, int k_group_size_, void* scale_ptr, std::nullptr_t /*scale_only*/)
         : b(nullptr), n(n_), k(k_), k_group_size(k_group_size_) {
       if (k_group_size <= 0 || k % k_group_size != 0 || k % 8 != 0) {
@@ -102,13 +104,13 @@ struct GemmKernelAVX2RawInt4 {
       return n * k / 2 + n * (k / k_group_size) * sizeof(float);
     }
 
-    // Scale-only size: only float32 scales (b will point to external weight data).
+    // Scale-only size: only float32 scales (packed weights are owned separately).
     static size_t required_size_scale_only(size_t n, size_t k, int k_group_size) {
       return n * (k / k_group_size) * sizeof(float);
     }
 
     void from_raw_mat(const uint8_t* proj, int ith, int nth) {
-      if (b == nullptr) return;  // scale-only mode: b is an external pointer set later
+      if (b == nullptr) return;  // scale-only mode: b is assigned after loading
       auto [n_start, n_end] = split_range_n(n, ith, nth);
       const size_t row_bytes = (size_t)k / 2;
       std::memcpy(b + (size_t)n_start * row_bytes, proj + (size_t)n_start * row_bytes,
@@ -239,6 +241,13 @@ class AVX2_RAW_INT4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_RAW_INT4_MOE_TP<T>> {
   using Base::up_bb_;
   using Base::up_bc_;
 
+  // Per-expert safetensor sources are mmap-backed. Keep packed copies only
+  // for experts owned by this CPU backend so BufferB never outlives its data
+  // without allocating another image for GPU-resident experts.
+  std::unique_ptr<uint8_t[]> owned_gate_weights_;
+  std::unique_ptr<uint8_t[]> owned_up_weights_;
+  std::unique_ptr<uint8_t[]> owned_down_weights_;
+
  public:
   using typename Base::input_t;
   using typename Base::output_t;
@@ -258,8 +267,8 @@ class AVX2_RAW_INT4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_RAW_INT4_MOE_TP<T>> {
     return T::BufferA::required_size(m, k, config_.quant_config.group_size);
   }
   size_t buffer_b_required_size_impl(size_t n, size_t k) const {
-    // When per-expert source pointers are available, only allocate float32 scales.
-    // Weights will be served directly from the mmap'd safetensor data (no copy).
+    // Per-expert mode owns packed weights separately and keeps only converted
+    // FP32 scales in BufferB. Flat-buffer mode retains the full allocation.
     if (!config_.gate_projs.empty()) {
       return T::BufferB::required_size_scale_only(n, k, config_.quant_config.group_size);
     }
@@ -271,7 +280,6 @@ class AVX2_RAW_INT4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_RAW_INT4_MOE_TP<T>> {
     return std::make_shared<typename T::BufferA>(m, k, config_.quant_config.group_size, data);
   }
   std::shared_ptr<typename T::BufferB> make_buffer_b_impl(size_t n, size_t k, void* data) const {
-    // Scale-only mode: b is nullptr here; set externally in load_weights().
     if (!config_.gate_projs.empty()) {
       return std::make_shared<typename T::BufferB>((int)n, (int)k, config_.quant_config.group_size, data, nullptr);
     }
@@ -308,46 +316,82 @@ class AVX2_RAW_INT4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_RAW_INT4_MOE_TP<T>> {
     }
 
     if (use_per_expert) {
-      // Direct-pointer mode: BufferB.b is set to point into the mmap'd safetensor data
-      // (no weight copy). Only float32 scales are allocated and converted.
+      // Copy mmap-backed per-expert tensors into BufferB's NUMA-owned storage
+      // before Python drops the source tensors and closes the mmap.
       //
-      // For gate/up: source shape [intermediate_size_full, hidden_size/2] row-major.
-      //   TP partition tp_part_idx handles rows [tp_part_idx * n_per_tp, (tp_part_idx+1) * n_per_tp).
-      //   These are contiguous in memory → simple byte offset: tp_part_idx * n_per_tp * (k/2).
-      //   With kt_threadpool_count=1 (tp_part_idx=0): offset = 0.
-      //
-      // For down: source shape [hidden_size, intermediate_size_full/2] row-major.
-      //   TP partition tp_part_idx handles columns [tp_part_idx * n_per_tp/2, ...) per row.
-      //   These are NOT contiguous across rows for tp_count > 1.
-      //   This mode therefore requires kt_threadpool_count=1 (enforced in outer TP wrapper).
+      // The outer TP wrapper restricts this source layout to one subpool, so
+      // each gate/up/down tensor is already the exact local matrix to copy.
+      const size_t packed_weight_bytes =
+          (size_t)config_.intermediate_size * config_.hidden_size / 2;
+      const size_t no_slot = std::numeric_limits<size_t>::max();
+      std::vector<uint64_t> logical_expert_ids(config_.expert_num, 0);
+      std::vector<size_t> owned_slots(config_.expert_num, no_slot);
+      size_t owned_expert_count = 0;
+
+      if (config_.gate_projs.empty() || config_.up_projs.empty() || config_.down_projs.empty() ||
+          config_.gate_scales.empty() || config_.up_scales.empty() || config_.down_scales.empty()) {
+        throw std::runtime_error("RAWINT4 AVX2 per-expert loading requires all weight and scale pointer arrays");
+      }
+      for (int expert_idx = 0; expert_idx < config_.expert_num; expert_idx++) {
+        uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
+        if (logical_expert_id >= config_.gate_projs[0].size() ||
+            logical_expert_id >= config_.up_projs[0].size() ||
+            logical_expert_id >= config_.down_projs[0].size() ||
+            logical_expert_id >= config_.gate_scales[0].size() ||
+            logical_expert_id >= config_.up_scales[0].size() ||
+            logical_expert_id >= config_.down_scales[0].size()) {
+          throw std::runtime_error("RAWINT4 AVX2 logical expert id out of bounds: " +
+                                   std::to_string(logical_expert_id));
+        }
+        logical_expert_ids[expert_idx] = logical_expert_id;
+        if (config_.should_skip_expert(logical_expert_id)) continue;
+        if (config_.gate_projs[0][logical_expert_id] == nullptr ||
+            config_.up_projs[0][logical_expert_id] == nullptr ||
+            config_.down_projs[0][logical_expert_id] == nullptr ||
+            config_.gate_scales[0][logical_expert_id] == nullptr ||
+            config_.up_scales[0][logical_expert_id] == nullptr ||
+            config_.down_scales[0][logical_expert_id] == nullptr) {
+          throw std::runtime_error("RAWINT4 AVX2 received a null expert source pointer for expert " +
+                                   std::to_string(logical_expert_id));
+        }
+        owned_slots[expert_idx] = owned_expert_count++;
+      }
+      if (owned_expert_count != 0 &&
+          packed_weight_bytes > std::numeric_limits<size_t>::max() / owned_expert_count) {
+        throw std::overflow_error("RAWINT4 AVX2 packed expert allocation size overflow");
+      }
+      const size_t owned_weight_bytes = owned_expert_count * packed_weight_bytes;
+      std::unique_ptr<uint8_t[]> new_gate_weights(
+          owned_weight_bytes ? new uint8_t[owned_weight_bytes] : nullptr);
+      std::unique_ptr<uint8_t[]> new_up_weights(
+          owned_weight_bytes ? new uint8_t[owned_weight_bytes] : nullptr);
+      std::unique_ptr<uint8_t[]> new_down_weights(
+          owned_weight_bytes ? new uint8_t[owned_weight_bytes] : nullptr);
+
       pool->do_work_stealing_job(
           config_.expert_num, nullptr,
-          [this, physical_to_logical_map](int expert_idx) {
-            if (expert_idx < 0 || expert_idx >= config_.expert_num || gate_bb_[expert_idx] == nullptr ||
-                up_bb_[expert_idx] == nullptr || down_bb_[expert_idx] == nullptr) {
-              return;
-            }
-            uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
-            // Gate/Up row offset for this TP partition (bytes).
-            size_t gate_tp_byte_offset = (size_t)tp_part_idx * config_.intermediate_size * config_.hidden_size / 2;
-            gate_bb_[expert_idx]->b = (uint8_t*)config_.gate_projs[0][logical_expert_id] + gate_tp_byte_offset;
-            up_bb_[expert_idx]->b = (uint8_t*)config_.up_projs[0][logical_expert_id] + gate_tp_byte_offset;
-            // Down column offset (bytes per row start). Correct only for tp_count=1.
-            size_t down_tp_byte_offset = (size_t)tp_part_idx * config_.intermediate_size / 2;
-            down_bb_[expert_idx]->b = (uint8_t*)config_.down_projs[0][logical_expert_id] + down_tp_byte_offset;
+          [this, packed_weight_bytes, no_slot, &logical_expert_ids, &owned_slots, &new_gate_weights,
+           &new_up_weights, &new_down_weights](int expert_idx) {
+            const size_t slot = owned_slots[expert_idx];
+            if (slot == no_slot) return;
+            const uint64_t logical_expert_id = logical_expert_ids[expert_idx];
+            const size_t dst_offset = slot * packed_weight_bytes;
+            std::memcpy(new_gate_weights.get() + dst_offset, config_.gate_projs[0][logical_expert_id],
+                        packed_weight_bytes);
+            std::memcpy(new_up_weights.get() + dst_offset, config_.up_projs[0][logical_expert_id],
+                        packed_weight_bytes);
+            std::memcpy(new_down_weights.get() + dst_offset, config_.down_projs[0][logical_expert_id],
+                        packed_weight_bytes);
           },
           nullptr);
 
       // Scale conversion: BF16 → float32.
       pool->do_work_stealing_job(
           config_.expert_num, nullptr,
-          [this, physical_to_logical_map, group_size](int task_id) {
-            uint64_t expert_idx = task_id;
-            if (expert_idx >= (uint64_t)config_.expert_num || gate_bb_[expert_idx] == nullptr ||
-                up_bb_[expert_idx] == nullptr || down_bb_[expert_idx] == nullptr) {
-              return;
-            }
-            uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
+          [this, group_size, no_slot, &logical_expert_ids, &owned_slots](int task_id) {
+            const size_t expert_idx = (size_t)task_id;
+            if (owned_slots[expert_idx] == no_slot) return;
+            const uint64_t logical_expert_id = logical_expert_ids[expert_idx];
             size_t scale_elem_count = ((size_t)config_.hidden_size * config_.intermediate_size) / group_size;
             // Gate/Up scale offset: rows [tp_part_idx * n_per_tp, ...) of scale[n_total, k/gs].
             size_t gate_scale_tp_offset =
@@ -365,6 +409,26 @@ class AVX2_RAW_INT4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_RAW_INT4_MOE_TP<T>> {
                             scale_elem_count);
           },
           nullptr);
+
+      // Publish only after source validation, packed copies, and scale
+      // conversion complete. Repeated loads replace the prior image and
+      // rebind every BufferB, including skipped experts (nullptr).
+      owned_gate_weights_.swap(new_gate_weights);
+      owned_up_weights_.swap(new_up_weights);
+      owned_down_weights_.swap(new_down_weights);
+      for (int expert_idx = 0; expert_idx < config_.expert_num; expert_idx++) {
+        const size_t slot = owned_slots[expert_idx];
+        if (slot == no_slot) {
+          gate_bb_[expert_idx]->b = nullptr;
+          up_bb_[expert_idx]->b = nullptr;
+          down_bb_[expert_idx]->b = nullptr;
+          continue;
+        }
+        const size_t offset = slot * packed_weight_bytes;
+        gate_bb_[expert_idx]->b = owned_gate_weights_.get() + offset;
+        up_bb_[expert_idx]->b = owned_up_weights_.get() + offset;
+        down_bb_[expert_idx]->b = owned_down_weights_.get() + offset;
+      }
     } else {
       // Flat-buffer mode: copy TP-sliced weights from flat buffer into allocated BufferB.b.
       int nth = T::recommended_nth(config_.intermediate_size);
@@ -576,15 +640,20 @@ class TP_MOE<AVX2_RAW_INT4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_RAW_
     }
 
     if (use_per_expert_ptrs) {
-      // Direct-pointer mode: inner load_weights() sets BufferB.b directly from mmap'd data.
-      // The down projection column-gather required for tp_count > 1 is NOT supported in
-      // this mode; enforce single NUMA pool (kt_threadpool_count=1).
+      // Inner load_weights() copies the mmap-backed tensors into its owned
+      // BufferB. The down-projection gather needed for tp_count > 1 is still
+      // unsupported for this source layout, so enforce one NUMA subpool.
       if (this->tp_count > 1) {
         throw std::runtime_error(
-            "RAWINT4 per-expert pointer mode requires kt_threadpool_count=1 "
-            "(down projection TP column-gather is unsupported with direct pointers)");
+            "RAWINT4 per-expert source mode requires kt_threadpool_count=1 "
+            "(down projection TP column-gather is not implemented)");
       }
-      DO_TPS_LOAD_WEIGHTS(pool);
+      // Invoke the only TP part directly from the CPUInfer task thread. The
+      // inner loader still parallelizes memcpy/scale conversion on subpool 0,
+      // but validation and compact-blob allocation exceptions now propagate to
+      // TaskQueue::sync() instead of escaping a NUMA distributor worker.
+      tps[0]->config_.physical_to_logical_map = config.physical_to_logical_map;
+      tps[0]->load_weights();
     } else {
       // Flat-buffer mode: build a TP-sliced contiguous buffer per TP partition, then
       // call inner load_weights() which copies into BufferB.b from the flat buffer.

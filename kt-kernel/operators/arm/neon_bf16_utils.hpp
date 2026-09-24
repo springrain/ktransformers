@@ -152,6 +152,29 @@ static inline v8f32 exp_neon(v8f32 x) {
   return mul_v8f32(two_pow_i, frac_exp);
 }
 
+static inline v8f32 tanh_neon(v8f32 x) {
+  const v8f32 bound = set1_v8f32(44.0f);
+  x = min_v8f32(max_v8f32(x, set1_v8f32(-44.0f)), bound);
+  const v8f32 exp_2x = exp_neon(add_v8f32(x, x));
+  return div_v8f32(sub_v8f32(exp_2x, set1_v8f32(1.0f)), add_v8f32(exp_2x, set1_v8f32(1.0f)));
+}
+
+// SiTU (SoftCap-GLU), kept distinct from SwiGLU-OAI.
+static inline v8f32 situ_fn(v8f32 gate_val, v8f32 up_val, float beta, float linear_beta) {
+  const v8f32 one = set1_v8f32(1.0f);
+  const v8f32 beta_v = set1_v8f32(beta);
+  const v8f32 gate_softcap = mul_v8f32(beta_v, tanh_neon(div_v8f32(gate_val, beta_v)));
+  v8f32 neg_gate = sub_v8f32(zero_v8f32(), gate_val);
+  neg_gate = min_v8f32(max_v8f32(neg_gate, set1_v8f32(-88.0f)), set1_v8f32(88.0f));
+  const v8f32 sigmoid_gate = div_v8f32(one, add_v8f32(one, exp_neon(neg_gate)));
+  v8f32 up_softcap = up_val;
+  if (linear_beta > 0.0f) {
+    const v8f32 linear_beta_v = set1_v8f32(linear_beta);
+    up_softcap = mul_v8f32(linear_beta_v, tanh_neon(div_v8f32(up_val, linear_beta_v)));
+  }
+  return mul_v8f32(mul_v8f32(gate_softcap, sigmoid_gate), up_softcap);
+}
+
 // ============================================================================
 // SiLU activation: silu(gate) * up = gate * sigmoid(gate) * up
 // NEON port of avx2::act_fn
@@ -184,7 +207,7 @@ static inline v8f32 act_fn(v8f32 gate_val, v8f32 up_val, float swiglu_limit) {
 }
 
 // "swigluoai" (alpha > 0) / "silu" (alpha == 0) unified entry point.
-//   alpha > 0  -> gate * sigmoid(gate * alpha) * (up + 1), symmetric clamp on both
+//   alpha > 0  -> gate * sigmoid(gate * alpha) * (up + 1), upper-only gate clamp
 //   alpha == 0 -> falls back to silu (with optional one-sided clamp)
 // Mirrors avx2::act_fn(g, u, swiglu_limit, swiglu_alpha).
 static inline v8f32 act_fn(v8f32 gate_val, v8f32 up_val, float swiglu_limit, float swiglu_alpha) {
@@ -193,7 +216,6 @@ static inline v8f32 act_fn(v8f32 gate_val, v8f32 up_val, float swiglu_limit, flo
       v8f32 pos_lim = set1_v8f32(swiglu_limit);
       v8f32 neg_lim = set1_v8f32(-swiglu_limit);
       gate_val = min_v8f32(gate_val, pos_lim);
-      gate_val = max_v8f32(gate_val, neg_lim);
       up_val = min_v8f32(up_val, pos_lim);
       up_val = max_v8f32(up_val, neg_lim);
     }

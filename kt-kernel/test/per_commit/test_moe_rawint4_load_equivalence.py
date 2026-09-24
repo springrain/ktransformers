@@ -119,9 +119,9 @@ def build_flat_moe(backend_cls, cpu_infer, w, p2l_map):
 def build_per_expert_moe(backend_cls, cpu_infer, w, p2l_map):
     """Load through per-expert pointers, each expert in its own storage.
 
-    Returns the MoE instance and the per-expert tensors, which the caller must
-    keep alive while the instance is used (the AVX2 backend serves weights
-    directly from these buffers).
+    Returns the MoE instance and its per-expert source tensors. Native backends
+    must copy these sources during load, so mutating or releasing them after
+    ``sync()`` must not affect inference.
     """
     holders = []
     config = base_config(cpu_infer.backend_)
@@ -180,6 +180,12 @@ def check_per_expert_matches_flat(backend_name, backend_cls, subpool_count):
     moe_flat = build_flat_moe(backend_cls, cpu_infer, w, p2l_map)
     moe_pe, holders = build_per_expert_moe(backend_cls, cpu_infer, w, p2l_map)
 
+    # Prove the backend owns the loaded data. This catches direct pointers into
+    # Python tensors (or safetensors mmap regions), which become dangling when
+    # NativeMoEWrapper closes each layer's loader handles.
+    for source in holders:
+        source.zero_()
+
     for qlen in (1, 16):
         out_flat = run_forward(cpu_infer, moe_flat, qlen, seed=qlen)
         out_pe = run_forward(cpu_infer, moe_pe, qlen, seed=qlen)
@@ -209,7 +215,7 @@ def test_avx2_per_expert_load_matches_flat():
     if backend_cls is None:
         print("Skipping: AVX2RawInt4_MOE not available")
         return
-    # The AVX2 per-expert (direct pointer) mode requires a single subpool.
+    # The AVX2 per-expert source layout requires a single subpool.
     check_per_expert_matches_flat("AVX2RawInt4_MOE", backend_cls, subpool_count=1)
 
 

@@ -1,204 +1,163 @@
-"""Tests for NativeMoEWrapper layerwise mmap-release mechanism.
+"""Tests for the NativeMoEWrapper shared-index loader lifecycle.
 
-Verifies that the SafeTensor loader singleton (_native_loader_instance) is
-released after EACH layer's load_weights() completes (not just after all layers),
-and that the loader is recreated on demand for the next layer.
-
-These tests use mocking so they can run without actual safetensors files or
-compiled kt_kernel_ext binaries.
+The production wrapper keeps one immutable key-to-shard index across layers,
+while closing only the mmap handle cache after each layer. These lightweight
+tests model that lifecycle without importing the compiled kt_kernel extension.
 """
 
-import sys
-import os
-import types
 import unittest
-from unittest.mock import MagicMock, patch
 
 
 class MockLoader:
-    """Minimal mock SafeTensorLoader."""
+    _create_count = 0
 
-    _create_count = 0  # Track how many times a loader was created
-
-    def __init__(self):
+    def __init__(self, cache_key):
         MockLoader._create_count += 1
-        self.closed = False
+        self.cache_key = cache_key
         self.file_handle_map = {"dummy.safetensors": object()}
+        self.tensor_file_map = {"expert.weight": "dummy.safetensors"}
+        self.close_count = 0
 
-    def close_all_handles(self):
-        self.closed = True
+    def close_all_handles(self, *, collect=True):
+        del collect
+        self.close_count += 1
         self.file_handle_map.clear()
+
+    def clear_index(self):
+        self.close_all_handles(collect=False)
+        self.tensor_file_map.clear()
 
 
 class FakeNativeMoEWrapper:
-    """
-    A simplified replica of NativeMoEWrapper that isolates the
-    layerwise-release + recreate logic without requiring kt_kernel_ext.
-    """
+    """Small replica of the shared-index / lazy-handle lifecycle."""
 
     _native_loader_instance = None
-    # Simulate _create_loader: returns a fresh MockLoader each time
+    _native_loader_key = None
     _create_loader_calls = 0
 
-    def __init__(self, layer_idx=0):
+    def __init__(self, layer_idx=0, method="MXFP4", weight_path="/fake/path"):
         self.layer_idx = layer_idx
-        self.method = "FP8"
-        self.weight_path = "/fake/path"
+        self.method = method
+        self.weight_path = weight_path
+        self._loader_key = (method, weight_path)
+        self.loader = self._ensure_loader(method, weight_path)
 
-    def _ensure_loader(self):
-        """Simulate the loader-recreate logic at the start of load_weights."""
-        if FakeNativeMoEWrapper._native_loader_instance is None:
-            FakeNativeMoEWrapper._create_loader_calls += 1
-            FakeNativeMoEWrapper._native_loader_instance = MockLoader()
-        self.loader = FakeNativeMoEWrapper._native_loader_instance
+    @classmethod
+    def _ensure_loader(cls, method, weight_path):
+        key = (method, weight_path)
+        if cls._native_loader_instance is None or cls._native_loader_key != key:
+            if cls._native_loader_instance is not None:
+                cls._native_loader_instance.close_all_handles(collect=False)
+            cls._create_loader_calls += 1
+            cls._native_loader_instance = MockLoader(key)
+            cls._native_loader_key = key
+        return cls._native_loader_instance
 
     def load_weights(self):
-        """Simulate load_weights: ensure loader -> do work -> release loader."""
-        self._ensure_loader()
-        # Simulate: C++ sync + del Python tensors -> release
-        FakeNativeMoEWrapper._release_loader(layer_idx=self.layer_idx)
+        if not self.loader.tensor_file_map:
+            self.loader = self._ensure_loader(self.method, self.weight_path)
+        # Simulate lazily reopening the shard needed by this layer.
+        self.loader.file_handle_map["dummy.safetensors"] = object()
+        self._release_loader(layer_idx=self.layer_idx, loader=self.loader)
 
-    @staticmethod
-    def _release_loader(layer_idx=-1):
-        if FakeNativeMoEWrapper._native_loader_instance is not None:
-            FakeNativeMoEWrapper._native_loader_instance.close_all_handles()
-            FakeNativeMoEWrapper._native_loader_instance = None
+    @classmethod
+    def _release_loader(cls, layer_idx=-1, *, drop_index=False, loader=None):
+        del layer_idx
+        target = loader or cls._native_loader_instance
+        if target is None:
+            return
+        if drop_index:
+            target.clear_index()
+            if target is cls._native_loader_instance:
+                cls._native_loader_instance = None
+                cls._native_loader_key = None
+        else:
+            target.close_all_handles(collect=False)
 
-    @staticmethod
-    def force_release_loader():
-        FakeNativeMoEWrapper._release_loader()
+    @classmethod
+    def force_release_loader(cls):
+        cls._release_loader(drop_index=True)
 
 
 def _reset_state():
-    """Reset all test state between tests."""
     FakeNativeMoEWrapper._native_loader_instance = None
+    FakeNativeMoEWrapper._native_loader_key = None
     FakeNativeMoEWrapper._create_loader_calls = 0
     MockLoader._create_count = 0
 
 
-# ---------------------------------------------------------------------------
-# Test cases
-# ---------------------------------------------------------------------------
-
-class TestLayerwiseRelease(unittest.TestCase):
-    """Each layer's load_weights() should release the loader afterwards."""
-
+class TestSharedIndexLifecycle(unittest.TestCase):
     def setUp(self):
         _reset_state()
 
-    def test_single_layer_released_after_load(self):
-        w = FakeNativeMoEWrapper(layer_idx=0)
-        w.load_weights()
-        self.assertIsNone(FakeNativeMoEWrapper._native_loader_instance,
-                          "Loader should be None after single layer loads")
+    def test_layer_closes_handles_but_retains_index(self):
+        wrapper = FakeNativeMoEWrapper(layer_idx=0)
+        loader = wrapper.loader
+        index_id = id(loader.tensor_file_map)
 
-    def test_each_layer_releases_loader(self):
-        """After every layer's load_weights(), the loader should be None."""
-        for i in range(5):
-            w = FakeNativeMoEWrapper(layer_idx=i)
-            w.load_weights()
-            self.assertIsNone(
-                FakeNativeMoEWrapper._native_loader_instance,
-                f"Loader should be None after layer {i} loads",
-            )
+        wrapper.load_weights()
 
-    def test_loader_recreated_for_each_layer(self):
-        """Each layer should trigger a loader recreation (since previous layer released it)."""
-        N = 4
-        for i in range(N):
-            w = FakeNativeMoEWrapper(layer_idx=i)
-            w.load_weights()
-
-        # First layer uses the initial loader; layers 1..N-1 recreate it
-        # Total recreations = N - 1 (layer 0 doesn't recreate if loader pre-existed,
-        # but in this test the loader starts as None so all N layers recreate)
+        self.assertIs(FakeNativeMoEWrapper._native_loader_instance, loader)
+        self.assertEqual(loader.file_handle_map, {})
         self.assertEqual(
-            FakeNativeMoEWrapper._create_loader_calls, N,
-            f"Expected {N} loader recreations for {N} layers, "
-            f"got {FakeNativeMoEWrapper._create_loader_calls}",
+            loader.tensor_file_map, {"expert.weight": "dummy.safetensors"}
         )
+        self.assertEqual(id(loader.tensor_file_map), index_id)
 
+    def test_all_layers_share_one_loader_and_one_index(self):
+        loaders = []
+        index_ids = []
+        for layer_idx in range(5):
+            wrapper = FakeNativeMoEWrapper(layer_idx=layer_idx)
+            loaders.append(wrapper.loader)
+            index_ids.append(id(wrapper.loader.tensor_file_map))
+            wrapper.load_weights()
 
-class TestLoaderRecreate(unittest.TestCase):
-    """Loader should be recreated when _native_loader_instance is None."""
+        self.assertTrue(all(loader is loaders[0] for loader in loaders))
+        self.assertEqual(len(set(index_ids)), 1)
+        self.assertEqual(FakeNativeMoEWrapper._create_loader_calls, 1)
+        self.assertEqual(loaders[0].close_count, 5)
 
-    def setUp(self):
-        _reset_state()
+    def test_different_checkpoint_gets_a_different_loader(self):
+        first = FakeNativeMoEWrapper(weight_path="/model/a").loader
+        second = FakeNativeMoEWrapper(weight_path="/model/b").loader
 
-    def test_first_layer_creates_loader(self):
-        w = FakeNativeMoEWrapper(layer_idx=0)
-        w.load_weights()
-        # Loader was created (then released), but the creation happened
-        self.assertGreater(FakeNativeMoEWrapper._create_loader_calls, 0)
-
-    def test_second_layer_recreates_after_first_released(self):
-        w0 = FakeNativeMoEWrapper(layer_idx=0)
-        w0.load_weights()
-        self.assertIsNone(FakeNativeMoEWrapper._native_loader_instance)
-
-        w1 = FakeNativeMoEWrapper(layer_idx=1)
-        w1.load_weights()
-        # Second layer should have recreated the loader
-        self.assertEqual(FakeNativeMoEWrapper._create_loader_calls, 2,
-                         "Both layers should recreate the loader")
-
-    def test_pre_existing_loader_not_recreated(self):
-        """If loader already exists (e.g., from __init__), it should not be recreated."""
-        loader = MockLoader()
-        FakeNativeMoEWrapper._native_loader_instance = loader
-        initial_create_calls = FakeNativeMoEWrapper._create_loader_calls
-
-        w = FakeNativeMoEWrapper(layer_idx=0)
-        w._ensure_loader()
-        # No new creation should happen
-        self.assertEqual(FakeNativeMoEWrapper._create_loader_calls, initial_create_calls)
-        self.assertIs(w.loader, loader)
+        self.assertIsNot(first, second)
+        self.assertEqual(FakeNativeMoEWrapper._create_loader_calls, 2)
+        self.assertEqual(
+            first.tensor_file_map, {"expert.weight": "dummy.safetensors"}
+        )
+        self.assertEqual(first.file_handle_map, {})
 
 
 class TestForceReleaseLoader(unittest.TestCase):
-    """force_release_loader() should work at any time."""
-
     def setUp(self):
         _reset_state()
 
-    def test_force_release_before_any_load(self):
-        loader = MockLoader()
-        FakeNativeMoEWrapper._native_loader_instance = loader
+    def test_force_release_drops_handles_and_index(self):
+        loader = FakeNativeMoEWrapper(layer_idx=0).loader
 
         FakeNativeMoEWrapper.force_release_loader()
 
         self.assertIsNone(FakeNativeMoEWrapper._native_loader_instance)
-        self.assertTrue(loader.closed)
+        self.assertIsNone(FakeNativeMoEWrapper._native_loader_key)
+        self.assertEqual(loader.file_handle_map, {})
+        self.assertEqual(loader.tensor_file_map, {})
+
+    def test_next_layer_recreates_after_force_release(self):
+        first_wrapper = FakeNativeMoEWrapper(layer_idx=0)
+        first_loader = first_wrapper.loader
+        FakeNativeMoEWrapper.force_release_loader()
+
+        second_wrapper = FakeNativeMoEWrapper(layer_idx=1)
+
+        self.assertIsNot(second_wrapper.loader, first_loader)
+        self.assertEqual(FakeNativeMoEWrapper._create_loader_calls, 2)
 
     def test_force_release_when_loader_is_none(self):
-        """force_release_loader() should be safe even if loader is already None."""
-        FakeNativeMoEWrapper._native_loader_instance = None
         FakeNativeMoEWrapper.force_release_loader()
         self.assertIsNone(FakeNativeMoEWrapper._native_loader_instance)
 
-    def test_force_release_mid_loading(self):
-        loader = MockLoader()
-        FakeNativeMoEWrapper._native_loader_instance = loader
-
-        # Load first layer
-        w0 = FakeNativeMoEWrapper(layer_idx=0)
-        w0.load_weights()
-        # Loader is now released (each layer releases it)
-
-        # Set a new loader manually
-        loader2 = MockLoader()
-        FakeNativeMoEWrapper._native_loader_instance = loader2
-
-        # Force release before next load
-        FakeNativeMoEWrapper.force_release_loader()
-
-        self.assertIsNone(FakeNativeMoEWrapper._native_loader_instance)
-        self.assertTrue(loader2.closed)
-
-
-# ---------------------------------------------------------------------------
-# Run directly
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

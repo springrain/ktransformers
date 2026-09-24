@@ -227,6 +227,15 @@ struct QuantConfig {
   bool per_channel = false;  // Per-channel quantization (GLM-4.7-FP8 style)
 };
 
+enum MoeActivationType : int {
+  // Preserve the pre-contract behavior for low-level C++ callers: alpha > 0
+  // selects SwiGLU-OAI, otherwise the existing SiLU/clamp path is used.
+  MOE_ACTIVATION_AUTO = -1,
+  MOE_ACTIVATION_SILU = 0,
+  MOE_ACTIVATION_SWIGLU_OAI = 1,
+  MOE_ACTIVATION_SITU = 2,
+};
+
 struct GeneralMOEConfig {
   // Basic Config
   int expert_num;
@@ -308,21 +317,29 @@ struct GeneralMOEConfig {
 
   int max_cache_depth = 1;
 
-  // SwiGLU asymmetric clamp applied to gate/up before silu*up. 0.0f =
-  // disabled (default for all non-MXFP4 paths). Set to e.g. 10.0f for
+  // SwiGLU asymmetric clamp applied to gate/up before the gated activation.
+  // 0.0f = disabled. Set to e.g. 10.0f for
   // DeepSeek V4-Flash 2604B routed experts, matching the trtllm
   // `gemm1_clamp_limit` and the sglang deep_gemm path's
   // `_apply_swiglu_limit`:
   //   gate = clamp(gate, max=limit)            // one-sided (silu input)
   //   up   = clamp(up, min=-limit, max=limit)  // symmetric
-  // Read by `act_fn` in la/amx.hpp; non-zero only for MXFP4 today.
+  // Read by each backend's activation implementation.
   // Origin: kt-sglang 耦合 (carries the V4-2604B limit set by sglang side).
   float swiglu_limit = 0.0f;
 
   // MiniMax M3 "swigluoai" activation: gate * sigmoid(gate * alpha) * (up + 1).
-  // When alpha > 0, act_fn uses the swigluoai formula with symmetric clamp on
-  // both gate and up (±swiglu_limit). 0.0f = disabled (standard silu path).
+  // When alpha > 0, gate is clamped only from above while up is clamped
+  // symmetrically. 0.0f = disabled (standard silu path).
   float swiglu_alpha = 0.0f;
+
+  // Explicit gated-activation contract. Keep SiTU separate from SwiGLU-OAI:
+  //   situ(gate, up) = beta * tanh(gate / beta) * sigmoid(gate)
+  //                    * linear_beta * tanh(up / linear_beta)
+  // `situ_linear_beta <= 0` disables the up softcap and uses `up` directly.
+  int activation_type = MOE_ACTIVATION_AUTO;
+  float situ_beta = 0.0f;
+  float situ_linear_beta = 0.0f;
 
   GeneralMOEConfig() {}
 
@@ -331,6 +348,33 @@ struct GeneralMOEConfig {
         num_experts_per_tok(routed_expert_num),
         hidden_size(hidden_size),
         intermediate_size(intermediate_size) {}
+
+  void validate_activation() const {
+    if (activation_type < MOE_ACTIVATION_AUTO || activation_type > MOE_ACTIVATION_SITU) {
+      throw std::invalid_argument("Unsupported MoE activation_type");
+    }
+    if (!std::isfinite(swiglu_limit) || swiglu_limit < 0.0f) {
+      throw std::invalid_argument("MoE swiglu_limit must be finite and non-negative");
+    }
+    if (!std::isfinite(swiglu_alpha) || swiglu_alpha < 0.0f) {
+      throw std::invalid_argument("MoE swiglu_alpha must be finite and non-negative");
+    }
+    if (activation_type == MOE_ACTIVATION_SWIGLU_OAI && swiglu_alpha <= 0.0f) {
+      throw std::invalid_argument("SwiGLU-OAI requires a finite positive swiglu_alpha");
+    }
+    if (activation_type == MOE_ACTIVATION_SITU) {
+      if (!std::isfinite(situ_beta) || situ_beta <= 0.0f) {
+        throw std::invalid_argument("SiTU requires a finite positive situ_beta");
+      }
+      if (!std::isfinite(situ_linear_beta) || situ_linear_beta < 0.0f) {
+        throw std::invalid_argument("SiTU situ_linear_beta must be finite and non-negative");
+      }
+    }
+  }
+
+  float effective_swiglu_alpha() const {
+    return activation_type == MOE_ACTIVATION_SILU ? 0.0f : swiglu_alpha;
+  }
 
   int max_possible_qlen() { return std::max(max_len, group_max_len); }
 };
@@ -374,7 +418,23 @@ struct MOESFTConfig : public GeneralMOEConfig {
   explicit MOESFTConfig(const GeneralMOEConfig& base) : GeneralMOEConfig(base) {
     // LoRA fields use default values (already initialized in struct definition)
   }
+
+  void validate_sft_activation() const {
+    validate_activation();
+    const bool is_plain_silu =
+        activation_type == MOE_ACTIVATION_AUTO || activation_type == MOE_ACTIVATION_SILU;
+    if (!is_plain_silu || swiglu_alpha != 0.0f || swiglu_limit != 0.0f || situ_beta != 0.0f ||
+        situ_linear_beta != 0.0f) {
+      throw std::invalid_argument(
+          "MoE SFT forward/backward currently supports only plain SiLU activation");
+    }
+  }
 };
+
+inline GeneralMOEConfig make_validated_sft_base_config(const MOESFTConfig& config) {
+  config.validate_sft_activation();
+  return static_cast<const GeneralMOEConfig&>(config);
+}
 
 struct GeneralGateConfig {
   size_t hidden_size;

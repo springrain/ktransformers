@@ -49,8 +49,7 @@ class NEON_MXFP8_MOE_TP : public NEON_MOE_BASE<T, NEON_MXFP8_MOE_TP<T>> {
   ~NEON_MXFP8_MOE_TP() = default;
 
   // MiniMax MXFP8 follows current SGLang SwiGLU-OAI semantics: gate has only
-  // an upper clamp, while up is clamped symmetrically. Keep this override on
-  // MXFP8 so BF16/FP8/LLAMAFILE and other existing backends remain unchanged.
+  // an upper clamp, while up is clamped symmetrically.
   armneon::v8f32 custom_activation(armneon::v8f32 gate_val, armneon::v8f32 up_val, float swiglu_limit,
                                    float swiglu_alpha) const {
     if (swiglu_alpha <= 0.0f) return armneon::act_fn(gate_val, up_val, swiglu_limit, swiglu_alpha);

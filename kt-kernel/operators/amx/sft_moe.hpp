@@ -719,7 +719,7 @@ class AMX_SFT_MOE_TP : public BaseMOE<T> {
 
  public:
   AMX_SFT_MOE_TP(MOESFTConfig config, int tp_part_idx = 0)
-      : Base(static_cast<GeneralMOEConfig>(config), tp_part_idx), sft_config_(config) {
+      : Base(make_validated_sft_base_config(config), tp_part_idx), sft_config_(config) {
     printf(
         "Creating AMX_SFT_MOE_TP layer=%d tp_part=%d at numa %d skiplora %s share_backward_bb %s share_cache_pool %s\n",
         config.layer_idx, tp_part_idx, numa_node_of_cpu(sched_getcpu()), SkipLoRA ? "true" : "false",

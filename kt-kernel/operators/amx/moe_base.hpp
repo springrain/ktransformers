@@ -80,6 +80,7 @@ class AMX_MOE_BASE {
   static constexpr double ELEMENT_SIZE = T::ELEMENT_SIZE;
 
   AMX_MOE_BASE(GeneralMOEConfig config, int tp_part_idx_) : tp_part_idx(tp_part_idx_), config_(config) {
+    config_.validate_activation();
     init();
     derived()->derived_init();
   }
@@ -716,8 +717,17 @@ class AMX_MOE_BASE {
           __m512 gate_val0, gate_val1, up_val0, up_val1;
           avx512_32xbf16_to_32xfp32((__m512i*)(gate_output_ptr + j), &gate_val0, &gate_val1);
           avx512_32xbf16_to_32xfp32((__m512i*)(up_output_ptr + j), &up_val0, &up_val1);
-          __m512 result0 = amx::act_fn(gate_val0, up_val0, config_.swiglu_limit, config_.swiglu_alpha);
-          __m512 result1 = amx::act_fn(gate_val1, up_val1, config_.swiglu_limit, config_.swiglu_alpha);
+          __m512 result0;
+          __m512 result1;
+          if (config_.activation_type == MOE_ACTIVATION_SITU) {
+            result0 = amx::situ_fn(gate_val0, up_val0, config_.situ_beta, config_.situ_linear_beta);
+            result1 = amx::situ_fn(gate_val1, up_val1, config_.situ_beta, config_.situ_linear_beta);
+          } else {
+            result0 =
+                amx::act_fn(gate_val0, up_val0, config_.swiglu_limit, config_.effective_swiglu_alpha());
+            result1 =
+                amx::act_fn(gate_val1, up_val1, config_.swiglu_limit, config_.effective_swiglu_alpha());
+          }
           avx512_32xfp32_to_32xbf16(&result0, &result1, (__m512i*)(destination_ptr + j));
         }
       }

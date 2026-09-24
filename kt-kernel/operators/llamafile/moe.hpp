@@ -167,6 +167,11 @@ class LLAMA_MOE_TP {
   using output_t = float;
 
   LLAMA_MOE_TP(GeneralMOEConfig config, int tp_part_idx) : config_(config), tp_part_idx(tp_part_idx) {
+    config_.validate_activation();
+    if (config_.activation_type == MOE_ACTIVATION_SITU) {
+      throw std::invalid_argument(
+          "Llamafile MoE does not support SiTU; use a native AMX/AVX2/NEON backend");
+    }
     MemoryRequest mem_requests;
     mem_requests.append_pointer(&s_input_fp32_, sizeof(float) * config_.hidden_size);
     mem_requests.append_pointer(
@@ -402,7 +407,15 @@ class LLAMA_MOE_TP {
     }
   }
 
-  static float act_fn(float gate, float up, float swiglu_limit) {
+  static float act_fn(float gate, float up, float swiglu_limit, float swiglu_alpha) {
+    if (swiglu_alpha > 0.0f) {
+      if (swiglu_limit > 0.0f) {
+        gate = fminf(gate, swiglu_limit);
+        up = fmaxf(-swiglu_limit, fminf(up, swiglu_limit));
+      }
+      const float neg_gate_alpha = fminf(-gate * swiglu_alpha, 88.0f);
+      return gate / (1.0f + expf(neg_gate_alpha)) * (up + 1.0f);
+    }
     if (swiglu_limit > 0.0f) {
       gate = fminf(gate, swiglu_limit);
       up = fmaxf(-swiglu_limit, fminf(up, swiglu_limit));
@@ -523,7 +536,8 @@ class LLAMA_MOE_TP {
 
             for (int i = ith * config_.m_block; i < (ith + 1) * config_.m_block; i++) {
               s_intermediate_fp32_[act_idx][i] =
-                  act_fn(s_gate_output_[act_idx][i], s_up_output_[act_idx][i], config_.swiglu_limit);
+                  act_fn(s_gate_output_[act_idx][i], s_up_output_[act_idx][i], config_.swiglu_limit,
+                         config_.effective_swiglu_alpha());
             }
             if (config_.m_block %
                     ggml_blck_size(kt_effective_vec_dot_type((ggml_type)config_.down_type)) ==
@@ -824,7 +838,7 @@ class LLAMA_MOE_TP {
               m_local_intermediate_fp32_ptr_[expert_idx][i * config_.intermediate_size + j] =
                   act_fn(m_local_gate_output_ptr_[expert_idx][i * config_.intermediate_size + j],
                          m_local_up_output_ptr_[expert_idx][i * config_.intermediate_size + j],
-                         config_.swiglu_limit);
+                         config_.swiglu_limit, config_.effective_swiglu_alpha());
             }
             float* intermediate_fp32_ptr =
                 m_local_intermediate_fp32_ptr_[expert_idx] + i * config_.intermediate_size + ith * m_block;

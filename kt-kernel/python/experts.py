@@ -18,6 +18,8 @@ Usage:
 
 from __future__ import annotations
 
+import math
+
 import torch
 from typing import List, Optional
 
@@ -25,7 +27,12 @@ from typing import List, Optional
 from .experts_base import BaseMoEWrapper
 
 # Import inference backend implementations
-from .utils.amx import AMXMoEWrapper, NativeMoEWrapper
+from .utils.amx import (
+    AMXMoEWrapper,
+    NATIVE_SITU_METHODS,
+    NATIVE_SWIGLU_METHODS,
+    NativeMoEWrapper,
+)
 from .utils.llamafile import LlamafileMoEWrapper
 from .utils.moe_kernel import GeneralMoEWrapper
 
@@ -162,6 +169,11 @@ class KTMoEWrapper:
         swiglu_alpha: float = 0.0,
         # Dynamic placement requires CPU-packed copies of initially resident experts.
         pack_all_experts_on_load: bool = False,
+        # Explicit native-MoE activation contract. SiTU uses independent beta
+        # parameters and is intentionally not encoded as SwiGLU-OAI.
+        activation: Optional[str] = None,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
     ):
         """
         Factory method to create the appropriate backend implementation.
@@ -184,7 +196,8 @@ class KTMoEWrapper:
             cpu_save: Whether to save weights to CPU memory (inference only)
             max_deferred_experts_per_token: Experts per token to defer (inference only)
             pack_all_experts_on_load: Pack GPU-resident experts into the CPU
-                                      backend too, for later dynamic eviction.
+                                      backend too, for layerwise full-GPU
+                                      prefill or later dynamic eviction.
             numa_nodes: Explicit list of NUMA node IDs for subpool mapping. If None, defaults to sequential.
             method: Backend method (see INFERENCE_METHODS and SFT_METHODS)
             mode: Operation mode ("inference" or "sft")
@@ -237,6 +250,9 @@ class KTMoEWrapper:
                 numa_nodes=numa_nodes,
                 swiglu_limit=swiglu_limit,
                 swiglu_alpha=swiglu_alpha,
+                activation=activation,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
             )
         else:  # mode == "sft"
             # SFT factory does not plumb swiglu_limit; reject non-zero
@@ -246,6 +262,14 @@ class KTMoEWrapper:
                     f"swiglu_limit={swiglu_limit} is not supported in "
                     f"mode='sft' (method={method!r}); SFT backends do not "
                     f"implement the V4-2604B clamp."
+                )
+            if (
+                activation not in (None, "silu")
+                or situ_beta is not None
+                or situ_linear_beta is not None
+            ):
+                raise ValueError(
+                    "SiTU and custom inference activations are not supported in mode='sft'."
                 )
             return _create_sft_wrapper(
                 layer_idx=layer_idx,
@@ -338,6 +362,9 @@ def _create_inference_wrapper(
     numa_nodes: Optional[List[int]] = None,
     swiglu_limit: float = 0.0,
     swiglu_alpha: float = 0.0,
+    activation: Optional[str] = None,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
 ) -> BaseMoEWrapper:
     """
     Create an inference wrapper based on the method.
@@ -371,31 +398,112 @@ def _create_inference_wrapper(
         # This shouldn't happen due to validation in __new__
         raise NotImplementedError(f"Unsupported inference method: {method}")
 
-    # Create and return backend instance.
-    # `swiglu_limit != 0` is validated for block-FP8, MXFP4, MXFP8 and LLAMAFILE.
-    # NativeMoEWrapper also serves RAWINT4 / BF16 / FP8_PERCHANNEL / GPTQ_INT4, so a
-    # `backend_cls is NativeMoEWrapper` test would silently forward a stale
-    # 10.0 (e.g., from a leftover SGLANG_DSV4_2604_SUBMODE=2604B in the env)
-    # into a non-MXFP4 backend; act_fn would then clamp gate/up to ±10 with
-    # no warning. Gate strictly on method instead. Origin: kt-sglang 耦合.
-    # LLAMAFILE is on the list for the same reason as the native MXFP4 path: it
-    # validates the GGUF tensor types while loading and applies the clamp in its
-    # scalar/NEON-independent activation step.
+    # Create and return backend instance. Activation capability follows the
+    # execution path, not the weight format: all Native methods below use the
+    # shared AMX/AVX2/NEON activation base. SYCL and legacy generic wrappers
+    # bypass that path and therefore fail closed for non-plain-SiLU contracts.
+    if activation is None and backend_cls is NativeMoEWrapper:
+        # Backward compatibility for callers predating the explicit contract.
+        # Kimi-K3 was historically forwarded as (alpha=4, limit=25) through
+        # fields named for SwiGLU-OAI. Resolve that exact MXFP4 tuple to SiTU;
+        # every other positive alpha retains the legacy SwiGLU-OAI meaning.
+        if method == "MXFP4" and swiglu_alpha == 4.0 and swiglu_limit == 25.0:
+            activation = "situ"
+            situ_beta = swiglu_alpha
+            situ_linear_beta = swiglu_limit
+            swiglu_alpha = 0.0
+            swiglu_limit = 0.0
+        else:
+            activation = "swiglu_oai" if swiglu_alpha > 0.0 else "silu"
+    elif activation is None and backend_cls is LlamafileMoEWrapper:
+        activation = "swiglu_oai" if swiglu_alpha > 0.0 else "silu"
+    elif activation is None:
+        activation = "silu"
+    if not isinstance(activation, str):
+        raise ValueError(
+            f"Unsupported MoE activation {activation!r}; expected 'silu', "
+            "'swiglu_oai', or 'situ'."
+        )
+    activation = activation.lower()
+    if activation not in ("silu", "swiglu_oai", "situ"):
+        raise ValueError(
+            f"Unsupported MoE activation {activation!r}; expected 'silu', "
+            "'swiglu_oai', or 'situ'."
+        )
+    if backend_cls is NativeMoEWrapper:
+        if method not in NATIVE_SWIGLU_METHODS and (
+            activation == "swiglu_oai" or swiglu_limit != 0.0
+        ):
+            raise ValueError(
+                f"activation={activation!r} with swiglu_limit={swiglu_limit} "
+                f"is unsupported for method={method!r}; this method bypasses "
+                "the shared CPU activation path."
+            )
+        if activation == "situ":
+            if method not in NATIVE_SITU_METHODS:
+                raise ValueError(
+                    f"SiTU is unsupported for method={method!r}; supported native CPU "
+                    f"methods are {sorted(NATIVE_SITU_METHODS)}."
+                )
+            if situ_beta is None or not math.isfinite(situ_beta) or situ_beta <= 0.0:
+                raise ValueError("SiTU requires a finite positive situ_beta.")
+            if situ_linear_beta is not None and (
+                not math.isfinite(situ_linear_beta) or situ_linear_beta < 0.0
+            ):
+                raise ValueError(
+                    "situ_linear_beta must be finite and non-negative when provided."
+                )
+            if swiglu_alpha != 0.0 or swiglu_limit != 0.0:
+                raise ValueError(
+                    "SiTU parameters must not be mixed with SwiGLU-OAI/clamp parameters."
+                )
+        elif situ_beta is not None or situ_linear_beta is not None:
+            raise ValueError("situ_beta/situ_linear_beta require activation='situ'.")
+        elif activation == "swiglu_oai" and (
+            not math.isfinite(swiglu_alpha) or swiglu_alpha <= 0.0
+        ):
+            raise ValueError("SwiGLU-OAI requires a finite positive swiglu_alpha.")
+        elif activation == "silu" and swiglu_alpha != 0.0:
+            raise ValueError("activation='silu' cannot use swiglu_alpha.")
+    elif backend_cls is LlamafileMoEWrapper:
+        if (
+            activation == "situ"
+            or situ_beta is not None
+            or situ_linear_beta is not None
+        ):
+            raise ValueError("Llamafile MoE does not support SiTU.")
+        if activation == "swiglu_oai" and (
+            not math.isfinite(swiglu_alpha) or swiglu_alpha <= 0.0
+        ):
+            raise ValueError(
+                "Llamafile SwiGLU-OAI requires a finite positive swiglu_alpha."
+            )
+        if activation == "silu" and swiglu_alpha != 0.0:
+            raise ValueError("activation='silu' cannot use swiglu_alpha.")
+    elif activation != "silu" or situ_beta is not None or situ_linear_beta is not None:
+        raise ValueError(
+            f"activation={activation!r} is unsupported by backend {backend_cls.__name__}."
+        )
+
     extra_kwargs = {}
     if backend_cls is NativeMoEWrapper:
         extra_kwargs["pack_all_experts_on_load"] = pack_all_experts_on_load
-    if method in ("FP8", "MXFP4", "MXFP8", "LLAMAFILE"):
+        extra_kwargs["activation"] = activation
+        extra_kwargs["situ_beta"] = situ_beta
+        extra_kwargs["situ_linear_beta"] = situ_linear_beta
+        # All Native methods use a shared CPU activation base, so an explicit
+        # SwiGLU-OAI contract is independent of the weight quantization format.
+        extra_kwargs["swiglu_alpha"] = swiglu_alpha
+        extra_kwargs["swiglu_limit"] = swiglu_limit
+    elif backend_cls is LlamafileMoEWrapper:
+        extra_kwargs["activation"] = activation
         extra_kwargs["swiglu_limit"] = swiglu_limit
         extra_kwargs["swiglu_alpha"] = swiglu_alpha
     elif swiglu_limit != 0.0:
         raise ValueError(
-            f"swiglu_limit={swiglu_limit} is only supported on "
-            "method='FP8'/'MXFP4'/'MXFP8'/'LLAMAFILE', "
-            f"got method={method!r} (backend={backend_cls.__name__}). This "
-            f"usually means SGLANG_DSV4_2604_SUBMODE=2604B is set in the "
-            f"environment while the current launch does not actually use "
-            "FP8/MXFP4/MXFP8/LLAMAFILE weights — either unset the env or select a "
-            "matching --kt-method."
+            f"swiglu_limit={swiglu_limit} is unsupported by method={method!r} "
+            f"(backend={backend_cls.__name__}); this backend bypasses the shared "
+            "CPU activation path."
         )
     return backend_cls(
         layer_idx=layer_idx,

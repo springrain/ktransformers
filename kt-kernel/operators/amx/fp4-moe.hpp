@@ -789,8 +789,14 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
         __m512 gate0, gate1, up0, up1;
         avx512_32xbf16_to_32xfp32((__m512i*)(gate + j), &gate0, &gate1);
         avx512_32xbf16_to_32xfp32((__m512i*)(up + j), &up0, &up1);
-        const __m512 result0 = amx::act_fn(gate0, up0, config_.swiglu_limit, config_.swiglu_alpha);
-        const __m512 result1 = amx::act_fn(gate1, up1, config_.swiglu_limit, config_.swiglu_alpha);
+        const __m512 result0 =
+            config_.activation_type == MOE_ACTIVATION_SITU
+                ? amx::situ_fn(gate0, up0, config_.situ_beta, config_.situ_linear_beta)
+                : amx::act_fn(gate0, up0, config_.swiglu_limit, config_.effective_swiglu_alpha());
+        const __m512 result1 =
+            config_.activation_type == MOE_ACTIVATION_SITU
+                ? amx::situ_fn(gate1, up1, config_.situ_beta, config_.situ_linear_beta)
+                : amx::act_fn(gate1, up1, config_.swiglu_limit, config_.effective_swiglu_alpha());
         const __m512bh logical = _mm512_cvtne2ps_pbh(result1, result0);
         const __m512bh natural = T::permute_activation_group(logical);
         _mm512_storeu_si512((void*)(destination + (j - n_start)), (__m512i)natural);

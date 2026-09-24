@@ -110,6 +110,33 @@ static inline __m256 exp_avx2(__m256 x) {
   return _mm256_mul_ps(two_pow_i, frac_exp);
 }
 
+static inline __m256 tanh_avx2(__m256 x) {
+  const __m256 original = x;
+  const __m256 nan_mask = _mm256_cmp_ps(original, original, _CMP_UNORD_Q);
+  const __m256 bound = _mm256_set1_ps(44.0f);
+  x = _mm256_min_ps(_mm256_max_ps(x, _mm256_sub_ps(_mm256_setzero_ps(), bound)), bound);
+  const __m256 exp_2x = exp_avx2(_mm256_add_ps(x, x));
+  const __m256 result = _mm256_div_ps(_mm256_sub_ps(exp_2x, _mm256_set1_ps(1.0f)),
+                                      _mm256_add_ps(exp_2x, _mm256_set1_ps(1.0f)));
+  return _mm256_blendv_ps(result, original, nan_mask);
+}
+
+// SiTU (SoftCap-GLU), kept distinct from SwiGLU-OAI.
+static inline __m256 situ_fn(__m256 gate_val, __m256 up_val, float beta, float linear_beta) {
+  const __m256 one = _mm256_set1_ps(1.0f);
+  const __m256 beta_v = _mm256_set1_ps(beta);
+  const __m256 gate_softcap = _mm256_mul_ps(beta_v, tanh_avx2(_mm256_div_ps(gate_val, beta_v)));
+  __m256 neg_gate = _mm256_sub_ps(_mm256_setzero_ps(), gate_val);
+  neg_gate = _mm256_min_ps(_mm256_max_ps(neg_gate, _mm256_set1_ps(-88.0f)), _mm256_set1_ps(88.0f));
+  const __m256 sigmoid_gate = _mm256_div_ps(one, _mm256_add_ps(one, exp_avx2(neg_gate)));
+  __m256 up_softcap = up_val;
+  if (linear_beta > 0.0f) {
+    const __m256 linear_beta_v = _mm256_set1_ps(linear_beta);
+    up_softcap = _mm256_mul_ps(linear_beta_v, tanh_avx2(_mm256_div_ps(up_val, linear_beta_v)));
+  }
+  return _mm256_mul_ps(_mm256_mul_ps(gate_softcap, sigmoid_gate), up_softcap);
+}
+
 // ============================================================================
 // SiLU activation: silu(gate) * up = gate * sigmoid(gate) * up
 // AVX2 port of amx::act_fn
@@ -143,7 +170,7 @@ static inline __m256 act_fn(__m256 gate_val, __m256 up_val, float swiglu_limit) 
 }
 
 // MiniMax M3 \"swigluoai\" activation + DeepSeek V4 \"silu\" unified entry point.
-//   alpha > 0  -> swigluoai: gate * sigmoid(gate * alpha) * (up + 1), symmetric clamp on both
+//   alpha > 0  -> swigluoai: gate * sigmoid(gate * alpha) * (up + 1), upper-only gate clamp
 //   alpha == 0 -> falls back to silu (with optional one-sided clamp via the overload above)
 // Mirrors amx::act_fn(g, u, swiglu_limit, swiglu_alpha).
 static inline __m256 act_fn(__m256 gate_val, __m256 up_val, float swiglu_limit, float swiglu_alpha) {
@@ -152,7 +179,6 @@ static inline __m256 act_fn(__m256 gate_val, __m256 up_val, float swiglu_limit, 
       const __m256 pos_lim = _mm256_set1_ps(swiglu_limit);
       const __m256 neg_lim = _mm256_set1_ps(-swiglu_limit);
       gate_val = _mm256_min_ps(gate_val, pos_lim);
-      gate_val = _mm256_max_ps(gate_val, neg_lim);
       up_val = _mm256_min_ps(up_val, pos_lim);
       up_val = _mm256_max_ps(up_val, neg_lim);
     }

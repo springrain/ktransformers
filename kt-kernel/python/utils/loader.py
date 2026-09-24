@@ -8,12 +8,18 @@ This module provides loaders for:
 
 from __future__ import annotations
 
+import json
+import logging
 import os
+import time
+from enum import IntEnum
+
 import numpy as np
 import torch
-from enum import IntEnum
-from safetensors import safe_open
 from gguf.gguf_reader import GGUFReader
+from safetensors import safe_open
+
+logger = logging.getLogger(__name__)
 
 
 class GGMLQuantizationType(IntEnum):
@@ -150,58 +156,210 @@ class SafeTensorLoader:
     tensor_device_map: dict
 
     def __init__(self, file_path: str):
-        self.__load_tensor_file_map(file_path)
-
-    def __load_tensor_file_map(self, file_path: str):
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"Path not found: {file_path}")
-        if os.path.isfile(file_path):
-            folder_path = os.path.dirname(file_path)
-        else:
-            folder_path = file_path
+        self.source_path = os.path.abspath(os.fspath(file_path))
         self.file_handle_map = {}
         self.tensor_file_map = {}
         self.tensor_type_map = {}
         self.tensor_device_map = {}
+        self.index_path = None
+        self.checkpoint_files = ()
+        self.__load_tensor_file_map(file_path)
 
-        found_safetensor = False
-        for root, _, files in os.walk(folder_path):
-            files = sorted(files)
-            for file in files:
-                if file.endswith(".safetensors"):
-                    found_safetensor = True
-                    file_path = os.path.join(root, file)
-                    if file not in self.file_handle_map:
-                        try:
-                            handle = safe_open(file_path, framework="pt")
-                            self.file_handle_map[file] = handle
-                        except Exception as e:
-                            print(f"Error opening Safetensor file {file_path}: {e}")
-                            continue
+    def __load_tensor_file_map(self, file_path: str):
+        source_path = os.path.abspath(os.fspath(file_path))
+        if not os.path.exists(source_path):
+            raise FileNotFoundError(f"Path not found: {source_path}")
 
-                    f = self.file_handle_map.get(file)
-                    if f is None:
-                        continue
-                    try:
-                        for key in f.keys():
-                            self.tensor_file_map[key] = file
-                    except Exception as e:
-                        print(f"Error reading Safetensor file {file_path}: {e}")
+        started = time.perf_counter()
+        if os.path.isfile(source_path):
+            if source_path.endswith(".safetensors.index.json"):
+                self._load_tensor_index(source_path)
+            elif source_path.endswith(".safetensors"):
+                # An explicit file means exactly that file.  This prevents an
+                # adapter or unrelated checkpoint in the same directory from
+                # being merged into the native-expert key space.
+                self._scan_safetensor_headers([source_path])
+            else:
+                raise ValueError(
+                    "SafeTensorLoader expects a .safetensors file, a "
+                    f".safetensors.index.json file, or a directory; got {source_path!r}"
+                )
+        else:
+            canonical_index = os.path.join(
+                source_path, "model.safetensors.index.json"
+            )
+            if os.path.isfile(canonical_index):
+                self._load_tensor_index(canonical_index)
+            else:
+                index_files = sorted(
+                    os.path.join(source_path, name)
+                    for name in os.listdir(source_path)
+                    if name.endswith(".safetensors.index.json")
+                    and os.path.isfile(os.path.join(source_path, name))
+                )
+                if len(index_files) > 1:
+                    raise ValueError(
+                        "Multiple safetensors index files were found without a "
+                        "canonical model.safetensors.index.json. Pass the intended "
+                        f"index file explicitly: {index_files}"
+                    )
+                if index_files:
+                    self._load_tensor_index(index_files[0])
+                else:
+                    checkpoint_files = []
+                    for root, _, files in os.walk(source_path):
+                        checkpoint_files.extend(
+                            os.path.join(root, name)
+                            for name in sorted(files)
+                            if name.endswith(".safetensors")
+                        )
+                    self._scan_safetensor_headers(checkpoint_files)
 
-        if not found_safetensor:
-            raise FileNotFoundError(f"No Safetensor files found in {folder_path}")
+        if not self.tensor_file_map:
+            raise FileNotFoundError(
+                f"No Safetensor tensor keys found under {source_path}"
+            )
+        logger.info(
+            "[KT] Safetensors index ready: %d tensor keys across %d shard(s) "
+            "in %.2fs (source=%s)",
+            len(self.tensor_file_map),
+            len(self.checkpoint_files),
+            time.perf_counter() - started,
+            self.index_path or source_path,
+        )
+
+    @staticmethod
+    def _normalize_checkpoint_path(path: str) -> str:
+        return os.path.abspath(os.path.normpath(path))
+
+    def _load_tensor_index(self, index_path: str) -> None:
+        """Build key-to-shard metadata without opening any weight shard."""
+        index_path = self._normalize_checkpoint_path(index_path)
+        logger.debug("[KT] Reading safetensors index: %s", index_path)
+        try:
+            with open(index_path, encoding="utf-8") as handle:
+                index_data = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"Unable to read safetensors index {index_path}: {exc}"
+            ) from exc
+
+        if not isinstance(index_data, dict):
+            raise ValueError(
+                f"Safetensors index root must be an object: {index_path}"
+            )
+        weight_map = index_data.get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ValueError(
+                f"Safetensors index has no non-empty weight_map: {index_path}"
+            )
+
+        index_dir = os.path.dirname(index_path)
+        shard_path_cache = {}
+        for key, shard_name in weight_map.items():
+            if not isinstance(key, str) or not isinstance(shard_name, str):
+                raise ValueError(
+                    f"Safetensors index contains a non-string weight_map entry: "
+                    f"key={key!r}, shard={shard_name!r}"
+                )
+            shard_path = shard_path_cache.get(shard_name)
+            if shard_path is None:
+                shard_path = shard_name
+                if not os.path.isabs(shard_path):
+                    shard_path = os.path.join(index_dir, shard_path)
+                shard_path = self._normalize_checkpoint_path(shard_path)
+                shard_path_cache[shard_name] = shard_path
+            self.tensor_file_map[key] = shard_path
+
+        checkpoint_files = tuple(sorted(set(shard_path_cache.values())))
+        missing_files = [path for path in checkpoint_files if not os.path.isfile(path)]
+        if missing_files:
+            preview = missing_files[:8]
+            suffix = "" if len(missing_files) <= len(preview) else " ..."
+            raise FileNotFoundError(
+                f"Safetensors index {index_path} references {len(missing_files)} "
+                f"missing shard(s): {preview}{suffix}"
+            )
+        self.index_path = index_path
+        self.checkpoint_files = checkpoint_files
+
+    def _scan_safetensor_headers(self, checkpoint_files) -> None:
+        """Fallback for checkpoints without an index JSON.
+
+        Headers are scanned once to build the persistent key map.  Handles are
+        not retained; tensor reads still use the lazy handle cache below.
+        """
+        checkpoint_files = tuple(
+            sorted(
+                self._normalize_checkpoint_path(path) for path in checkpoint_files
+            )
+        )
+        if not checkpoint_files:
+            raise FileNotFoundError(
+                f"No Safetensor files found under {self.source_path}"
+            )
+
+        logger.info(
+            "[KT] No safetensors index JSON found; scanning %d shard header(s) once",
+            len(checkpoint_files),
+        )
+        for file_idx, checkpoint_file in enumerate(checkpoint_files, start=1):
+            try:
+                with safe_open(checkpoint_file, framework="pt") as handle:
+                    for key in handle.keys():
+                        previous_file = self.tensor_file_map.get(key)
+                        if previous_file is not None and os.path.normcase(
+                            previous_file
+                        ) != os.path.normcase(checkpoint_file):
+                            raise ValueError(
+                                f"Duplicate tensor key {key!r} appears in both "
+                                f"{previous_file!r} and {checkpoint_file!r}"
+                            )
+                        self.tensor_file_map[key] = checkpoint_file
+            except ValueError:
+                raise
+            except Exception as exc:
+                raise OSError(
+                    f"Unable to read Safetensor header {checkpoint_file}: {exc}"
+                ) from exc
+            if file_idx % 16 == 0 or file_idx == len(checkpoint_files):
+                logger.info(
+                    "[KT] Safetensors header scan progress: %d/%d shards, %d keys",
+                    file_idx,
+                    len(checkpoint_files),
+                    len(self.tensor_file_map),
+                )
+        self.checkpoint_files = checkpoint_files
+
+    def _get_file_handle(self, checkpoint_file: str):
+        handle = self.file_handle_map.get(checkpoint_file)
+        if handle is None:
+            try:
+                handle = safe_open(checkpoint_file, framework="pt")
+            except Exception as exc:
+                raise OSError(
+                    f"Unable to open Safetensor shard {checkpoint_file}: {exc}"
+                ) from exc
+            self.file_handle_map[checkpoint_file] = handle
+        return handle
 
     def load_tensor(self, key: str, device: str = "cpu"):
         if key not in self.tensor_file_map:
             raise KeyError(f"Key {key} not found in Safetensor files")
-        file = self.tensor_file_map[key]
-        f = self.file_handle_map.get(file)
-        if f is None:
-            raise FileNotFoundError(f"File {file} not found in Safetensor files")
-        tensor = f.get_tensor(key)
+        checkpoint_file = self.tensor_file_map[key]
+        handle = self._get_file_handle(checkpoint_file)
+        try:
+            tensor = handle.get_tensor(key)
+        except Exception as exc:
+            raise KeyError(
+                f"Tensor {key!r} is listed in the checkpoint index for "
+                f"{checkpoint_file!r}, but the shard could not provide it: {exc}"
+            ) from exc
+        if device == "cpu":
+            return tensor
         return tensor.to(device)
 
-    def close_all_handles(self):
+    def close_all_handles(self, *, collect: bool = True):
         """Close all file handles and clear the handle map.
 
         Note: safetensors.safe_open doesn't expose a close() method. Releasing
@@ -210,8 +368,21 @@ class SafeTensorLoader:
         will reclaim the page cache. gc.collect() is called here to trigger
         immediate reclamation rather than waiting for the next GC cycle.
         """
-        import gc
         self.file_handle_map.clear()
+        if collect:
+            import gc
+
+            gc.collect()
+
+    def clear_index(self) -> None:
+        """Release both mmap handles and the persistent key-to-shard index."""
+        import gc
+
+        self.close_all_handles(collect=False)
+        self.tensor_file_map.clear()
+        self.tensor_type_map.clear()
+        self.tensor_device_map.clear()
+        self.checkpoint_files = ()
         gc.collect()
 
     def load_experts(self, base_key: str, device: str = "cpu"):
@@ -376,8 +547,9 @@ class FP8SafeTensorLoader(SafeTensorLoader):
 
     def _detect_format(self):
         """Auto-detect the MoE naming format and scale format by checking tensor keys."""
-        # Sample some tensor names to detect format
-        sample_keys = list(self.tensor_file_map.keys())[:1000]
+        # Iterate the key view without copying a potentially 500k-entry map.
+        # The view is re-iterable, so each format probe can scan it safely.
+        sample_keys = self.tensor_file_map.keys()
 
         for fmt_name, (path_tpl, gate, up, down) in self.MOE_FORMATS.items():
             # Check if any key matches this format pattern
@@ -467,16 +639,7 @@ class FP8SafeTensorLoader(SafeTensorLoader):
         return gate, up, down
 
     def load_tensor(self, key: str, device: str = "cpu"):
-        if key not in self.tensor_file_map:
-            raise KeyError(f"Key {key} not found in Safetensor files")
-        file = self.tensor_file_map[key]
-        f = self.file_handle_map.get(file)
-        if f is None:
-            raise FileNotFoundError(f"File {file} not found in Safetensor files")
-        tensor = f.get_tensor(key)
-        if device == "cpu":
-            return tensor
-        return tensor.to(device)
+        return super().load_tensor(key, device)
 
     def load_experts(self, base_key: str, device: str = "cpu"):
         """Load FP8 expert weights and their scale tensors.
@@ -574,7 +737,7 @@ class BF16SafeTensorLoader(SafeTensorLoader):
 
     def _detect_format(self):
         """Auto-detect the MoE naming format by checking tensor keys."""
-        sample_keys = list(self.tensor_file_map.keys())[:1000]
+        sample_keys = self.tensor_file_map.keys()
 
         # Check for packed format first (Qwen3.5 MoE style: all experts in one 3D tensor)
         for key in sample_keys:
@@ -619,16 +782,7 @@ class BF16SafeTensorLoader(SafeTensorLoader):
         return gate, up, down
 
     def load_tensor(self, key: str, device: str = "cpu"):
-        if key not in self.tensor_file_map:
-            raise KeyError(f"Key {key} not found in Safetensor files")
-        file = self.tensor_file_map[key]
-        f = self.file_handle_map.get(file)
-        if f is None:
-            raise FileNotFoundError(f"File {file} not found in Safetensor files")
-        tensor = f.get_tensor(key)
-        if device == "cpu":
-            return tensor
-        return tensor.to(device)
+        return super().load_tensor(key, device)
 
     def load_experts(self, base_key: str, device: str = "cpu"):
         """Load BF16 expert weights (no scales needed)."""
@@ -1098,7 +1252,7 @@ class GPTQSafeTensorLoader(FP8SafeTensorLoader):
 
     def _detect_format(self):
         """Override FP8 format detection to look for .qweight instead of .weight."""
-        sample_keys = list(self.tensor_file_map.keys())[:2000]
+        sample_keys = self.tensor_file_map.keys()
 
         for fmt_name, (path_tpl, gate, up, down) in self.MOE_FORMATS.items():
             for key in sample_keys:
@@ -1198,56 +1352,303 @@ class GPTQSafeTensorLoader(FP8SafeTensorLoader):
 
 
 class MXFP4SafeTensorLoader(SafeTensorLoader):
-    """Loader for native MXFP4 expert weights (DeepSeek-V4-Flash format).
+    """Loader for native MXFP4 expert weights.
 
-    Per expert layout:
+    DeepSeek-V4-Flash per-expert layout:
       {base}.ffn.experts.{i}.w1.weight  I8       [N, K/2]   nibble-packed E2M1 (gate)
       {base}.ffn.experts.{i}.w1.scale   F8_E8M0  [N, K/32]  ue8m0 group scale
       {base}.ffn.experts.{i}.w3.{weight,scale}              up
       {base}.ffn.experts.{i}.w2.{weight,scale}              down
 
+    Compressed-tensors packed per-expert layout:
+      {base}.{block_sparse_moe,mlp}.experts.{i}.w1.weight_packed  U8 [N, K/2]
+      {base}.{block_sparse_moe,mlp}.experts.{i}.w1.weight_scale   U8 [N, 1, K/32, 1]
+      {base}.{block_sparse_moe,mlp}.experts.{i}.w3.{weight_packed,weight_scale}
+      {base}.{block_sparse_moe,mlp}.experts.{i}.w2.{weight_packed,weight_scale}
+
     V4 ckpt keys are not prefixed with ``model.``; we also probe the stripped form so
-    callers can keep passing ``base_key="model.layers.{L}"``. ue8m0 → bf16 is a lossless
-    bit shift (both have an 8-bit exponent and zero mantissa for ue8m0), and the AMX
-    FP4 backend already consumes bf16 scales.
+    callers can keep passing ``base_key="model.layers.{L}"``. UE8M0 values are
+    converted exactly to bf16, including the minimum finite value and NaN sentinel,
+    and the native FP4 kernels consume those bf16 scales directly.
     """
 
     EXPERTS_PATH_TPL = "{base}.ffn.experts"
     PROJ_NAMES = ("w1", "w3", "w2")  # (gate, up, down)
+    EXPERT_PATHS = (
+        ("ffn_experts", "{base}.ffn.experts"),
+        ("block_sparse_moe", "{base}.block_sparse_moe.experts"),
+        ("mlp", "{base}.mlp.experts"),
+        ("feed_forward", "{base}.feed_forward.experts"),
+        ("direct_experts", "{base}.experts"),
+    )
+    PROJECTION_ALIASES = (
+        ("w_names", ("w1", "w3", "w2")),
+        ("proj_names", ("gate_proj", "up_proj", "down_proj")),
+    )
+    SUFFIX_COMBINATIONS = (
+        ("v4", "weight", "scale"),
+        ("compressed", "weight_packed", "weight_scale"),
+        ("weight_scale", "weight", "weight_scale"),
+    )
+    # ``weight_scale_inv`` is also the standard FP8/MXFP8 suffix. Its name
+    # alone does not prove that the payload is a direct UE8M0 dequant scale,
+    # so detect it only to produce an explicit fail-fast diagnostic.
+    UNSUPPORTED_SCALE_INV_COMBINATIONS = (
+        ("weight_packed", "weight_scale_inv"),
+        ("weight", "weight_scale_inv"),
+    )
+
+    @staticmethod
+    def _base_key_candidates(base_key: str) -> list[str]:
+        candidates = [base_key]
+        if base_key.startswith("model."):
+            candidates.append(base_key[len("model.") :])
+        if base_key.startswith("language_model.model."):
+            candidates.append(
+                "language_model." + base_key[len("language_model.model.") :]
+            )
+        if base_key.startswith("model.language_model."):
+            candidates.append(
+                "language_model." + base_key[len("model.language_model.") :]
+            )
+        return list(dict.fromkeys(candidates))
+
+    def _schema_candidates(
+        self, base_key: str
+    ) -> list[tuple[str, str, tuple[str, str, str], str, str]]:
+        candidates = []
+        for base in self._base_key_candidates(base_key):
+            for path_name, path_template in self.EXPERT_PATHS:
+                prefix = path_template.format(base=base)
+                for projection_name, projections in self.PROJECTION_ALIASES:
+                    for (
+                        suffix_name,
+                        weight_suffix,
+                        scale_suffix,
+                    ) in self.SUFFIX_COMBINATIONS:
+                        candidates.append(
+                            (
+                                f"{path_name}/{projection_name}/{suffix_name}",
+                                prefix,
+                                projections,
+                                weight_suffix,
+                                scale_suffix,
+                            )
+                        )
+        return list(dict.fromkeys(candidates))
 
     def _experts_prefix_candidates(self, base_key: str) -> list[str]:
-        candidates = [self.EXPERTS_PATH_TPL.format(base=base_key)]
-        if base_key.startswith("model."):
-            candidates.append(self.EXPERTS_PATH_TPL.format(base=base_key[len("model.") :]))
+        return list(
+            dict.fromkeys(
+                prefix for _, prefix, _, _, _ in self._schema_candidates(base_key)
+            )
+        )
+
+    def _unsupported_scale_inv_candidates(
+        self, base_key: str
+    ) -> list[tuple[str, str, tuple[str, str, str], str, str]]:
+        candidates = []
+        for base in self._base_key_candidates(base_key):
+            for path_name, path_template in self.EXPERT_PATHS:
+                prefix = path_template.format(base=base)
+                for projection_name, projections in self.PROJECTION_ALIASES:
+                    for (
+                        weight_suffix,
+                        scale_suffix,
+                    ) in self.UNSUPPORTED_SCALE_INV_COMBINATIONS:
+                        candidates.append(
+                            (
+                                f"{path_name}/{projection_name}/{weight_suffix}+{scale_suffix}",
+                                prefix,
+                                projections,
+                                weight_suffix,
+                                scale_suffix,
+                            )
+                        )
         return list(dict.fromkeys(candidates))
 
     @staticmethod
-    def _ue8m0_to_bf16(scale_t: torch.Tensor) -> torch.Tensor:
-        if scale_t.dtype != torch.uint8:
-            scale_t = scale_t.view(torch.uint8)
-        # bf16 = [sign(1) | exp(8) | mant(7)]; setting mant=0, exp=e gives 2^(e-127),
-        # which is exactly the value encoded by ue8m0 for e ∈ [1, 254]. e=0 → bf16 +0
-        # (acceptable: ue8m0=0 represents 2^-127, below bf16 normal range), e=255 → +inf.
-        # Compute in int32 then narrow to int16 (max value is 255<<7=32640, fits int16),
-        # because torch CPU has no lshift kernel for uint16.
-        return (scale_t.to(torch.int32) << 7).to(torch.int16).view(torch.bfloat16).contiguous()
+    def _as_packed_u8(weight: torch.Tensor, key: str) -> torch.Tensor:
+        allowed_dtypes = {torch.uint8, torch.int8}
+        float4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+        if float4_dtype is not None:
+            allowed_dtypes.add(float4_dtype)
+        if weight.element_size() != 1 or weight.dtype not in allowed_dtypes:
+            raise TypeError(
+                f"MXFP4 packed weight {key!r} must use uint8/int8/packed-float4, "
+                f"got dtype={weight.dtype}, shape={tuple(weight.shape)}"
+            )
+        if weight.dtype != torch.uint8:
+            weight = weight.view(torch.uint8)
+        return weight.contiguous()
 
-    def load_experts(self, base_key: str, device: str = "cpu"):
-        gate_name, up_name, down_name = self.PROJ_NAMES
-        prefix = None
-        expert_count = 0
-        for cand in self._experts_prefix_candidates(base_key):
-            expert_count = 0
-            while self.has_tensor(f"{cand}.{expert_count}.{gate_name}.weight"):
-                expert_count += 1
-            if expert_count > 0:
-                prefix = cand
-                break
-        if prefix is None:
+    @staticmethod
+    def _normalize_scale_shape(scale: torch.Tensor, key: str) -> torch.Tensor:
+        # compressed-tensors serializes MXFP4 scales as [N, 1, K/32, 1].
+        # Normalize that exporter layout before validating the group-32 contract.
+        if scale.ndim == 4:
+            if scale.shape[1] != 1 or scale.shape[3] != 1:
+                raise ValueError(
+                    f"MXFP4 scale {key!r} has unsupported 4D shape "
+                    f"{tuple(scale.shape)}; expected [N, 1, K_groups, 1]"
+                )
+            scale = scale[:, 0, :, 0]
+        return scale
+
+    @staticmethod
+    def _validate_weight_scale_shapes(
+        weight: torch.Tensor, scale: torch.Tensor, weight_key: str, scale_key: str
+    ) -> None:
+        if weight.ndim < 2 or scale.ndim != weight.ndim:
             raise ValueError(
-                f"No MXFP4 experts found under any of: {self._experts_prefix_candidates(base_key)}"
+                "MXFP4 weight/scale rank mismatch: "
+                f"{weight_key} shape={tuple(weight.shape)}, "
+                f"{scale_key} shape={tuple(scale.shape)}"
+            )
+        if weight.shape[:-1] != scale.shape[:-1]:
+            raise ValueError(
+                "MXFP4 weight/scale leading dimensions differ: "
+                f"{weight_key} shape={tuple(weight.shape)}, "
+                f"{scale_key} shape={tuple(scale.shape)}"
+            )
+        if weight.shape[-1] % 16 != 0 or scale.shape[-1] != weight.shape[-1] // 16:
+            raise ValueError(
+                "MXFP4 scale must contain one E8M0 value per 32 FP4 values: "
+                f"{weight_key} shape={tuple(weight.shape)}, "
+                f"{scale_key} shape={tuple(scale.shape)}"
             )
 
+    @staticmethod
+    def _ue8m0_to_bf16(scale_t: torch.Tensor, key: str = "scale") -> torch.Tensor:
+        allowed_dtypes = {torch.uint8, torch.int8}
+        e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+        if e8m0_dtype is not None:
+            allowed_dtypes.add(e8m0_dtype)
+        if scale_t.element_size() != 1 or scale_t.dtype not in allowed_dtypes:
+            raise TypeError(
+                f"MXFP4 E8M0 scale {key!r} must use uint8/int8/float8_e8m0fnu, "
+                f"got dtype={scale_t.dtype}, shape={tuple(scale_t.shape)}"
+            )
+        if scale_t.dtype != torch.uint8:
+            scale_t = scale_t.view(torch.uint8)
+        # For raw exponents 1..254, bf16 = [sign(1) | exp(8) | mant(7)] is an
+        # exact left shift. UE8M0 raw 0 is 2^-127, which is the bf16 subnormal
+        # bit pattern 0x0040 rather than zero; raw 255 is the NaN sentinel and
+        # maps to a quiet bf16 NaN. Compute in int32 because torch CPU has no
+        # left-shift kernel for uint16.
+        raw = scale_t.to(torch.int32)
+        bf16_bits = raw << 7
+        bf16_bits = torch.where(raw == 0, 0x0040, bf16_bits)
+        bf16_bits = torch.where(raw == 255, 0x7FC0, bf16_bits)
+        return bf16_bits.to(torch.int16).view(torch.bfloat16).contiguous()
+
+    def _load_validated_pair(
+        self, weight_key: str, scale_key: str, device: str
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        weight = self._as_packed_u8(self.load_tensor(weight_key, device), weight_key)
+        scale = self._normalize_scale_shape(
+            self.load_tensor(scale_key, device), scale_key
+        )
+        self._validate_weight_scale_shapes(weight, scale, weight_key, scale_key)
+        return weight, self._ue8m0_to_bf16(scale, scale_key)
+
+    def load_experts(self, base_key: str, device: str = "cpu"):
+        selected = None
+        expert_count = 0
+        probed_candidates = []
+        rejected_candidates = []
+        for (
+            schema_name,
+            prefix,
+            projections,
+            weight_suffix,
+            scale_suffix,
+        ) in self._unsupported_scale_inv_candidates(base_key):
+            gate_name = projections[0]
+            gate_weight_key = f"{prefix}.0.{gate_name}.{weight_suffix}"
+            gate_scale_key = f"{prefix}.0.{gate_name}.{scale_suffix}"
+            probed_candidates.append(
+                f"unsupported {schema_name}: weight={gate_weight_key}, "
+                f"scale={gate_scale_key}"
+            )
+            if self.has_tensor(gate_weight_key) and self.has_tensor(gate_scale_key):
+                rejected_candidates.append(
+                    f"{schema_name}: weight_scale_inv semantics are not accepted "
+                    "for MXFP4 because this suffix is also used by FP8/MXFP8; "
+                    "use a checkpoint with direct E8M0 scale/weight_scale tensors"
+                )
+        for (
+            schema_name,
+            prefix,
+            projections,
+            weight_suffix,
+            scale_suffix,
+        ) in self._schema_candidates(base_key):
+            gate_name = projections[0]
+            gate_weight_key = f"{prefix}.0.{gate_name}.{weight_suffix}"
+            gate_scale_key = f"{prefix}.0.{gate_name}.{scale_suffix}"
+            probed_candidates.append(
+                f"{schema_name}: weight={gate_weight_key}, scale={gate_scale_key}"
+            )
+            if not self.has_tensor(gate_weight_key) or not self.has_tensor(
+                gate_scale_key
+            ):
+                continue
+            try:
+                self._load_validated_pair(gate_weight_key, gate_scale_key, device)
+            except (TypeError, ValueError) as exc:
+                rejected_candidates.append(f"{schema_name}: {exc}")
+                continue
+            candidate_expert_count = 0
+            while self.has_tensor(
+                f"{prefix}.{candidate_expert_count}.{gate_name}.{weight_suffix}"
+            ):
+                candidate_expert_count += 1
+            if candidate_expert_count > 0:
+                missing_keys = []
+                missing_key_count = 0
+                for expert_id in range(candidate_expert_count):
+                    for projection in projections:
+                        for suffix in (weight_suffix, scale_suffix):
+                            key = f"{prefix}.{expert_id}.{projection}.{suffix}"
+                            if not self.has_tensor(key):
+                                missing_key_count += 1
+                                if len(missing_keys) < 8:
+                                    missing_keys.append(key)
+                if missing_key_count:
+                    rejected_candidates.append(
+                        f"{schema_name}: incomplete candidate; missing "
+                        f"{missing_key_count} tensors, first keys={missing_keys}"
+                    )
+                    continue
+                try:
+                    for projection in projections[1:]:
+                        self._load_validated_pair(
+                            f"{prefix}.0.{projection}.{weight_suffix}",
+                            f"{prefix}.0.{projection}.{scale_suffix}",
+                            device,
+                        )
+                except (TypeError, ValueError) as exc:
+                    rejected_candidates.append(f"{schema_name}: {exc}")
+                    continue
+                expert_count = candidate_expert_count
+                selected = (
+                    schema_name,
+                    prefix,
+                    projections,
+                    weight_suffix,
+                    scale_suffix,
+                )
+                break
+        if selected is None:
+            raise ValueError(
+                f"No MXFP4 experts found for base_key {base_key!r}. "
+                f"Probed schema candidates: {probed_candidates}. "
+                f"Rejected matching candidates: {rejected_candidates}"
+            )
+
+        schema_name, prefix, projections, weight_suffix, scale_suffix = selected
+        gate_name, up_name, down_name = projections
         gate_weights = [None] * expert_count
         up_weights = [None] * expert_count
         down_weights = [None] * expert_count
@@ -1256,25 +1657,34 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
         down_scales = [None] * expert_count
 
         for exp_id in range(expert_count):
-            for proj, dst in (
-                (gate_name, gate_weights),
-                (up_name, up_weights),
-                (down_name, down_weights),
+            for proj, weight_dst, scale_dst in (
+                (gate_name, gate_weights, gate_scales),
+                (up_name, up_weights, up_scales),
+                (down_name, down_weights, down_scales),
             ):
-                w = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight", device).contiguous()
-                if w.dtype != torch.uint8:
-                    w = w.view(torch.uint8)
-                dst[exp_id] = w
+                weight_key = f"{prefix}.{exp_id}.{proj}.{weight_suffix}"
+                scale_key = f"{prefix}.{exp_id}.{proj}.{scale_suffix}"
+                missing = [
+                    key for key in (weight_key, scale_key) if not self.has_tensor(key)
+                ]
+                if missing:
+                    raise ValueError(
+                        f"Incomplete MXFP4 expert for schema={schema_name!r}, "
+                        f"prefix={prefix!r}, expert={exp_id}, projection={proj!r}; "
+                        f"missing tensors={missing}. Probed schema candidates: "
+                        f"{probed_candidates}"
+                    )
 
-            for proj, dst in (
-                (gate_name, gate_scales),
-                (up_name, up_scales),
-                (down_name, down_scales),
-            ):
-                s = self.load_tensor(f"{prefix}.{exp_id}.{proj}.scale", device)
-                dst[exp_id] = self._ue8m0_to_bf16(s)
+                weight, scale = self._load_validated_pair(weight_key, scale_key, device)
+                weight_dst[exp_id] = weight
+                scale_dst[exp_id] = scale
 
-        print(f"[MXFP4SafeTensorLoader] Loaded {expert_count} experts from {prefix}")
+        logger.debug(
+            "[KT] MXFP4 schema resolved: %d experts from %s (schema=%s)",
+            expert_count,
+            prefix,
+            schema_name,
+        )
         return {
             "gate": gate_weights,
             "up": up_weights,

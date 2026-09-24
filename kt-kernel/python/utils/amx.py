@@ -1,27 +1,30 @@
+import ctypes
 import gc
 import glob
 import logging
+import math
 import os
-import torch
-import ctypes
 from typing import List, Optional
+
+import torch
 
 logger = logging.getLogger(__name__)
 
 # Use relative imports for package structure
+import kt_kernel_ext.moe as _moe_mod
+from kt_kernel_ext.moe import MOEConfig
+
 from ..experts_base import BaseMoEWrapper, _temporary_all_cpu_experts_mask
 from .loader import (
-    SafeTensorLoader,
+    BF16SafeTensorLoader,
     CompressedSafeTensorLoader,
     FP8SafeTensorLoader,
-    BF16SafeTensorLoader,
     GPTQSafeTensorLoader,
     MXFP4SafeTensorLoader,
-    NVFP4SafeTensorLoader,
     MXFP8SafeTensorLoader,
+    NVFP4SafeTensorLoader,
+    SafeTensorLoader,
 )
-from kt_kernel_ext.moe import MOEConfig
-import kt_kernel_ext.moe as _moe_mod
 
 AMXInt4_MOE = getattr(_moe_mod, "AMXInt4_MOE", None)
 AMXInt8_MOE = getattr(_moe_mod, "AMXInt8_MOE", None)
@@ -73,6 +76,26 @@ _HAS_SYCL_GPTQ_INT4_SUPPORT = SYCLGPTQInt4_MOE is not None
 _AVXVNNI256_GPTQ_INT4_MAX_GROUP_SIZE = 256
 _AVXVNNI256_PACKED_GPTQ_INT4_MAX_GROUP_SIZE = 2048
 _AVXVNNI256_RAW_INT4_MAX_GROUP_SIZE = 256
+
+# Native CPU formats whose gate/up outputs all flow through the shared
+# AMX_MOE_BASE, AVX2_MOE_BASE, or NEON_MOE_BASE activation contract. SYCL is
+# deliberately excluded because its fused device kernels apply activation
+# internally and currently accept only the legacy swiglu fields.
+NATIVE_SITU_METHODS = frozenset(
+    {
+        "RAWINT4",
+        "FP8",
+        "BF16",
+        "FP8_PERCHANNEL",
+        "GPTQ_INT4",
+        "MXFP4",
+        "NVFP4",
+        "MXFP8",
+    }
+)
+# SYCL has its own fused activation kernels: they implement the legacy
+# SiLU/SwiGLU-OAI alpha+clamp contract, but not SiTU.
+NATIVE_SWIGLU_METHODS = NATIVE_SITU_METHODS | {"SYCL_GPTQ_INT4"}
 
 
 def _validate_block_fp8_layout(
@@ -783,6 +806,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
     """Wrapper for native CPU/SYCL experts stored in compressed SafeTensor format."""
 
     _native_loader_instance = None
+    _native_loader_key = None
 
     def __init__(
         self,
@@ -803,20 +827,79 @@ class NativeMoEWrapper(BaseMoEWrapper):
         swiglu_limit: float = 0.0,
         swiglu_alpha: float = 0.0,
         pack_all_experts_on_load: bool = False,
+        activation: Optional[str] = None,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
     ):
+        # Keep direct NativeMoEWrapper callers compatible with the factory's
+        # pre-contract arguments. The exact K3 tuple is translated into the
+        # independent SiTU fields; other positive alpha values retain their
+        # historical SwiGLU-OAI meaning.
+        if activation is None:
+            if method == "MXFP4" and swiglu_alpha == 4.0 and swiglu_limit == 25.0:
+                activation = "situ"
+                situ_beta = swiglu_alpha
+                situ_linear_beta = swiglu_limit
+                swiglu_alpha = 0.0
+                swiglu_limit = 0.0
+            else:
+                activation = "swiglu_oai" if swiglu_alpha > 0.0 else "silu"
         self._swiglu_alpha = float(swiglu_alpha)
+        self._activation_type = activation
+        self._situ_beta = None if situ_beta is None else float(situ_beta)
+        self._situ_linear_beta = (
+            None if situ_linear_beta is None else float(situ_linear_beta)
+        )
         self.pack_all_experts_on_load = bool(pack_all_experts_on_load)
-        # Defence in depth: reject swiglu_limit on methods whose native MoE
-        # activation contract has not been validated.  The block-FP8 backend
-        # shares the same MOEConfig/act_fn path as MXFP4/MXFP8 and is required
-        # by GLM-5-Next's E4M3 + FP32 [128, 128] checkpoint format.
-        # if the experts.py guard is bypassed (e.g., by a future caller
-        # that constructs NativeMoEWrapper directly). Origin: kt-sglang 耦合.
-        if swiglu_limit != 0.0 and method not in ("FP8", "MXFP4", "MXFP8"):
+        if not math.isfinite(swiglu_limit) or swiglu_limit < 0.0:
+            raise ValueError("swiglu_limit must be finite and non-negative.")
+        if not math.isfinite(swiglu_alpha) or swiglu_alpha < 0.0:
+            raise ValueError("swiglu_alpha must be finite and non-negative.")
+        if activation not in ("silu", "swiglu_oai", "situ"):
+            raise ValueError(f"Unsupported NativeMoEWrapper activation: {activation!r}")
+        if activation == "situ":
+            if method not in NATIVE_SITU_METHODS:
+                raise ValueError(
+                    f"NativeMoEWrapper SiTU is unsupported for method={method!r}; "
+                    f"supported native CPU methods are {sorted(NATIVE_SITU_METHODS)}."
+                )
+            if (
+                self._situ_beta is None
+                or not math.isfinite(self._situ_beta)
+                or self._situ_beta <= 0.0
+            ):
+                raise ValueError(
+                    "NativeMoEWrapper SiTU requires a finite positive situ_beta."
+                )
+            if self._situ_linear_beta is not None and (
+                not math.isfinite(self._situ_linear_beta)
+                or self._situ_linear_beta < 0.0
+            ):
+                raise ValueError(
+                    "situ_linear_beta must be finite and non-negative when provided."
+                )
+            if swiglu_alpha != 0.0 or swiglu_limit != 0.0:
+                raise ValueError(
+                    "SiTU must not reuse swiglu_alpha/swiglu_limit."
+                )
+        elif self._situ_beta is not None or self._situ_linear_beta is not None:
+            raise ValueError("SiTU beta parameters require activation='situ'.")
+        elif activation == "swiglu_oai" and (
+            not math.isfinite(swiglu_alpha) or swiglu_alpha <= 0.0
+        ):
+            raise ValueError(
+                "SwiGLU-OAI requires a finite positive swiglu_alpha."
+            )
+        elif activation == "silu" and swiglu_alpha != 0.0:
+            raise ValueError("activation='silu' cannot use swiglu_alpha.")
+        # Defence in depth for direct callers: only methods whose gate/up
+        # outputs use the shared CPU activation base may consume clamp/OAI/SiTU
+        # parameters. SYCL applies activation inside its fused device kernel.
+        if swiglu_limit != 0.0 and method not in NATIVE_SWIGLU_METHODS:
             raise ValueError(
                 f"NativeMoEWrapper received swiglu_limit={swiglu_limit} with "
-                f"method={method!r}; the clamp is supported only by "
-                "FP8/MXFP4/MXFP8. "
+                f"method={method!r}; the clamp requires one of the shared native "
+                f"CPU/device methods {sorted(NATIVE_SWIGLU_METHODS)}. "
                 f"This indicates a missing guard in the caller."
             )
         if method == "RAWINT4" and not (
@@ -903,11 +986,13 @@ class NativeMoEWrapper(BaseMoEWrapper):
             method=method,
             numa_nodes=numa_nodes,
             swiglu_limit=swiglu_limit,
+            activation=activation,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
 
-        if NativeMoEWrapper._native_loader_instance is None:
-            NativeMoEWrapper._native_loader_instance = NativeMoEWrapper._create_loader(method, weight_path)
-        self.loader = NativeMoEWrapper._native_loader_instance
+        self._loader_key = NativeMoEWrapper._make_loader_key(method, weight_path)
+        self.loader = NativeMoEWrapper._ensure_loader(method, weight_path)
 
         self.gate_weights = None
         self.up_weights = None
@@ -938,21 +1023,69 @@ class NativeMoEWrapper(BaseMoEWrapper):
             raise NotImplementedError(f"Unsupported method for NativeMoEWrapper: {method}")
 
     @staticmethod
-    def _release_loader(layer_idx: int = -1):
-        if NativeMoEWrapper._native_loader_instance is not None:
-            NativeMoEWrapper._native_loader_instance.close_all_handles()
-            NativeMoEWrapper._native_loader_instance = None
+    def _make_loader_key(method: str, weight_path: str):
+        return method, os.path.realpath(os.path.abspath(os.fspath(weight_path)))
+
+    @classmethod
+    def _ensure_loader(cls, method: str, weight_path: str):
+        import time
+
+        loader_key = cls._make_loader_key(method, weight_path)
+        if (
+            cls._native_loader_instance is None
+            or cls._native_loader_key != loader_key
+        ):
+            if cls._native_loader_instance is not None:
+                # A different checkpoint/model is being constructed in this
+                # process.  Its wrappers retain their own immutable index, but
+                # no stale mmap handle should remain in the singleton cache.
+                cls._native_loader_instance.close_all_handles(collect=False)
+            started = time.perf_counter()
+            logger.info(
+                "[KT] Building shared native expert index: method=%s, path=%s",
+                method,
+                weight_path,
+            )
+            cls._native_loader_instance = cls._create_loader(method, weight_path)
+            cls._native_loader_key = loader_key
+            logger.debug(
+                "[KT] Shared native expert index ready in %.2fs: %d keys, %d shards",
+                time.perf_counter() - started,
+                len(cls._native_loader_instance.tensor_file_map),
+                len(cls._native_loader_instance.checkpoint_files),
+            )
+        return cls._native_loader_instance
+
+    @classmethod
+    def _release_loader(
+        cls, layer_idx: int = -1, *, drop_index: bool = False, loader=None
+    ):
+        target_loader = loader or cls._native_loader_instance
+        if target_loader is not None:
+            if drop_index:
+                target_loader.clear_index()
+            else:
+                # Layer tensors have been copied into the native NUMA buffers.
+                # Drop mmap handles but retain the one shared 500k-key index;
+                # rebuilding that index for every layer is prohibitively slow.
+                target_loader.close_all_handles(collect=False)
+            if drop_index and target_loader is cls._native_loader_instance:
+                cls._native_loader_instance = None
+                cls._native_loader_key = None
             if layer_idx >= 0:
-                logger.info(
-                    "[KT] Released NativeMoEWrapper loader after layer %d: " "safetensors mmap handles freed.",
+                logger.debug(
+                    "[KT] Closed native safetensors handles after layer %d; "
+                    "shared tensor index retained.",
                     layer_idx,
                 )
-            else:
-                logger.info("[KT] Released NativeMoEWrapper loader: safetensors mmap handles freed.")
+            elif drop_index:
+                logger.info(
+                    "[KT] Released NativeMoEWrapper safetensors handles and index."
+                )
 
-    @staticmethod
-    def force_release_loader():
-        NativeMoEWrapper._release_loader()
+    @classmethod
+    def force_release_loader(cls):
+        cls._release_loader(drop_index=True)
 
     def load_weights_from_tensors(
         self,
@@ -966,35 +1099,44 @@ class NativeMoEWrapper(BaseMoEWrapper):
     def load_weights(self, physical_to_logical_map_cpu: torch.Tensor):
         import time
 
-        if NativeMoEWrapper._native_loader_instance is None:
-            t_recreate_start = time.time()
-            NativeMoEWrapper._native_loader_instance = NativeMoEWrapper._create_loader(self.method, self.weight_path)
-            self.loader = NativeMoEWrapper._native_loader_instance
-            t_recreate_elapsed = (time.time() - t_recreate_start) * 1000
-            logger.info(
-                "[KT] Recreated NativeMoEWrapper loader for layer %d (took %.1fms)",
-                self.layer_idx,
-                t_recreate_elapsed,
+        if not getattr(self.loader, "tensor_file_map", None):
+            self.loader = NativeMoEWrapper._ensure_loader(
+                self.method, self.weight_path
             )
-        else:
-            self.loader = NativeMoEWrapper._native_loader_instance
 
         t0 = time.time()
+        logger.info(
+            "[KT] Loading native %s experts for layer %d from safetensors",
+            self.method,
+            self.layer_idx,
+        )
         _candidates = [
             f"model.layers.{self.layer_idx}",
+            f"language_model.layers.{self.layer_idx}",
             f"language_model.model.layers.{self.layer_idx}",
             f"model.language_model.layers.{self.layer_idx}",
         ]
         weights = None
+        load_errors = []
         for base_key in _candidates:
             try:
                 weights = self.loader.load_experts(base_key)
                 break
-            except (ValueError, KeyError):
+            except (TypeError, ValueError, KeyError) as exc:
+                load_errors.append(f"{base_key}: {exc}")
                 continue
         if weights is None:
-            raise ValueError(f"No experts found for layer {self.layer_idx} under any prefix: {_candidates}")
+            raise ValueError(
+                f"No experts found for layer {self.layer_idx} under any prefix: "
+                f"{_candidates}. Loader diagnostics: {load_errors}"
+            )
         t1 = time.time()
+        logger.debug(
+            "[KT] Layer %d expert tensors prepared in %.2fs (%d shard handles open)",
+            self.layer_idx,
+            t1 - t0,
+            len(self.loader.file_handle_map),
+        )
 
         # Keep individual tensors instead of stacking - avoid expensive memory copy
         # weights["gate"], weights["up"], weights["down"] are lists of tensors per expert
@@ -1146,24 +1288,23 @@ class NativeMoEWrapper(BaseMoEWrapper):
         moe_config.layer_idx = self.layer_idx
         moe_config.pool = self.cpu_infer.backend_
         moe_config.max_len = self.chunked_prefill_size
-        # Clamp-before-SiLU; 0.0 = disabled. Read by `act_fn` in
-        # operators/amx/la/amx.hpp via
-        # `apply_activation` in operators/amx/moe_base.hpp. Re-checked here
-        # (defence in depth) so a future caller that bypasses both the
-        # experts.py and the __init__ guards still cannot apply the clamp on
-        # unvalidated RAWINT4 / BF16 / FP8_PERCHANNEL / GPTQ_INT4 paths.
-        # Origin: kt-sglang 耦合.
-        if self.swiglu_limit != 0.0 and self.method not in (
-            "FP8",
-            "MXFP4",
-            "MXFP8",
-        ):
+        # Clamp-before-gated-activation; 0.0 = disabled. Re-check the shared
+        # activation capability here in case a caller bypasses the factory.
+        if self.swiglu_limit != 0.0 and self.method not in NATIVE_SWIGLU_METHODS:
             raise ValueError(
                 f"NativeMoEWrapper.load_weights: swiglu_limit="
                 f"{self.swiglu_limit} with method={self.method!r}; clamp is "
-                f"only valid for FP8/MXFP4/MXFP8."
+                f"only valid for shared native CPU methods "
+                f"{sorted(NATIVE_SWIGLU_METHODS)}."
             )
         moe_config.swiglu_limit = self.swiglu_limit
+        activation_types = {"silu": 0, "swiglu_oai": 1, "situ": 2}
+        moe_config.activation_type = activation_types[self._activation_type]
+        moe_config.swiglu_alpha = (
+            self._swiglu_alpha if self._activation_type == "swiglu_oai" else 0.0
+        )
+        moe_config.situ_beta = self._situ_beta or 0.0
+        moe_config.situ_linear_beta = self._situ_linear_beta or 0.0
 
         # Use gate_projs instead of gate_proj for per-expert pointers
         moe_config.gate_projs = gate_ptrs
@@ -1249,7 +1390,6 @@ class NativeMoEWrapper(BaseMoEWrapper):
             moe_config.quant_config.bits = 8
             moe_config.quant_config.group_size = group_size
             moe_config.quant_config.zero_point = False
-            moe_config.swiglu_alpha = getattr(self, "_swiglu_alpha", 0.0)
             backend_cls = _select_mxfp8_backend()
             if backend_cls is None:
                 raise RuntimeError(
@@ -1330,6 +1470,11 @@ class NativeMoEWrapper(BaseMoEWrapper):
         # Pass the wrapper-owned mapping to the asynchronous native loader;
         # the C++ MoE retains this pointer for later layerwise staging calls.
         load_task = self.moe.load_weights_task(self.physical_to_logical_map_cpu.data_ptr())
+        logger.debug(
+            "[KT] Layer %d copying %d experts into native NUMA buffers",
+            self.layer_idx,
+            self.num_experts,
+        )
         with _temporary_all_cpu_experts_mask(
             self.gpu_experts_mask,
             self.pack_all_experts_on_load and self.num_gpu_experts > 0,
@@ -1337,6 +1482,11 @@ class NativeMoEWrapper(BaseMoEWrapper):
             self.cpu_infer.submit(load_task)
             self.cpu_infer.sync()
         t5 = time.time()
+        logger.debug(
+            "[KT] Layer %d native NUMA copy finished in %.2fs",
+            self.layer_idx,
+            t5 - t4,
+        )
 
         del self.gate_weights
         del self.up_weights
@@ -1345,19 +1495,25 @@ class NativeMoEWrapper(BaseMoEWrapper):
             del self.gate_scales
             del self.up_scales
             del self.down_scales
+        del weights
 
-        NativeMoEWrapper._release_loader(layer_idx=self.layer_idx)
+        NativeMoEWrapper._release_loader(
+            layer_idx=self.layer_idx, loader=self.loader
+        )
         t6 = time.time()
 
-        print(
-            f"[NativeMoEWrapper Layer {self.layer_idx}] "
-            f"load_experts: {(t1-t0)*1000:.1f}ms, "
-            f"prepare_tensors: {(t2-t1)*1000:.1f}ms, "
-            f"build_ptrs: {(t3-t2)*1000:.1f}ms, "
-            f"create_moe: {(t4-t3)*1000:.1f}ms, "
-            f"cpp_load_weights: {(t5-t4)*1000:.1f}ms, "
-            f"cleanup: {(t6-t5)*1000:.1f}ms, "
-            f"total: {(t6-t0)*1000:.1f}ms"
+        logger.info(
+            "[KT] Native layer %d loaded: load_experts=%.1fms, "
+            "prepare_tensors=%.1fms, build_ptrs=%.1fms, create_moe=%.1fms, "
+            "cpp_load_weights=%.1fms, cleanup=%.1fms, total=%.1fms",
+            self.layer_idx,
+            (t1 - t0) * 1000,
+            (t2 - t1) * 1000,
+            (t3 - t2) * 1000,
+            (t4 - t3) * 1000,
+            (t5 - t4) * 1000,
+            (t6 - t5) * 1000,
+            (t6 - t0) * 1000,
         )
 
     def submit_write_weight_scale_to_buffer(

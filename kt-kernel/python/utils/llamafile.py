@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from typing import Dict, List, Optional
 
@@ -51,6 +52,7 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
         numa_nodes: Optional[List[int]] = None,
         swiglu_limit: float = 0.0,
         swiglu_alpha: float = 0.0,
+        activation: Optional[str] = None,
     ):
         """
         Initialize Llamafile MoE Wrapper.
@@ -128,6 +130,26 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
             print(f"  TP {tp_id}: size={tp_size}, offset={current_offset}, blocks={tp_blocks}")
             current_offset += tp_size
 
+        if activation is None:
+            activation = "swiglu_oai" if swiglu_alpha > 0.0 else "silu"
+        if not isinstance(activation, str):
+            raise ValueError(f"Unsupported Llamafile MoE activation: {activation!r}")
+        activation = activation.lower()
+        if activation not in ("silu", "swiglu_oai"):
+            raise ValueError(
+                "Llamafile MoE supports only 'silu' and 'swiglu_oai'; "
+                f"got {activation!r}."
+            )
+        if not math.isfinite(swiglu_limit) or swiglu_limit < 0.0:
+            raise ValueError("swiglu_limit must be finite and non-negative.")
+        if activation == "swiglu_oai":
+            if not math.isfinite(swiglu_alpha) or swiglu_alpha <= 0.0:
+                raise ValueError(
+                    "Llamafile SwiGLU-OAI requires a finite positive swiglu_alpha."
+                )
+        elif swiglu_alpha != 0.0:
+            raise ValueError("activation='silu' cannot use swiglu_alpha.")
+        self._activation_type = activation
         self._swiglu_alpha = float(swiglu_alpha)
 
         # Initialize base class
@@ -147,6 +169,7 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
             method=method,
             numa_nodes=numa_nodes,
             swiglu_limit=swiglu_limit,
+            activation=activation,
         )
 
         self.weights_to_keep = None
@@ -233,7 +256,10 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
         moe_config.max_len = _effective_chunk
         moe_config.group_max_len = _effective_chunk
         moe_config.swiglu_limit = self.swiglu_limit
-        moe_config.swiglu_alpha = self._swiglu_alpha
+        moe_config.activation_type = 1 if self._activation_type == "swiglu_oai" else 0
+        moe_config.swiglu_alpha = (
+            self._swiglu_alpha if self._activation_type == "swiglu_oai" else 0.0
+        )
 
         # Set weight pointers
         moe_config.gate_proj = gate_data.data_ptr()

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import math
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,14 +18,21 @@ from types import SimpleNamespace
 KT_KERNEL_ROOT = Path(__file__).resolve().parents[1]
 EXPERTS_PATH = KT_KERNEL_ROOT / "python/experts.py"
 AMX_PATH = KT_KERNEL_ROOT / "python/utils/amx.py"
-ALLOWED_METHODS = ("FP8", "MXFP4", "MXFP8")
-REJECTED_METHODS = (
-    "RAWINT4",
-    "BF16",
-    "FP8_PERCHANNEL",
-    "GPTQ_INT4",
-    "SYCL_GPTQ_INT4",
+NATIVE_SITU_METHODS = frozenset(
+    {
+        "RAWINT4",
+        "FP8",
+        "BF16",
+        "FP8_PERCHANNEL",
+        "GPTQ_INT4",
+        "MXFP4",
+        "NVFP4",
+        "MXFP8",
+    }
 )
+NATIVE_SWIGLU_METHODS = NATIVE_SITU_METHODS | {"SYCL_GPTQ_INT4"}
+ALLOWED_METHODS = tuple(sorted(NATIVE_SWIGLU_METHODS))
+REJECTED_METHODS = ()
 
 
 class _Recorder:
@@ -74,6 +82,9 @@ def _compile_factory():
         "NativeMoEWrapper": _NativeRecorder,
         "LlamafileMoEWrapper": _LlamafileRecorder,
         "GeneralMoEWrapper": _GeneralRecorder,
+        "NATIVE_SITU_METHODS": NATIVE_SITU_METHODS,
+        "NATIVE_SWIGLU_METHODS": NATIVE_SWIGLU_METHODS,
+        "math": math,
     }
     exec(compile(module, str(EXPERTS_PATH), "exec"), namespace)
     return namespace["_create_inference_wrapper"]
@@ -121,7 +132,10 @@ def _native_guard(method_name: str):
         decorator_list=[],
     )
     module = ast.fix_missing_locations(ast.Module(body=[wrapper], type_ignores=[]))
-    namespace = {}
+    namespace = {
+        "NATIVE_SITU_METHODS": NATIVE_SITU_METHODS,
+        "NATIVE_SWIGLU_METHODS": NATIVE_SWIGLU_METHODS,
+    }
     exec(compile(module, str(AMX_PATH), "exec"), namespace)
     return namespace["guard"]
 
@@ -155,11 +169,16 @@ class TestSwigluLimitMethodGuards(unittest.TestCase):
         self.assertEqual(wrapper.kwargs["swiglu_limit"], 10.0)
         self.assertEqual(wrapper.kwargs["swiglu_alpha"], 0.0)
 
-    def test_factory_does_not_widen_other_native_formats(self):
+    def test_factory_forwards_limit_to_all_shared_native_activation_formats(self):
         factory = _compile_factory()
+        for method in ALLOWED_METHODS:
+            with self.subTest(method=method):
+                wrapper = factory(**_factory_kwargs(method, 10.0))
+                self.assertEqual(wrapper.kwargs["swiglu_limit"], 10.0)
+
         for method in REJECTED_METHODS:
             with self.subTest(method=method):
-                with self.assertRaisesRegex(ValueError, "only supported"):
+                with self.assertRaisesRegex(ValueError, "shared CPU activation"):
                     factory(**_factory_kwargs(method, 10.0))
 
     def test_factory_forwards_dynamic_load_flag_only_to_native_backend(self):
@@ -186,10 +205,10 @@ class TestSwigluLimitMethodGuards(unittest.TestCase):
 
         for method in REJECTED_METHODS:
             with self.subTest(guard="init", method=method):
-                with self.assertRaisesRegex(ValueError, "supported only"):
+                with self.assertRaisesRegex(ValueError, "shared native CPU"):
                     init_guard(10.0, method)
             with self.subTest(guard="load", method=method):
-                with self.assertRaisesRegex(ValueError, "only valid"):
+                with self.assertRaisesRegex(ValueError, "shared native CPU"):
                     load_guard(SimpleNamespace(swiglu_limit=10.0, method=method))
 
 

@@ -332,7 +332,7 @@ inline sycl::event submit_gate_up_decode(int m, int n, int k, GemmKernelSYCLGPTQ
             float activated;
             if (swiglu_alpha > 0.0f) {
               if (swiglu_limit > 0.0f) {
-                gate_value = sycl::fmin(sycl::fmax(gate_value, -swiglu_limit), swiglu_limit);
+                gate_value = sycl::fmin(gate_value, swiglu_limit);
                 up_value = sycl::fmin(sycl::fmax(up_value, -swiglu_limit), swiglu_limit);
               }
               const float sigmoid = 1.0f / (1.0f + sycl::native::exp(-gate_value * swiglu_alpha));
@@ -417,7 +417,7 @@ inline sycl::event submit_down_decode(int m, int n, int k, GemmKernelSYCLGPTQInt
 inline float prefill_swiglu(float gate, float up, float swiglu_limit, float swiglu_alpha) {
   if (swiglu_alpha > 0.0f) {
     if (swiglu_limit > 0.0f) {
-      gate = sycl::fmin(sycl::fmax(gate, -swiglu_limit), swiglu_limit);
+      gate = sycl::fmin(gate, swiglu_limit);
       up = sycl::fmin(sycl::fmax(up, -swiglu_limit), swiglu_limit);
     }
     const float sigmoid = 1.0f / (1.0f + sycl::native::exp(-gate * swiglu_alpha));
@@ -758,20 +758,38 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
   using Base::tp_part_idx;
   using Base::up_bb_;
 
+  static GeneralMOEConfig validated_sycl_config(GeneralMOEConfig config) {
+    config.validate_activation();
+    if (config.activation_type == MOE_ACTIVATION_SITU) {
+      throw std::invalid_argument(
+          "SYCL GPTQ INT4 does not support SiTU in its fused device activation kernels");
+    }
+    const int group_size = config.quant_config.group_size;
+    if (group_size <= 0 || (group_size % 8) != 0) {
+      throw std::runtime_error(
+          "SYCL GPTQ INT4 requires a positive group_size divisible by 8");
+    }
+    if (config.hidden_size <= 0 || config.intermediate_size <= 0 ||
+        (config.hidden_size % 8) != 0 || (config.intermediate_size % 8) != 0 ||
+        (config.hidden_size % group_size) != 0 ||
+        (config.intermediate_size % group_size) != 0) {
+      throw std::runtime_error(
+          "SYCL GPTQ INT4 hidden/intermediate sizes must be positive and "
+          "divisible by 8 and group_size");
+    }
+    T::config();
+    return config;
+  }
+
  public:
   using typename Base::input_t;
   using typename Base::output_t;
 
   SYCL_GPTQ_INT4_MOE_TP() = default;
-  SYCL_GPTQ_INT4_MOE_TP(GeneralMOEConfig config, int tp_part_idx_ = 0) : Base(config, tp_part_idx_) {}
+  SYCL_GPTQ_INT4_MOE_TP(GeneralMOEConfig config, int tp_part_idx_ = 0)
+      : Base(validated_sycl_config(config), tp_part_idx_) {}
 
-  void derived_init() {
-    T::config();
-    const int group_size = config_.quant_config.group_size;
-    if (group_size <= 0 || (group_size % 8) != 0) {
-      throw std::runtime_error("SYCL GPTQ INT4 requires a positive group_size divisible by 8");
-    }
-  }
+  void derived_init() {}
 
   size_t buffer_a_required_size_impl(size_t m, size_t k) const { return T::BufferA::required_size(m, k); }
   size_t buffer_b_required_size_impl(size_t n, size_t k) const {
@@ -806,7 +824,7 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
           scratch->prefill_tile_experts, scratch->prefill_tile_rows, scratch->prefill_inputs,
           scratch->prefill_gate_qweights, scratch->prefill_up_qweights, scratch->prefill_gate_scales,
           scratch->prefill_up_scales, scratch->prefill_activations, config_.quant_config.group_size,
-          config_.swiglu_limit, config_.swiglu_alpha);
+          config_.swiglu_limit, config_.effective_swiglu_alpha());
       sparse_down_event = sycl_int4::submit_prefill_down<sycl_int4::kPrefillSparseRows>(
           sparse_tiles, config_.hidden_size, config_.intermediate_size, scratch->prefill_row_counts,
           scratch->prefill_tile_experts, scratch->prefill_tile_rows, scratch->prefill_activations,
@@ -825,7 +843,8 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
           dense_tiles, config_.intermediate_size, config_.hidden_size, scratch->prefill_row_counts, dense_experts,
           dense_rows, scratch->prefill_q8_scratch, scratch->prefill_gate_qweights, scratch->prefill_up_qweights,
           scratch->prefill_gate_scales, scratch->prefill_up_scales, scratch->prefill_activations,
-          config_.quant_config.group_size, config_.swiglu_limit, config_.swiglu_alpha, quantization_event);
+          config_.quant_config.group_size, config_.swiglu_limit, config_.effective_swiglu_alpha(),
+          quantization_event);
       dense_down_event = sycl_int4::submit_prefill_down<sycl_int4::kPrefillDenseRows>(
           dense_tiles, config_.hidden_size, config_.intermediate_size, scratch->prefill_row_counts, dense_experts,
           dense_rows, scratch->prefill_activations, scratch->prefill_down_qweights, scratch->prefill_down_scales,
@@ -859,7 +878,7 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
       const int expert = m_expert_id_map_[task];
       scratch->gate_up_events.push_back(sycl_int4::submit_gate_up_decode(
           m_local_num_[expert], config_.intermediate_size, config_.hidden_size, *gate_up_ba_[expert], *gate_bb_[expert],
-          *up_bb_[expert], *down_ba_[expert], config_.swiglu_limit, config_.swiglu_alpha));
+          *up_bb_[expert], *down_ba_[expert], config_.swiglu_limit, config_.effective_swiglu_alpha()));
       scratch->gate_up_experts.push_back(expert);
     }
     scratch->active_experts = activated_experts;

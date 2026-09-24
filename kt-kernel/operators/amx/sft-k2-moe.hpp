@@ -130,6 +130,7 @@ class AMX_K2_SFT_MOE_TP : public AMX_K2_MOE_TP<T> {
   }
 
   static GeneralMOEConfig validated_base_config(const MOESFTConfig& config) {
+    config.validate_sft_activation();
     GeneralMOEConfig base_config = static_cast<const GeneralMOEConfig&>(config);
     validate_k2_kgroup_contract(base_config);
     return base_config;

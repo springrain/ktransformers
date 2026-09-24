@@ -44,6 +44,34 @@ static inline __m512 exp_avx512(__m512 x) {
   return _mm512_mul_ps(two_pow_i, frac_exp);
 }
 
+static inline __m512 tanh_avx512(__m512 x) {
+  const __m512 original = x;
+  const __mmask16 nan_mask = _mm512_cmp_ps_mask(original, original, _CMP_UNORD_Q);
+  const __m512 bound = _mm512_set1_ps(44.0f);
+  x = _mm512_min_ps(_mm512_max_ps(x, _mm512_sub_ps(_mm512_setzero_ps(), bound)), bound);
+  const __m512 exp_2x = exp_avx512(_mm512_add_ps(x, x));
+  const __m512 result = _mm512_div_ps(_mm512_sub_ps(exp_2x, _mm512_set1_ps(1.0f)),
+                                      _mm512_add_ps(exp_2x, _mm512_set1_ps(1.0f)));
+  return _mm512_mask_mov_ps(result, nan_mask, original);
+}
+
+// SiTU (SoftCap-GLU). This is intentionally separate from
+// SwiGLU-OAI: sigmoid sees the original gate, while tanh applies the softcaps.
+static inline __m512 situ_fn(__m512 gate_val, __m512 up_val, float beta, float linear_beta) {
+  const __m512 one = _mm512_set1_ps(1.0f);
+  const __m512 beta_v = _mm512_set1_ps(beta);
+  const __m512 gate_softcap = _mm512_mul_ps(beta_v, tanh_avx512(_mm512_div_ps(gate_val, beta_v)));
+  __m512 neg_gate = _mm512_sub_ps(_mm512_setzero_ps(), gate_val);
+  neg_gate = _mm512_min_ps(_mm512_max_ps(neg_gate, _mm512_set1_ps(-88.0f)), _mm512_set1_ps(88.0f));
+  const __m512 sigmoid_gate = _mm512_div_ps(one, _mm512_add_ps(one, exp_avx512(neg_gate)));
+  __m512 up_softcap = up_val;
+  if (linear_beta > 0.0f) {
+    const __m512 linear_beta_v = _mm512_set1_ps(linear_beta);
+    up_softcap = _mm512_mul_ps(linear_beta_v, tanh_avx512(_mm512_div_ps(up_val, linear_beta_v)));
+  }
+  return _mm512_mul_ps(_mm512_mul_ps(gate_softcap, sigmoid_gate), up_softcap);
+}
+
 static inline __m512 act_fn(__m512 gate_val, __m512 up_val, float swiglu_limit = 0.0f) {
   // DeepSeek V4-Flash 2604B asymmetric SwiGLU clamp. swiglu_limit > 0
   // applies the same clamp the trtllm `gemm1_clamp_limit` and the sglang
@@ -73,17 +101,16 @@ static inline __m512 act_fn(__m512 gate_val, __m512 up_val, float swiglu_limit =
 }
 
 // MiniMax M3 "swigluoai" activation + DeepSeek V4 "silu" unified entry point.
-//   alpha > 0  → swigluoai: gate * sigmoid(gate * alpha) * (up + 1), symmetric clamp
-//   alpha == 0 → falls back to standard silu path above
+//   alpha > 0 -> swigluoai: gate * sigmoid(gate * alpha) * (up + 1), upper-only gate clamp
+//   alpha == 0 -> falls back to standard silu path above
 static inline __m512 act_fn(__m512 gate_val, __m512 up_val, float swiglu_limit, float swiglu_alpha) {
   if (swiglu_alpha > 0.0f) {
     // --- MiniMax M3 swigluoai path ---
-    // Symmetric clamp on both gate and up (differs from V4 which clamps gate one-sided)
+    // SwiGLU-OAI clamps gate only from above and clamps up symmetrically.
     if (swiglu_limit > 0.0f) {
       const __m512 pos_lim = _mm512_set1_ps(swiglu_limit);
       const __m512 neg_lim = _mm512_set1_ps(-swiglu_limit);
       gate_val = _mm512_min_ps(gate_val, pos_lim);
-      gate_val = _mm512_max_ps(gate_val, neg_lim);
       up_val = _mm512_min_ps(up_val, pos_lim);
       up_val = _mm512_max_ps(up_val, neg_lim);
     }

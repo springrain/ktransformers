@@ -475,7 +475,7 @@ class TP_MOE_SFT : public TP_MOE<T> {
 
  public:
   TP_MOE_SFT(const MOESFTConfig& config)
-      : Base(static_cast<const GeneralMOEConfig&>(config), make_sft_part_factory(config)), sft_config(config) {
+      : Base(make_validated_sft_base_config(config), make_sft_part_factory(config)), sft_config(config) {
     printf("Creating TP_MOE_SFT layer %d\n", config.layer_idx);
 
     if (config.full_weight_grad && T::kIsInt8Backend) {

@@ -9,15 +9,16 @@ This module contains base classes and utilities shared across all backend implem
 
 from __future__ import annotations
 
-import torch
-from typing import Dict, List, Optional, Tuple
-from abc import ABC, abstractmethod
-from collections import OrderedDict
-from contextlib import contextmanager
 import ctypes
 import logging
 import os
+import time
+from abc import ABC, abstractmethod
+from collections import OrderedDict
+from contextlib import contextmanager
+from typing import Dict, List, Optional, Tuple
 
+import torch
 from kt_kernel import kt_kernel_ext
 
 logger = logging.getLogger(__name__)
@@ -418,6 +419,16 @@ class _MoEBase:
             CPUInfer singleton instance
         """
         if cls._cpu_infer_instance is None:
+            if threadpool_count <= 0:
+                raise ValueError(
+                    f"threadpool_count must be positive, got {threadpool_count}"
+                )
+            if cpuinfer_threads < threadpool_count:
+                raise ValueError(
+                    "cpuinfer_threads must be at least threadpool_count so every "
+                    f"NUMA subpool has a worker (got {cpuinfer_threads} and "
+                    f"{threadpool_count})"
+                )
             try:
                 if torch.npu.is_available():  # type: ignore[attr-defined]
                     _ensure_ascend_callback_worker()
@@ -441,7 +452,20 @@ class _MoEBase:
             worker_config.subpool_count = threadpool_count
             worker_config.subpool_numa_map = subpool_numa_map
             worker_config.subpool_thread_count = subpool_thread_count
+            started = time.perf_counter()
+            logger.info(
+                "[KT] Initializing CPUInfer: threads=%d, subpools=%d, "
+                "numa_nodes=%s, threads_per_subpool=%s",
+                cpuinfer_threads,
+                threadpool_count,
+                subpool_numa_map,
+                subpool_thread_count,
+            )
             cls._cpu_infer_instance = kt_kernel_ext.CPUInfer(worker_config)
+            logger.info(
+                "[KT] CPUInfer initialized in %.2fs",
+                time.perf_counter() - started,
+            )
 
         return cls._cpu_infer_instance
 
@@ -497,6 +521,9 @@ class BaseMoEWrapper(_MoEBase, ABC):
         method: str = "AMXINT4",
         numa_nodes: Optional[List[int]] = None,
         swiglu_limit: float = 0.0,
+        activation: str = "silu",
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
     ):
         """
         Initialize base MoE Wrapper.
@@ -556,6 +583,11 @@ class BaseMoEWrapper(_MoEBase, ABC):
         # MOEConfig.swiglu_limit. Other backends ignore it (C++ act_fn skips
         # the clamp branch when limit==0). Origin: kt-sglang 耦合.
         self.swiglu_limit = float(swiglu_limit)
+        self.activation = activation
+        self.situ_beta = None if situ_beta is None else float(situ_beta)
+        self.situ_linear_beta = (
+            None if situ_linear_beta is None else float(situ_linear_beta)
+        )
 
         # Initialize CPU inference engine (singleton via shared base class)
         self.cpu_infer = self._get_cpu_infer(cpuinfer_threads, threadpool_count, numa_nodes=numa_nodes)

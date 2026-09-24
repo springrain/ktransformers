@@ -119,6 +119,14 @@ class MOE_KERNEL_TP
   static constexpr double ELEMENT_SIZE = T::ELEMENT_SIZE;
 
   MOE_KERNEL_TP(GeneralMOEConfig config, int tp_part_idx) {
+    config.validate_activation();
+    const bool is_plain_silu =
+        config.activation_type == MOE_ACTIVATION_AUTO || config.activation_type == MOE_ACTIVATION_SILU;
+    if (!is_plain_silu || config.swiglu_alpha != 0.0f || config.swiglu_limit != 0.0f ||
+        config.situ_beta != 0.0f || config.situ_linear_beta != 0.0f) {
+      throw std::invalid_argument(
+          "Generic MoE kernel supports only plain SiLU activation");
+    }
     printf("  Creating AMD_MOE_TP %d at numa %d\n", tp_part_idx, numa_node_of_cpu(sched_getcpu()));
     auto& load = config.load;
     auto& save = config.save;
