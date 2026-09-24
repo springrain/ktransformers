@@ -2,14 +2,18 @@
 
 **状态：首版代码已完成；MXFP4 + KT Marlin 路径待 Linux CUDA / TP 实机验收**
 
-**日期：2026-09-23**
+**日期：2026-09-24**
 
 首版实现说明：
 
 - 已实现参数解析、按层固定容量、Decayed-LFU、Stream-TopN、不补位、三路 exact-once 分流、late CPU fallback、双 host/GPU staging、单专家 H2D/repack/wave 2、增量 resident install、decode/mixed freeze、TP 顺序校验和不可逆提交 fail-stop。
 - 首个可执行 backend 收敛为 DeepSeek V4 MXFP4 + KT Marlin（SM89/SM120）；其他权重格式仍按本文支持矩阵 fail fast 或留待后续阶段。
 - CPU/策略/状态机测试已完成；当前开发环境没有 CUDA GPU，因此真实 kernel 数值、H2D/计算重叠、TP2 多进程和端到端性能仍是合入前硬件验收项。
-- 当前 writer 与 CPU expert forward 仍共享 CPUInfer FIFO。首版采用 compute-idle writer，避免 host pack 与 CPU GEMM 争抢同一 WorkerPool；因此 H2D/repack 可与仍在途 GPU wave 重叠，但 host pack 尚不能与主 CPU GEMM 真正并行。
+- 当前 writer 与 CPU expert forward 仍共享 CPUInfer FIFO。V1.1 将固定双 staging 能承载的 writer 先于主 CPU task 入队；writer 完成后立即启动 H2D/repack/wave 2，使数据传输和第二批 GPU 计算与主 CPU GEMM 重叠。host export 本身仍与 CPU GEMM 串行；要让两者也并行，后续仍需独立且经过带宽隔离验证的 writer WorkerPool。
+- 双 staging 下每个窗口最多预启动 2 个 missing candidates。`N_stream > 2` 时，超出 staging 深度的候选保留在同一个主 CPU task 中，不再排到 CPU GEMM 后形成串行 streaming 尾部；Top-N 热点统计本身保持完整。
+- writer 预启动后增加 TP prelaunch 共识。任一 rank 在 CPU assignment 过滤、主 CPU task 提交或 enqueue boundary 失败时，所有 rank 统一 abort tickets，禁止部分 rank 进入 wave 2 collective。
+- V1.1 的首个 expert H2D 不再等待主 CPU GEMM，但仍等待 CPU 输入 D2H 与 CUDA host callback 的提交确认；该前缀通常是毫秒级，后续可用显式 submission receipt 进一步拆除。
+- 当前两个 candidate 仍按 `wait/launch/finalize` 顺序驱动，尚未保证 candidate 2 的 H2D 与 candidate 1 的 wave 2 严格重叠；后续应拆成 prepare-ready queue 与独立 finalize 阶段。
 - 首版 TP 控制面为保证一致性使用带完整 ticket/stage token 的 CPU-group object collective。其正确性边界已覆盖，但控制面延迟必须实机 profile；后续应改为固定 `int64` tensor token，并合并非关键阶段 collective。
 
 **适用范围：KTransformers + SGLang 的 CPU/GPU 混合 MoE 推理路径**
@@ -494,7 +498,7 @@ SELECTED
 - host staging 只有在所有 TP ranks 的 H2D event 和 release consensus 完成后才能复用。
 - GPU staging 只有在 writer/DMA/repack、可能存在的 GPU wave 2 consumed event，以及把它作为 source 的 install D2D event 全部完成后才能复用。
 - assignment 切到 `CPU_CLAIMED` 只禁止当前 chunk 接受 streamed GPU output，不自动取消已经在途的 loader，也不允许提前复用 staging；load 最终成功时仍可安装供后续 chunk 使用。
-- 默认只有两个 GPU staging slots，因此当 `N_stream > 2` 时 candidates 必须流水执行：candidate 1 在 wave 2 后需完成 unpublished install 或明确放弃 promotion 并释放 slot，staging 0 才能交给 candidate 3。
+- 默认只有两个 GPU staging slots。V1.1 为避免 candidate 3/4 的 writer 排在长 CPU GEMM 后面，只对前两个 missing candidates 固化 GPU ownership；其余候选保持 `CPU_CLAIMED` 并留在主 CPU task。未来增加独立 writer queue/WorkerPool 后，才恢复 `N_stream > 2` 的全量双槽滚动流水。
 - `GPU_CLAIMED` 与 `CPU_CLAIMED` 必须是互斥状态，保证 candidate 的当前 chunk 输出不会被 CPU/GPU 重复计算并重复累加。
 - GPU wave 2 必须先写 candidate-private output；只有 kernel/event 与 TP success consensus 完成后才 scatter/merge 到共享 MoE output。可恢复失败可丢弃私有 output 并切换 CPU；已经部分写入共享 output 或 CUDA context 损坏时必须 fail-stop。
 - 当前 chunk 的 streaming mapping 是私有 dispatch snapshot；全局 resident mask/mapping 在 CPU task 仍可能读取时不得修改。
@@ -829,9 +833,10 @@ Router 生成 prefill topk_ids
   |
   +-- R = active resident --------------------> GPU wave 1
   |
-  +-- C_cpu = other non-resident -------------> CPU GEMM
+  +-- C_cpu = other non-resident
+  |          + 超出双 staging prebegin 深度的热点 --> CPU GEMM
   |
-  +-- P = missing experts in current Stream-TopN
+  +-- P = Stream-TopN 中前两个可预启动的 missing experts
           |
           +-- host export / H2D / repack
           |      与 GPU wave 1、CPU GEMM 重叠
@@ -857,7 +862,7 @@ stream topk weights / scatter metadata
 三条流水的重叠范围是同一层：
 
 - GPU wave 1 立即计算所有当前 active resident experts，包括不在 Stream-TopN 的 resident experts。
-- CPU 立即计算所有 `C_cpu` experts。
+- CPU 在前两个 writer 入队后立即计算所有 `C_cpu` experts；host export 仍串行在 CPU GEMM 前，但其后的 H2D/repack/wave 2 与 CPU GEMM 重叠。
 - loader 同时准备 `P`；candidate 1 ready 后即可计算 candidate 1，其余 candidates 继续搬运。
 - 当前层三路输出合并完成前不能进入下一 transformer layer；只有 persistent install/publish 工作可能在安全协议允许时与后续层重叠。
 
@@ -1459,7 +1464,7 @@ staging allocation 在启动或首次启用时完成。运行时不能临时扩�
 - 使用按兼容签名分组的 staging pool 和 loader queue。
 - 为 writer 配置受限的独立 WorkerPool/NUMA 资源，或实现明确的 compute-idle 调度，不能只新增 future 后继续与 CPU MoE 无限制争抢同一 pool。
 - Router 后立即同时启动 resident GPU wave 1、CPU-only task 和 Stream-TopN missing loader。
-- 首版采用共享 CPUInfer FIFO 的 compute-idle writer：主 CPU-only task 先入队，writer 随后执行；H2D/repack 与仍在途 GPU wave 1 重叠。若要让 host pack 与 CPU-only GEMM 真正重叠，必须在后续增加受限且验证过带宽隔离的 writer WorkerPool。
+- V1.1 在共享 CPUInfer FIFO 中把双 staging 对应的 writer 先入队，主 CPU-only task 随后入队；writer completion 返回后立即启动 H2D/repack/wave 2，并与主 CPU GEMM 重叠。超出 staging 深度的候选保留在主 CPU task。若要让 host pack 与 CPU-only GEMM 本身并行，或让 `N_stream > 2` 全部参与当前窗口 wave 2，必须增加受限且验证过带宽隔离的 writer WorkerPool。
 - 实现“candidate 1 搬完即算 candidate 1，candidate 2 继续搬”的双 staging 流水；多个同时 ready 时允许小 grouped GEMM。
 - 当前 chunk GPU wave 2 完成后，再在 prefill safe boundary 提交 persistent promotion。
 - 在 prefill-to-decode finalization drain 有界的在途任务并冻结 mapping。

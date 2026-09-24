@@ -62,6 +62,11 @@ class TaskQueue {
   void record_exception(std::exception_ptr exception) noexcept;
 
   bool has_pending_exception() noexcept;
+  // Rethrow a latched callback/worker exception without waiting for queued
+  // work.  Callers use this immediately after a CUDA host callback boundary to
+  // validate that the callback successfully enqueued its CPU task while the
+  // task itself remains free to run asynchronously.
+  void rethrow_pending_exception();
 
  private:
   struct Node {

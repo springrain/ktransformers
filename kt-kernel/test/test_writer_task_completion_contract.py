@@ -157,6 +157,7 @@ class TestWriterTaskCompletionContract(unittest.TestCase):
         source = BINDINGS_PATH.read_text(encoding="utf-8")
         self.assertIn('m, "CPUInferTaskCompletion"', source)
         self.assertIn('"write_weight_scale_to_buffer_tracked_task"', source)
+        self.assertIn('"rethrow_pending_callback_exception"', source)
         self.assertIn("enqueue_tracked", source)
         self.assertIn("std::shared_ptr<MoeClass> moe;", source)
         self.assertNotIn("MoeClass* moe;", source)

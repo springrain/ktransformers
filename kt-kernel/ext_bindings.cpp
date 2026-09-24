@@ -801,6 +801,8 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def(py::init<WorkerPoolConfig>())
       .def("submit", &CPUInfer::submit)
       .def("sync", &CPUInfer::sync, py::arg("allow_n_pending") = 0)
+      .def("rethrow_pending_callback_exception",
+           &CPUInfer::rethrow_pending_callback_exception)
       .def_readwrite("backend_", &CPUInfer::backend_)
 #ifndef KTRANSFORMERS_CPU_ONLY
       .def("sync_with_cuda_stream", &CPUInfer::sync_with_cuda_stream, py::arg("user_cuda_stream"),

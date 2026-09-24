@@ -154,6 +154,16 @@ bool TaskQueue::has_pending_exception() noexcept {
   }
 }
 
+void TaskQueue::rethrow_pending_exception() {
+  std::exception_ptr task_exception;
+  {
+    std::lock_guard<std::mutex> lock(mtx);
+    task_exception = first_exception;
+    first_exception = nullptr;
+  }
+  if (task_exception) std::rethrow_exception(task_exception);
+}
+
 void TaskQueue::sync(size_t allow_n_pending) {
   std::exception_ptr task_exception;
   {

@@ -29,5 +29,9 @@ int main() {
                     std::declval<const std::shared_ptr<TaskCompletion>&>(),
                     std::declval<std::function<void()>>())),
                 void>);
+  static_assert(std::is_same_v<
+                decltype(std::declval<CPUInfer&>()
+                             .rethrow_pending_callback_exception()),
+                void>);
   return 0;
 }

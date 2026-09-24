@@ -148,6 +148,10 @@ class CPUInfer {
     task_queue_->record_exception(exception);
   }
 
+  void rethrow_pending_callback_exception() {
+    task_queue_->rethrow_pending_exception();
+  }
+
   struct StreamTaskArgs {
     CPUInferTask task;
     bool autofree;

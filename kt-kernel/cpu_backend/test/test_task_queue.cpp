@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 int main() {
   TaskQueue queue;
@@ -80,6 +81,37 @@ int main() {
   }
 
   {
+    TaskQueue callback_ack_queue;
+    std::atomic<bool> release_task{false};
+    std::atomic<bool> task_completed{false};
+    callback_ack_queue.enqueue([&] {
+      while (!release_task.load()) {
+        std::this_thread::yield();
+      }
+      task_completed.store(true);
+    });
+    callback_ack_queue.record_exception(
+        std::make_exception_ptr(std::runtime_error("callback enqueue failed")));
+
+    bool callback_enqueue_error_caught = false;
+    try {
+      callback_ack_queue.rethrow_pending_exception();
+    } catch (const std::runtime_error& error) {
+      callback_enqueue_error_caught =
+          std::string(error.what()) == "callback enqueue failed";
+    }
+    assert(callback_enqueue_error_caught);
+    // The callback acknowledgement must not wait for the already running CPU
+    // task; it only consumes the latched callback-side enqueue error.
+    assert(!task_completed.load());
+    assert(!callback_ack_queue.has_pending_exception());
+
+    release_task.store(true);
+    callback_ack_queue.sync(0);
+    assert(task_completed.load());
+  }
+
+  {
     TaskQueue tracked_queue;
     std::atomic<bool> release_trailing{false};
     std::atomic<bool> trailing_started{false};
@@ -107,6 +139,46 @@ int main() {
     release_trailing.store(true);
     tracked_queue.sync(0);
     assert(trailing_completed.load());
+  }
+
+  {
+    TaskQueue writer_first_queue;
+    std::mutex order_mutex;
+    std::vector<int> order;
+    std::atomic<bool> release_cpu{false};
+    std::atomic<bool> cpu_started{false};
+
+    auto writer0 = writer_first_queue.enqueue_tracked([&] {
+      std::lock_guard<std::mutex> lock(order_mutex);
+      order.push_back(0);
+    });
+    auto writer1 = writer_first_queue.enqueue_tracked([&] {
+      std::lock_guard<std::mutex> lock(order_mutex);
+      order.push_back(1);
+    });
+    writer_first_queue.enqueue([&] {
+      {
+        std::lock_guard<std::mutex> lock(order_mutex);
+        order.push_back(2);
+      }
+      cpu_started.store(true);
+      while (!release_cpu.load()) {
+        std::this_thread::yield();
+      }
+    });
+
+    writer0->wait();
+    writer1->wait();
+    while (!cpu_started.load()) {
+      std::this_thread::yield();
+    }
+    {
+      std::lock_guard<std::mutex> lock(order_mutex);
+      assert((order == std::vector<int>{0, 1, 2}));
+    }
+
+    release_cpu.store(true);
+    writer_first_queue.sync(0);
   }
 
   {
