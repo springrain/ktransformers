@@ -867,6 +867,13 @@ stream topk weights / scatter metadata
 - loader 使用两个 staging slots 滚动准备全部 `P`；candidate 1 ready 后即可计算 candidate 1，slot 安全释放后立即用于后续 candidate，不等待全部 candidates 一次性完成。
 - 当前层三路输出合并完成前不能进入下一 transformer layer；只有 persistent install/publish 工作可能在安全协议允许时与后续层重叠。
 
+必须区分“同一 candidate 的依赖串行”和“不同执行通道的并行”：
+
+- 同一 candidate 内部严格为 `host export -> H2D -> repack -> GPU wave 2`，不能跳过 ready event 提前计算。
+- 不同 candidates 可以流水重叠：E1 H2D/GPU wave 2 期间，独立 writer 可以继续导出 E2/E3；E1 wave 2 执行期间，copy stream 可以搬运另一个已完成 host export 的 candidate。
+- CPU-only GEMM 与 writer、H2D、repack、GPU wave 2 使用不同执行资源，可并发推进，但会共享 DRAM/L3、PCIe 或 GPU SM 等物理资源。
+- 当前 resident GPU wave 1 与 streamed GPU wave 2 进入同一个主 compute stream，因此两批 GPU GEMM 本身按 stream 顺序执行；可与 wave 1 重叠的是独立 copy stream 上的 H2D，以及硬件资源允许时的 prepare 工作，不能宣称 wave 1 与 wave 2 同时占用同一 compute stream 执行。
+
 单层延迟近似为：
 
 ```text
@@ -877,7 +884,24 @@ T_layer ~= max(
 ) + T_merge
 ```
 
-`T_stream_pipeline_completion` 是最后一个 candidate 经 host export、H2D、repack 和 GPU wave 2 完成的时间，包含 staging 复用造成的排队。异步流式换入仍可能落在当前 chunk 的临界路径，但它与已有 GPU/CPU 计算重叠，暴露时间小于先搬完再统一计算的串行路径。
+`T_stream_pipeline_completion` 是从本层 Router 完成开始，到最后一个 candidate 经 host export、H2D、repack 和 GPU wave 2 完成的墙钟时间；它包含 staging 复用、TP 控制以及 wave 2 在主 compute stream 中等待 wave 1 的时间。异步流式换入仍可能落在当前 chunk 的临界路径，但它与已有 GPU/CPU 计算重叠，暴露时间小于先搬完再统一计算的串行路径。
+
+只有满足下式时，streaming 时间才可认为基本被当前层计算隐藏：
+
+```text
+T_stream_pipeline_completion <= max(T_cpu_only, T_gpu_wave1)
+```
+
+若 streaming 更慢，则暴露尾部近似为：
+
+```text
+T_exposed_stream ~= max(
+    0,
+    T_stream_pipeline_completion - max(T_cpu_only, T_gpu_wave1)
+)
+```
+
+例如 CPU-only 为 170 ms，而全部 Stream-TopN 流水在 100 ms 内完成，则该流水大部分隐藏在 CPU 窗口中；若流水需要 220 ms，则约有 50 ms 会进入层延迟临界路径。上述判断必须基于 profiler 时间线，不能只依据 `non_blocking=True` 或不同 stream 的 API 形式。
 
 例：`N_stream=4`，L1 当前激活 200 个不同专家，resident capacity 为 32，且 32 个 resident 均被本窗口激活；当前 Stream-TopN 中已有 3 个 resident。则：
 
@@ -971,13 +995,9 @@ compute stream: GPU wave 1 ===== GPU(E1) -- GPU(E2/E3) -- GPU(E4)
 - compute stream 的 GPU wave 2 只等待对应 ready event；不调用 device-wide synchronize。
 - 如果 GPU wave 1 已占满计算资源，wave 2 可能排队，但 H2D 仍可利用 copy engine 与其重叠；实际重叠比例必须由 profiler 验证，不能仅凭异步 API 名称推断。
 
-当前 `submit_write_weight_scale_to_buffer()` 已提供单 expert writer primitive，但现有 `sync_write_weight_scale_to_buffer()` 会调用全局 `CPUInfer.sync()`。新 cache loader 不能在热路径复用这种全队列 drain，必须增加：
+当前实现已经使用 task-specific completion handle 和独立、受限的 writer CPUInfer/WorkerPool。正常路径中的 `sync_write_weight_scale_to_buffer(completion)` 只等待指定 writer，不 drain 主 CPUInfer 队列；等待发生在调度线程上时，主 CPU GEMM 仍可继续运行。全队列 `sync()` 仅保留给旧扩展兼容路径和异常恢复清理，不得重新进入正常 Stream-TopN 热路径。
 
-- task-specific completion handle；或
-- 独立/低优先级 writer queue；或
-- 只在已知 CPU forward 队列为空的安全边界同步执行。
-
-最终目标是让权重准备与当前 resident GPU/CPU-only critical work 重叠，同时不与 CPU MoE 无节制争抢同一 WorkerPool 和 DRAM 带宽。生产实现需要 task-specific completion 和专用/受限 writer resources；仅把同步调用放入另一个 Python thread 不等于真正异步。
+最终目标是让权重准备与当前 resident GPU/CPU-only critical work 重叠，同时通过每个 CPU TP/NUMA 默认 1 个 writer worker 限制其与 CPU MoE 的 DRAM/L3 争抢。独立队列解决的是队列级串行，不自动保证物理带宽无竞争；实际隐藏比例仍必须通过 Nsight 与 CPU trace 联合验证。
 
 ### 10.5 当前 chunk GPU wave 2 与 persistent 提交
 
@@ -1805,6 +1825,8 @@ current_result=gpu persistent_commit=success
 - profiler 中 resident GPU wave 1 和 CPU-only task 不等待 candidate H2D 才启动。
 - candidate 1 ready 后可在其余 candidates 仍搬运时启动 GPU wave 2，不存在“等待所有 candidate ready”的统一 barrier。
 - host pack/H2D/repack 与当前层 GPU wave 1/CPU-only 产生可观测重叠。
+- trace 中必须能看到 CPU main GEMM 与独立 writer 同时运行，并能看到 candidate N 的 GPU wave 2 期间 candidate N+1 的 H2D 或 host export 推进；若只看到异步 API 提交而没有设备/CPU 时间线重叠，不算验收通过。
+- 分别报告 `T_cpu_only`、`T_gpu_wave1`、`T_stream_pipeline_completion` 和 `T_exposed_stream`；只有最后一项接近零时，才能宣称 streaming 基本被当前层计算隐藏。
 - Stream-TopN 部分 resident 场景下 selected candidate 数严格等于 hotset 中缺失数量，不向后补位；实际 GPU 成功数与 fallback 数可完整对账。
 - `N_stream=0` 与静态 resident 计算路径数值一致，且不产生 cache loader 流量。
 - current-chunk 三路方案在目标长 prefill workload 上降低 CPU-only assignments 或 exposed CPU wait，并且端到端 TTFT/prefill tok/s 不退化。
