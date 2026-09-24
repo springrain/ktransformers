@@ -1,6 +1,6 @@
 # KT 按层动态专家缓存与 Prefill 流式换入实施技术设计
 
-**状态：首版代码已完成；MXFP4 + KT Marlin 路径待 Linux CUDA / TP 实机验收**
+**状态：首版代码已完成；最新 Linux CUDA / TP2 Trace 中 Stream-TopN 整体流水被同层 CPU-only critical path 隐藏（`T_exposed_stream ~= 0`），candidate 间双 staging 设备侧重叠未通过验收**
 
 **日期：2026-09-24**
 
@@ -8,13 +8,13 @@
 
 - 已实现参数解析、按层固定容量、Decayed-LFU、Stream-TopN、不补位、三路 exact-once 分流、late CPU fallback、双 host/GPU staging、单专家 H2D/repack/wave 2、增量 resident install、decode/mixed freeze、TP 顺序校验和不可逆提交 fail-stop。
 - 首个可执行 backend 收敛为 DeepSeek V4 MXFP4 + KT Marlin（SM89/SM120）；其他权重格式仍按本文支持矩阵 fail fast 或留待后续阶段。
-- CPU/策略/状态机测试已完成；当前开发环境没有 CUDA GPU，因此真实 kernel 数值、H2D/计算重叠、TP2 多进程和端到端性能仍是合入前硬件验收项。
+- CPU/策略/状态机测试已完成；2026-09-24 最新 TP2 CUPTI/Chrome Trace 已完成首轮设备时间线验收。该次 Trace 已验证 Stream-TopN 整体流水可被同层 CPU-only 分支隐藏，但尚未完成真实 kernel 数值对照、故障注入、CUDA sanitizer、多轮稳定性和完整端到端 A/B。
 - 启用 `decayed-lfu` 且 `N_stream > 0` 时，MXFP4 writer 使用独立的内部 CPUInfer FIFO 和辅助 WorkerPool；每个 CPU TP/NUMA 分区默认 1 个 writer worker。此时 `--kt-cpuinfer` 被视为总 CPU 线程预算，内部自动从主 GEMM 池预留每个 threadpool 1 个核心给 writer，例如 `--kt-cpuinfer 168 --kt-threadpool-count 1` 对应 167 个主 worker + 1 个 writer worker，不增加新参数或额外核心。静态 MXFP4 与 `N_stream=0` 保持原有主 CPUInfer 线程数和共享 writer 行为。双 staging 首批 2 个 writer 立即激活；slot 释放后按确定性顺序滚动激活后续 tickets，使 host export、H2D/repack/wave 2 可与主 CPU GEMM 重叠。该资源仍必须观测 DRAM 带宽争抢。
 - `N_stream` 定义每窗口最多选择并流式执行的 missing 热点专家总数；双 staging 的 `2` 只定义同时处于 writer/H2D/repack/wave 2 流水中的并发深度。`N_stream > 2` 时全部选中 candidates 仍保持 GPU streaming ownership，并随 slot 释放滚动执行，不回填到主 CPU task。
 - writer 预启动后增加 TP prelaunch 共识。任一 rank 在 CPU assignment 过滤、主 CPU task 提交或 enqueue boundary 失败时，所有 rank 统一 abort tickets，禁止部分 rank 进入 wave 2 collective。
 - V1.1 的首个 expert H2D 不再等待主 CPU GEMM，但仍等待 CPU 输入 D2H 与 CUDA host callback 的提交确认；该前缀通常是毫秒级，后续可用显式 submission receipt 进一步拆除。
-- 双 staging 通过滚动 pump 驱动全部选中 candidates；candidate 2 的 H2D 与 candidate 1 的 wave 2 是否达到理想重叠仍需 Nsight 实机确认，后续可进一步拆分 prepare-ready queue 与独立 finalize 阶段。
-- 首版 TP 控制面为保证一致性使用带完整 ticket/stage token 的 CPU-group object collective。其正确性边界已覆盖，但控制面延迟必须实机 profile；后续应改为固定 `int64` tensor token，并合并非关键阶段 collective。
+- 双 staging 通过滚动 pump 驱动全部选中 candidates；最新 TP2 Trace 中，完整 streaming pipeline 在 23 个 cache-managed 层均早于 CPU-only 输出完成，`T_exposed_stream ~= 0`。但是 82 对相邻 candidates 中没有观察到 candidate N+1 的 H2D 与 candidate N 的 wave 2 设备侧重叠，因此“candidate 1 计算时 candidate 2 搬运”的细粒度流水尚未达到本文目标；后续必须拆分 prepare-ready progress 与独立 finalize/recycle 阶段。
+- 首版 TP 控制面为保证一致性使用带完整 ticket/stage token 的 CPU-group object collective。最新 Trace 中单 candidate 的实际 H2D 中位数约 `0.473 ms`，相邻 candidate 发射间隔却约 `11.1 ms`；该差值同时包含 host export、逐阶段 TP 共识、Python ticket 调度、slot refill 和 finalize，尚不能只归因于某一项。后续应补齐分阶段指标，将 object collective 改为固定 `int64` tensor token，并合并非关键阶段 collective。
 
 **适用范围：KTransformers + SGLang 的 CPU/GPU 混合 MoE 推理路径**
 
@@ -1833,6 +1833,51 @@ current_result=gpu persistent_commit=success
 - 在宣称支持高并发 continuous serving 前，必须证明热点切换时 generation 在有界时间内推进；若 strict freeze 下长期不推进，只能标记为单请求/低并发实验能力。
 - Phase 5 相对 strict-freeze 基线的 decode ITL p95/p99、吞吐、TTFT 和 batch fragmentation 必须全部报告，不能只报告更高的 cache hit rate。
 
+### 19.5 最新 TP2 Trace 验收结果（2026-09-24）
+
+本轮使用以下同一次 TP2 运行的 PyTorch/CUPTI Chrome Trace：
+
+```text
+kt-prefill-16k-1790240023.5259194-TP-0.trace.json.gz
+kt-prefill-16k-1790240023.5259194-TP-1.trace.json.gz
+```
+
+运行环境为 `world_size=2`、NCCL、两张 NVIDIA RTX PRO 6000 Blackwell Server Edition。文件名表示 16K 请求工作负载，但本次捕获的单次 MoE forward 是一个 4096-token scheduler chunk：43 个 sparse MLA prefill kernel 的 grid 均为 `[4096, 1, 1]`，TP0 每层 activation D2H 也为 `4096 * 4096 * sizeof(BF16) = 32 MiB`。因此不能用 16K 直接除以该 Trace 的时长。
+
+Profiler 总 span 约 `7.825 s`，其中首次 CUDA runtime/device activity 出现在约 `+3.184 s`；本次 4096-token chunk 的有效 CUDA envelope 约为 `4.641 s`。Profiler span 前缀、完整请求调度和外部端到端吞吐必须分别报告，不能混用。
+
+主要定量结果：
+
+| 指标 | 最新结果 | 判定 |
+|---|---:|---|
+| cache-managed MoE 层 | 23 | L20～L42 |
+| streamed candidates | 105，总计 1～9 个/层，均值 4.57 | Stream-TopN 当前 chunk 执行已生效 |
+| 单 candidate 四段 pinned H2D span | 中位约 0.473 ms | PCIe H2D 不是当前一阶瓶颈 |
+| 单 candidate repack/swizzle | 均值约 0.066 ms | backend prepare 不是当前一阶瓶颈 |
+| 单 candidate GPU wave 2 | 均值约 1.92 ms | Marlin GEMM 不是当前一阶瓶颈 |
+| 相邻 candidate 发射间隔 | 约 11.1 ms | 主要余量位于 host/control/pump 串行节拍 |
+| 最后一个 streamed wave 2 领先 CPU output | 71.6～160.2 ms，均值约 121.9 ms | 23 层均满足 `T_exposed_stream ~= 0` |
+| candidate N+1 H2D 与 candidate N wave 2 重叠 | 0 / 82 对 | 双 staging 细粒度设备流水未通过验收 |
+| TP0 activation D2H 到 CPU result H2D 的间隔 | 合计约 4.003 s，均值约 174.0 ms/层 | 当前主关键路径为 TP0 CPU-only expert/offload |
+| 23 次 managed-layer AllReduce 驻留时间 | TP0 约 35.2 ms；TP1 约 2783.6 ms | TP1 在等待 TP0 到达，不是 NCCL 带宽瓶颈 |
+| TP0 23 层 activation D2H + result H2D DMA | 合计约 41.8 ms | CPU 计算/回调间隔远大于 DMA |
+
+本轮验收结论：
+
+1. **总体时间隐藏通过**：resident GPU wave、CPU-only task 和 streamed GPU wave 已形成同层并发；全部 streaming candidates 均在 CPU-only 输出之前完成，当前 `T_stream_pipeline_completion` 没有形成额外暴露尾部。
+2. **双 staging 细粒度重叠未通过**：当前实现能够滚动处理全部 candidates，但 H2D 仍在逐 ticket Python/TP 状态机中被串行驱动，没有形成本文要求的 `H2D(candidate N+1) || GPU(candidate N)` 设备时间线。
+3. **当前端到端优化重点是减少或加速 CPU-only assignments**：继续只优化 H2D、repack 或 Marlin kernel，主要效果会转化为 TP1 更早进入 collective 等待，而不会直接缩短当前 step。
+4. **NCCL 长 kernel 是 rendezvous 症状**：两个 rank 的非 NCCL GPU compute 基本一致；TP1 的长 AllReduce 在 TP0 到达后很快结束，不应优先按通信带宽问题处理。
+5. **控制面仍需细分观测**：现有 GPU Trace 无法把约 `11.1 ms/candidate` 精确拆成 host export、writer completion、`all_gather_object`、Python dispatch、slot refill 和 finalize。下一轮必须增加 writer start/end、`host_pack_ms`、`tp_control_collective_ms`、candidate stage timestamps 和 slot generation annotations。
+
+下一轮实现与 A/B 优先级：
+
+1. 将逐 stage `all_gather_object` 改为固定 shape 的 `int64` tensor 状态，并按窗口合并非关键阶段共识。
+2. 将 `writer done -> H2D -> prepare` 从逐 candidate wrapper 循环中拆成独立 progress engine；slot consumed 后立即 refill，不等待下一次 Python `wait_and_launch()`。
+3. 将 release/install/finalize 从 candidate 发射临界路径移入异步 recycler/commit queue，同时保留 safe-boundary publish 和 fail-stop 语义。
+4. 在相同 prompt、相同 warm state 下扫描 `N_stream` 和 resident capacity `C`，以 TP0 CPU-only assignments、TP1 collective wait、last-stream-to-CPU margin 和端到端 tok/s 作为决策指标。
+5. 保留本文 Go/No-Go 的严格定义：总体 `T_exposed_stream ~= 0` 不等于双 staging 已完全验收；只有 profiler 中出现 candidate 间真实 H2D/GPU 重叠，才能关闭该子项。
+
 ## 20. 风险与待决事项
 
 1. **Writer 与 CPU GEMM 的带宽争抢**：task-specific completion 和独立 writer FIFO/WorkerPool 已实现，避免了队列级串行；但两者仍共享 DRAM/L3。辅助池默认每个 CPU TP/NUMA 1 个 worker并采用主池之后的 core offset，仍需观测绑核是否成功以及 p95/p99 是否因带宽竞争恶化。
@@ -1853,13 +1898,13 @@ current_result=gpu persistent_commit=success
 16. **Continuous batching 更新饥饿**：严格 global decode freeze 下，只要持续存在 active decode，mapping 可能长期不更新，动态 cache 退化为静态 placement。Phase 5 必须通过 prepare/publish 分离、双 generation + 同层 shadow slots，或有界 maintenance epoch 解决，并同时守住 decode ITL。
 17. **未来预测模型偏差**：Phase 6 若引入预测，必须先用 trace 验证当前 chunk 与下一 chunk/decode 的相关性。
 18. **Global Spare 架构成本**：当前 per-layer 固定 tensor 无法零成本跨层借 slot，不能在首版假装支持。
-19. **TP 控制面开销**：首版为保正确性在关键阶段使用 CPU-group `all_gather_object` 校验完整 token。Top-N×多层可能累积明显延迟；必须 profile `tp_control_collective_ms`，后续改为固定 `int64` tensor token 并合并非关键阶段。
-20. **当前 Chunk 重叠上限**：独立 writer 队列消除了 candidate 3 及以后等待主 CPU FIFO 的问题，但双 staging 仍只允许两个 candidate 同时在途；host export 速度、逐 candidate TP 共识和 GPU wave 2 吞吐可能形成新的 exposed tail。需要记录 writer start/end、slot refill、H2D 和 wave 2 时间，按实测限制有效 `N_stream`。
+19. **TP 控制面开销**：首版为保正确性在关键阶段使用 CPU-group `all_gather_object` 校验完整 token。最新 TP2 Trace 已观察到约 `11.1 ms/candidate` 的发射节拍，而实际 H2D 中位数只有约 `0.473 ms`；该差值尚未完成 host export、TP collective、Python 调度和 finalize 的精确归因。必须补齐 `tp_control_collective_ms` 等分阶段指标，后续改为固定 `int64` tensor token 并合并非关键阶段。
+20. **当前 Chunk 重叠上限**：独立 writer 队列已使全部 selected candidates 在 CPU-only 输出前完成，因此当前 `T_exposed_stream ~= 0`；但最新 Trace 中 82 对相邻 candidates 的 `H2D(N+1) || GPU(N)` 重叠次数为 0，双 staging 目前只是容量复用，尚未形成目标设备流水。需要拆分 prepare-ready progress 与 finalize/recycle，记录 writer start/end、slot refill、H2D 和 wave 2 时间，并按实测限制有效 `N_stream`。
 21. **进程内重建生命周期**：主 CPUInfer 与 writer CPUInfer 当前均为进程级 singleton，配置 key 不一致时 fail fast，线程在进程退出前保持存活。未来若支持同进程卸载并重建不同 CPU/NUMA 配置的 engine，必须增加“停止新 ticket → drain writer completion → 销毁 writer → 销毁 main”的显式 shutdown/reset 协议。
 
 ## 21. 实施检查清单
 
-说明：以下清单是“代码 + 目标 GPU/TP 实机验收”的完成标准。首版代码已经覆盖其中的大部分正确性路径，但在 Linux CUDA、TP2、故障注入和 Nsight 性能验收完成前暂不批量勾选，避免把 CPU 单元测试等同于生产验收。
+说明：以下清单是“代码 + 目标 GPU/TP 实机验收”的完成标准。首版代码已经覆盖其中的大部分正确性路径，并完成一次 Linux CUDA / TP2 CUPTI Trace 性能验收；当前已确认总体 streaming 时间被 CPU-only 分支隐藏，同时确认 candidate 间双 staging 设备重叠未达标。真实 kernel 数值对照、故障注入、CUDA sanitizer、多轮 A/B 和该重叠子项完成前仍不批量勾选，避免把一次性能 Trace 等同于生产验收。
 
 ### 参数与状态
 
