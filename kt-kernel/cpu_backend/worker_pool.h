@@ -17,16 +17,49 @@
 #include <barrier>
 #include <condition_variable>
 #include <cstdio>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 // #define PROFILE_BALANCE
 
+inline hwloc_obj_t hwloc_numa_node_by_os_index(hwloc_topology_t topology,
+                                                int os_index) {
+  hwloc_obj_t obj = nullptr;
+  while ((obj = hwloc_get_next_obj_by_type(
+              topology, HWLOC_OBJ_NUMANODE, obj)) != nullptr) {
+    if (obj->os_index == static_cast<unsigned>(os_index)) return obj;
+  }
+  return nullptr;
+}
+
+inline hwloc_bitmap_t hwloc_allowed_numa_cpuset(hwloc_topology_t topology,
+                                                 hwloc_obj_t numa_obj) {
+  if (numa_obj == nullptr) return nullptr;
+  hwloc_bitmap_t cpuset = hwloc_bitmap_dup(numa_obj->cpuset);
+  const hwloc_const_bitmap_t allowed =
+      hwloc_topology_get_allowed_cpuset(topology);
+  if (allowed != nullptr) hwloc_bitmap_and(cpuset, cpuset, allowed);
+  return cpuset;
+}
+
 inline void set_to_numa(int this_numa) {
-  struct bitmask* mask = numa_bitmask_alloc(numa_num_configured_nodes());
+  if (numa_all_nodes_ptr == nullptr || this_numa < 0 ||
+      this_numa > numa_max_node() ||
+      !numa_bitmask_isbitset(numa_all_nodes_ptr, this_numa)) {
+    fprintf(stderr, "NUMA node %d is not available.\n", this_numa);
+    return;
+  }
+  struct bitmask* mask = numa_allocate_nodemask();
+  if (mask == nullptr) {
+    fprintf(stderr, "Failed to allocate NUMA node mask.\n");
+    return;
+  }
+  numa_bitmask_clearall(mask);
   numa_bitmask_setbit(mask, this_numa);
   numa_bind(mask);
   numa_bitmask_free(mask);
@@ -38,7 +71,7 @@ inline void set_memory_to_numa(int this_numa) {
   hwloc_topology_init(&topology);
   hwloc_topology_load(topology);
 
-  hwloc_obj_t obj = hwloc_get_obj_by_type(topology, HWLOC_OBJ_NUMANODE, this_numa);
+  hwloc_obj_t obj = hwloc_numa_node_by_os_index(topology, this_numa);
   if (!obj) {
     fprintf(stderr, "NUMA node %d not found.\n", this_numa);
     hwloc_topology_destroy(topology);
@@ -97,9 +130,14 @@ class InNumaPool {
   std::function<void(int)> finalize_func_;
   std::atomic<int> curr_;
   int end_;
+  std::mutex exception_mutex_;
+  std::exception_ptr first_exception_;
 
   void process_tasks(int);
   void worker_thread(int, int);
+  void record_exception(std::exception_ptr) noexcept;
+  void reset_exception() noexcept;
+  void rethrow_exception();
 };
 
 class NumaJobDistributor {
@@ -107,6 +145,8 @@ class NumaJobDistributor {
   NumaJobDistributor(int numa_count);
   NumaJobDistributor(std::vector<int> numa_ids);
   NumaJobDistributor(std::vector<int> numa_ids, std::vector<int> thread_count);
+  NumaJobDistributor(std::vector<int> numa_ids, std::vector<int> thread_count,
+                     std::vector<int> thread_start);
 
   ~NumaJobDistributor();
 
@@ -115,6 +155,8 @@ class NumaJobDistributor {
  private:
   void init(std::vector<int> numa_ids);
   void init(std::vector<int> numa_ids, std::vector<int> thread_count);
+  void init(std::vector<int> numa_ids, std::vector<int> thread_count,
+            std::vector<int> thread_start);
 
   std::unique_ptr<std::barrier<>> ready_bar;
 
@@ -125,14 +167,24 @@ class NumaJobDistributor {
   std::vector<std::unique_ptr<std::condition_variable>> cvs;
   std::function<void(int)> compute_func;
   std::vector<std::thread> workers;
+  std::mutex exception_mutex;
+  std::exception_ptr first_exception;
 
   void worker_thread(int);
+  void record_exception(std::exception_ptr) noexcept;
+  void reset_exception() noexcept;
+  void rethrow_exception();
 };
 
 struct WorkerPoolConfig {
   int subpool_count;
   std::vector<int> subpool_numa_map;
   std::vector<int> subpool_thread_count;
+  // Optional per-subpool core offset inside the selected NUMA node.  When
+  // empty, WorkerPool preserves the historical packed layout starting at
+  // core zero.  Auxiliary pools use an explicit offset so their workers do
+  // not pin on top of the main GEMM pool.
+  std::vector<int> subpool_thread_start;
 };
 
 class WorkerPool {

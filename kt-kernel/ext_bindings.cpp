@@ -569,14 +569,26 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
           auto w13_scale_ptrs = args_->w13_scale_ptrs;
           auto w2_weight_ptrs = args_->w2_weight_ptrs;
           auto w2_scale_ptrs = args_->w2_scale_ptrs;
-          auto writer = [moe, gpu_tp_count, expert_id,
+          auto* writer_pool = args_->cpuinfer->worker_pool();
+          auto writer = [moe, writer_pool, gpu_tp_count, expert_id,
                          w13_weight_ptrs = std::move(w13_weight_ptrs),
                          w13_scale_ptrs = std::move(w13_scale_ptrs),
                          w2_weight_ptrs = std::move(w2_weight_ptrs),
                          w2_scale_ptrs = std::move(w2_scale_ptrs)]() {
-            moe->write_weight_scale_to_buffer(
-                gpu_tp_count, expert_id, w13_weight_ptrs, w13_scale_ptrs,
-                w2_weight_ptrs, w2_scale_ptrs);
+            if constexpr (requires {
+                            moe->write_weight_scale_to_buffer_with_pool(
+                                writer_pool, gpu_tp_count, expert_id,
+                                w13_weight_ptrs, w13_scale_ptrs,
+                                w2_weight_ptrs, w2_scale_ptrs);
+                          }) {
+              moe->write_weight_scale_to_buffer_with_pool(
+                  writer_pool, gpu_tp_count, expert_id, w13_weight_ptrs,
+                  w13_scale_ptrs, w2_weight_ptrs, w2_scale_ptrs);
+            } else {
+              moe->write_weight_scale_to_buffer(
+                  gpu_tp_count, expert_id, w13_weight_ptrs, w13_scale_ptrs,
+                  w2_weight_ptrs, w2_scale_ptrs);
+            }
           };
           if (args_->completion) {
             args_->cpuinfer->enqueue_tracked(args_->completion, std::move(writer));
@@ -663,6 +675,17 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
                 py::arg("gpu_tp_count"), py::arg("expert_id"),
                 py::arg("w13_weight_ptrs"), py::arg("w13_scale_ptrs"),
                 py::arg("w2_weight_ptrs"), py::arg("w2_scale_ptrs"));
+    constexpr bool pool_aware_writer = requires(
+        MoeClass& instance, WorkerPool* pool, int gpu_tp_count, int expert_id,
+        const std::vector<uintptr_t>& w13_weight_ptrs,
+        const std::vector<uintptr_t>& w13_scale_ptrs,
+        const std::vector<uintptr_t>& w2_weight_ptrs,
+        const std::vector<uintptr_t>& w2_scale_ptrs) {
+      instance.write_weight_scale_to_buffer_with_pool(
+          pool, gpu_tp_count, expert_id, w13_weight_ptrs, w13_scale_ptrs,
+          w2_weight_ptrs, w2_scale_ptrs);
+    };
+    moe_cls.attr("_kt_pool_aware_writer") = py::bool_(pool_aware_writer);
 
     moe_cls.def(
         "run_layerwise_fp8_batch",
@@ -788,7 +811,8 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def(py::init<>())
       .def_readwrite("subpool_count", &WorkerPoolConfig::subpool_count)
       .def_readwrite("subpool_numa_map", &WorkerPoolConfig::subpool_numa_map)
-      .def_readwrite("subpool_thread_count", &WorkerPoolConfig::subpool_thread_count);
+      .def_readwrite("subpool_thread_count", &WorkerPoolConfig::subpool_thread_count)
+      .def_readwrite("subpool_thread_start", &WorkerPoolConfig::subpool_thread_start);
 
   py::class_<TaskCompletion, std::shared_ptr<TaskCompletion>>(
       m, "CPUInferTaskCompletion")

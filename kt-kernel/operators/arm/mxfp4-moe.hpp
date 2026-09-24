@@ -321,7 +321,8 @@ class NEON_MXFP4_MOE_TP : public NEON_MOE_BASE<T, NEON_MXFP4_MOE_TP<T>> {
                                const GeneralMOEConfig& full_config, const std::vector<uintptr_t>& w13_weight_ptrs,
                                const std::vector<uintptr_t>& w13_scale_ptrs,
                                const std::vector<uintptr_t>& w2_weight_ptrs,
-                               const std::vector<uintptr_t>& w2_scale_ptrs) const {
+                               const std::vector<uintptr_t>& w2_scale_ptrs,
+                               WorkerPool* work_pool = nullptr) const {
     if (expert_id < 0 || expert_id >= config_.expert_num || !gate_bb_[expert_id] || !up_bb_[expert_id] ||
         !down_bb_[expert_id] || !gate_bb_[expert_id]->b || !up_bb_[expert_id]->b || !down_bb_[expert_id]->b) {
       throw std::runtime_error("NEON MXFP4 staging: invalid expert");
@@ -356,7 +357,8 @@ class NEON_MXFP4_MOE_TP : public NEON_MOE_BASE<T, NEON_MXFP4_MOE_TP<T>> {
     const int cpu_k_groups = cpu_k / group_size;
     const int gpu_k_groups = cpu_k / group_size;
 
-    auto pool = config_.pool->get_subpool(tp_part_idx);
+    auto* selected_pool = work_pool != nullptr ? work_pool : config_.pool;
+    auto pool = selected_pool->get_subpool(tp_part_idx);
     constexpr int ROW_TASKS = 32;
     const int total = ROW_TASKS * 2 + ROW_TASKS;
     pool->do_work_stealing_job(
@@ -604,8 +606,19 @@ class TP_MOE<NEON_MXFP4_MOE_TP<K>> : public TP_MOE<NEON_MOE_BASE<K, NEON_MXFP4_M
                                     const std::vector<uintptr_t>& w13_scale_ptrs,
                                     const std::vector<uintptr_t>& w2_weight_ptrs,
                                     const std::vector<uintptr_t>& w2_scale_ptrs) {
+    write_weight_scale_to_buffer_with_pool(this->config.pool, gpu_tp_count, expert_id, w13_weight_ptrs,
+                                           w13_scale_ptrs, w2_weight_ptrs, w2_scale_ptrs);
+  }
+
+  void write_weight_scale_to_buffer_with_pool(
+      WorkerPool* writer_pool, int gpu_tp_count, int expert_id,
+      const std::vector<uintptr_t>& w13_weight_ptrs,
+      const std::vector<uintptr_t>& w13_scale_ptrs,
+      const std::vector<uintptr_t>& w2_weight_ptrs,
+      const std::vector<uintptr_t>& w2_scale_ptrs) {
     if (!this->weights_loaded) throw std::runtime_error("Not Loaded");
     if (this->tps.empty()) throw std::runtime_error("No TP parts initialized");
+    if (writer_pool == nullptr) throw std::runtime_error("NEON MXFP4 staging: writer pool is null");
     if (w13_weight_ptrs.size() != static_cast<size_t>(gpu_tp_count) ||
         w13_scale_ptrs.size() != static_cast<size_t>(gpu_tp_count) ||
         w2_weight_ptrs.size() != static_cast<size_t>(gpu_tp_count) ||
@@ -624,9 +637,10 @@ class TP_MOE<NEON_MXFP4_MOE_TP<K>> : public TP_MOE<NEON_MOE_BASE<K, NEON_MXFP4_M
       }
       if (physical_expert_id < 0) throw std::runtime_error("NEON MXFP4 staging: expert is absent from map");
     }
-    this->config.pool->dispense_backend()->do_numa_job([&, this, physical_expert_id](int i) {
+    writer_pool->dispense_backend()->do_numa_job([&, this, writer_pool, physical_expert_id](int i) {
       this->tps[i]->write_weights_to_buffer(gpu_tp_count, this->tp_count, physical_expert_id, this->config,
-                                            w13_weight_ptrs, w13_scale_ptrs, w2_weight_ptrs, w2_scale_ptrs);
+                                             w13_weight_ptrs, w13_scale_ptrs, w2_weight_ptrs, w2_scale_ptrs,
+                                             writer_pool);
     });
   }
 };

@@ -152,6 +152,8 @@ class CPUInfer {
     task_queue_->rethrow_pending_exception();
   }
 
+  WorkerPool* worker_pool() const noexcept { return backend_; }
+
   struct StreamTaskArgs {
     CPUInferTask task;
     bool autofree;

@@ -162,6 +162,8 @@ class KTMoEWrapper:
         swiglu_alpha: float = 0.0,
         # Dynamic placement requires CPU-packed copies of initially resident experts.
         pack_all_experts_on_load: bool = False,
+        # Stream-TopN reserves one writer core per inference threadpool.
+        reserve_stream_writer_threads: bool = False,
     ):
         """
         Factory method to create the appropriate backend implementation.
@@ -237,6 +239,7 @@ class KTMoEWrapper:
                 numa_nodes=numa_nodes,
                 swiglu_limit=swiglu_limit,
                 swiglu_alpha=swiglu_alpha,
+                reserve_stream_writer_threads=reserve_stream_writer_threads,
             )
         else:  # mode == "sft"
             # SFT factory does not plumb swiglu_limit; reject non-zero
@@ -338,6 +341,7 @@ def _create_inference_wrapper(
     numa_nodes: Optional[List[int]] = None,
     swiglu_limit: float = 0.0,
     swiglu_alpha: float = 0.0,
+    reserve_stream_writer_threads: bool = False,
 ) -> BaseMoEWrapper:
     """
     Create an inference wrapper based on the method.
@@ -384,6 +388,9 @@ def _create_inference_wrapper(
     extra_kwargs = {}
     if backend_cls is NativeMoEWrapper:
         extra_kwargs["pack_all_experts_on_load"] = pack_all_experts_on_load
+        extra_kwargs["reserve_stream_writer_threads"] = (
+            reserve_stream_writer_threads
+        )
     if method in ("FP8", "MXFP4", "MXFP8", "LLAMAFILE"):
         extra_kwargs["swiglu_limit"] = swiglu_limit
         extra_kwargs["swiglu_alpha"] = swiglu_alpha

@@ -9,11 +9,11 @@
 - 已实现参数解析、按层固定容量、Decayed-LFU、Stream-TopN、不补位、三路 exact-once 分流、late CPU fallback、双 host/GPU staging、单专家 H2D/repack/wave 2、增量 resident install、decode/mixed freeze、TP 顺序校验和不可逆提交 fail-stop。
 - 首个可执行 backend 收敛为 DeepSeek V4 MXFP4 + KT Marlin（SM89/SM120）；其他权重格式仍按本文支持矩阵 fail fast 或留待后续阶段。
 - CPU/策略/状态机测试已完成；当前开发环境没有 CUDA GPU，因此真实 kernel 数值、H2D/计算重叠、TP2 多进程和端到端性能仍是合入前硬件验收项。
-- 当前 writer 与 CPU expert forward 仍共享 CPUInfer FIFO。V1.1 将固定双 staging 能承载的 writer 先于主 CPU task 入队；writer 完成后立即启动 H2D/repack/wave 2，使数据传输和第二批 GPU 计算与主 CPU GEMM 重叠。host export 本身仍与 CPU GEMM 串行；要让两者也并行，后续仍需独立且经过带宽隔离验证的 writer WorkerPool。
-- 双 staging 下每个窗口最多预启动 2 个 missing candidates。`N_stream > 2` 时，超出 staging 深度的候选保留在同一个主 CPU task 中，不再排到 CPU GEMM 后形成串行 streaming 尾部；Top-N 热点统计本身保持完整。
+- 启用 `decayed-lfu` 且 `N_stream > 0` 时，MXFP4 writer 使用独立的内部 CPUInfer FIFO 和辅助 WorkerPool；每个 CPU TP/NUMA 分区默认 1 个 writer worker。此时 `--kt-cpuinfer` 被视为总 CPU 线程预算，内部自动从主 GEMM 池预留每个 threadpool 1 个核心给 writer，例如 `--kt-cpuinfer 168 --kt-threadpool-count 1` 对应 167 个主 worker + 1 个 writer worker，不增加新参数或额外核心。静态 MXFP4 与 `N_stream=0` 保持原有主 CPUInfer 线程数和共享 writer 行为。双 staging 首批 2 个 writer 立即激活；slot 释放后按确定性顺序滚动激活后续 tickets，使 host export、H2D/repack/wave 2 可与主 CPU GEMM 重叠。该资源仍必须观测 DRAM 带宽争抢。
+- `N_stream` 定义每窗口最多选择并流式执行的 missing 热点专家总数；双 staging 的 `2` 只定义同时处于 writer/H2D/repack/wave 2 流水中的并发深度。`N_stream > 2` 时全部选中 candidates 仍保持 GPU streaming ownership，并随 slot 释放滚动执行，不回填到主 CPU task。
 - writer 预启动后增加 TP prelaunch 共识。任一 rank 在 CPU assignment 过滤、主 CPU task 提交或 enqueue boundary 失败时，所有 rank 统一 abort tickets，禁止部分 rank 进入 wave 2 collective。
 - V1.1 的首个 expert H2D 不再等待主 CPU GEMM，但仍等待 CPU 输入 D2H 与 CUDA host callback 的提交确认；该前缀通常是毫秒级，后续可用显式 submission receipt 进一步拆除。
-- 当前两个 candidate 仍按 `wait/launch/finalize` 顺序驱动，尚未保证 candidate 2 的 H2D 与 candidate 1 的 wave 2 严格重叠；后续应拆成 prepare-ready queue 与独立 finalize 阶段。
+- 双 staging 通过滚动 pump 驱动全部选中 candidates；candidate 2 的 H2D 与 candidate 1 的 wave 2 是否达到理想重叠仍需 Nsight 实机确认，后续可进一步拆分 prepare-ready queue 与独立 finalize 阶段。
 - 首版 TP 控制面为保证一致性使用带完整 ticket/stage token 的 CPU-group object collective。其正确性边界已覆盖，但控制面延迟必须实机 profile；后续应改为固定 `int64` tensor token，并合并非关键阶段 collective。
 
 **适用范围：KTransformers + SGLang 的 CPU/GPU 混合 MoE 推理路径**
@@ -154,15 +154,16 @@ N_stream = --kt-prefill-stream-top-n
 L_gpu    = --kt-num-gpu-layers or 0
 ```
 
-`N_stream` 控制每层每个 prefill chunk 的 streaming hotset 大小，不改变模型 Router 的 per-token top-k。
+`N_stream` 控制每层每个 prefill chunk 的 streaming hotset 大小，并因此限定本窗口最多选择和流式执行的 missing 热点专家总数；它不改变模型 Router 的 per-token top-k，也不受 staging 并发深度裁剪。
 
 建议 help 文案：
 
 ```text
-Maximum number of distinct logical experts considered for current-chunk
-prefill streaming in each MoE layer. Experts are ranked by this chunk's
-route counts. Resident experts remain in the Top-N set but are not
-transferred, and lower-ranked experts are not backfilled.
+Maximum number of missing hot experts selected for current-chunk prefill
+streaming in each cache-managed MoE layer. Experts are ranked by this chunk's
+route counts. Resident experts remain in the Top-N set but are not transferred,
+and lower-ranked experts are not backfilled. Fixed staging slots limit only
+concurrency; they are reused until all selected candidates finish or fall back.
 ```
 
 扩展现有 strategy 枚举：
@@ -204,7 +205,7 @@ transferred, and lower-ranked experts are not backfilled.
 - 当前窗口不同 active experts 少于 `N_stream` 时，使用 `min(N_stream, unique_active_experts)`。
 - `decayed-lfu` 要求 `C > 0`。
 - 该参数只在 `--kt-expert-placement-strategy decayed-lfu` 下生效；其他 placement strategy 下显式配置时启动失败，避免无声忽略。
-- 推荐从 `1～4` 起步；V1.1 的 Top-N 统计允许 `N_stream <= C`，但当前窗口实际 GPU streaming 受双 staging 限制为前 2 个 missing candidates，其余仍由主 CPU task 计算。
+- 推荐从 `1～4` 起步；允许在 `N_stream <= C` 范围内显式实验更大值。双 staging 只限制同时在途的 candidates 为 2，不改变本窗口最多流式执行 `N_stream` 个 missing experts 的语义；更大的值可能形成更长的滚动队列并增加临界路径延迟。
 
 建议的首版内部默认值，而非性能承诺：
 
@@ -220,6 +221,7 @@ default N_stream            = min(4, per-layer capacity)
 selected candidates         = ordered non-resident filter of Stream-TopN, 0..N_stream
 host staging slots          = 2 per compatible loader group
 GPU raw/prepared staging    = 2 per compatible loader group
+staging semantics           = concurrency depth only; roll over until selected candidates finish
 max persistent replacements = actual successful stream loads, at most N_stream per layer/window
 fallback deadline policy    = internal, derived from current CPU branch and measured token-bucket CPU cost
 ```
@@ -498,7 +500,7 @@ SELECTED
 - host staging 只有在所有 TP ranks 的 H2D event 和 release consensus 完成后才能复用。
 - GPU staging 只有在 writer/DMA/repack、可能存在的 GPU wave 2 consumed event，以及把它作为 source 的 install D2D event 全部完成后才能复用。
 - assignment 切到 `CPU_CLAIMED` 只禁止当前 chunk 接受 streamed GPU output，不自动取消已经在途的 loader，也不允许提前复用 staging；load 最终成功时仍可安装供后续 chunk 使用。
-- 默认只有两个 GPU staging slots。V1.1 为避免 candidate 3/4 的 writer 排在长 CPU GEMM 后面，只对前两个 missing candidates 固化 GPU ownership；其余候选保持 `CPU_CLAIMED` 并留在主 CPU task。未来增加独立 writer queue/WorkerPool 后，才恢复 `N_stream > 2` 的全量双槽滚动流水。
+- 默认只有两个 GPU staging slots，但 staging depth 只是并发深度。`P` 中全部 `0..N_stream` 个 candidates 在主 CPU task 提交前固化为 GPU ownership；首批最多 2 个 tickets 进入 writer/H2D 流水，其余保持等待状态，并在 slot 完成 wave 2、install/release 和 TP fence 后按原顺序滚动激活。任一 candidate 可恢复失败时只对其自身及尚未成功的尾部执行 late CPU fallback，不得重新加入已经运行中的主 CPU task。
 - `GPU_CLAIMED` 与 `CPU_CLAIMED` 必须是互斥状态，保证 candidate 的当前 chunk 输出不会被 CPU/GPU 重复计算并重复累加。
 - GPU wave 2 必须先写 candidate-private output；只有 kernel/event 与 TP success consensus 完成后才 scatter/merge 到共享 MoE output。可恢复失败可丢弃私有 output 并切换 CPU；已经部分写入共享 output 或 CUDA context 损坏时必须 fail-stop。
 - 当前 chunk 的 streaming mapping 是私有 dispatch snapshot；全局 resident mask/mapping 在 CPU task 仍可能读取时不得修改。
@@ -734,12 +736,12 @@ selected_for_stream = ordered_filter(current_stream_hotset, not resident)
 
 `N_stream` 是候选集合硬上限，不是“必须搬满 N 个”的配额。实际成功的 H2D、当前 chunk GPU compute 和 persistent replacements 还受以下内部安全约束：
 
-- 兼容 staging slot 数量和 loader backpressure。
+- 兼容 staging slot 数量和 loader backpressure；slot 数量只决定同时在途数，等待中的 selected candidates 继续保持 GPU ownership。
 - 全局在途 writer/H2D/repack 数量。
 - 单位 step 的传输字节与 CPU/PCIe 带宽保护。
 - victim last-use、TP consensus、backend capability 和 failure fallback。
 
-这些约束不新增其他 CLI；超出预算的 candidate 必须明确走 late CPU fallback，不能静默漏算，也不能向第 `N_stream + 1` 名以后补位。
+这些约束不新增其他 CLI；selected candidate 若因 deadline、故障或全局预算无法完成 streaming，必须明确走 late CPU fallback，不能静默漏算，不能偷偷回填到已经启动的主 CPU task，也不能向第 `N_stream + 1` 名以后补位。
 
 ### 9.5 全局性与禁止整组覆盖
 
@@ -833,12 +835,11 @@ Router 生成 prefill topk_ids
   |
   +-- R = active resident --------------------> GPU wave 1
   |
-  +-- C_cpu = other non-resident
-  |          + 超出双 staging prebegin 深度的热点 --> CPU GEMM
+  +-- C_cpu = non-resident experts outside P ------> CPU GEMM
   |
-  +-- P = Stream-TopN 中前两个可预启动的 missing experts
+  +-- P = Stream-TopN 中全部 missing experts，最多 N_stream
           |
-          +-- host export / H2D / repack
+          +-- 双 staging 滚动执行 host export / H2D / repack
           |      与 GPU wave 1、CPU GEMM 重叠
           |
           +-- 每个 candidate READY 后 --------> GPU wave 2
@@ -862,8 +863,8 @@ stream topk weights / scatter metadata
 三条流水的重叠范围是同一层：
 
 - GPU wave 1 立即计算所有当前 active resident experts，包括不在 Stream-TopN 的 resident experts。
-- CPU 在前两个 writer 入队后立即计算所有 `C_cpu` experts；host export 仍串行在 CPU GEMM 前，但其后的 H2D/repack/wave 2 与 CPU GEMM 重叠。
-- loader 同时准备 `P`；candidate 1 ready 后即可计算 candidate 1，其余 candidates 继续搬运。
+- CPU 在首批最多两个 writer 激活后立即计算所有 `C_cpu` experts；`P` 中全部 candidates 已从该主 CPU task 排除。首批和后续滚动 host export 均在独立 writer FIFO/WorkerPool 上执行，不排在主 CPU task 后面；`N_stream > 2` 的剩余暴露时间主要来自 writer 带宽、逐 candidate TP 控制和 GPU wave 2，仍须实机测量。
+- loader 使用两个 staging slots 滚动准备全部 `P`；candidate 1 ready 后即可计算 candidate 1，slot 安全释放后立即用于后续 candidate，不等待全部 candidates 一次性完成。
 - 当前层三路输出合并完成前不能进入下一 transformer layer；只有 persistent install/publish 工作可能在安全协议允许时与后续层重叠。
 
 单层延迟近似为：
@@ -888,7 +889,7 @@ CPU-only   = 167 experts
 
 只选择并尝试搬运这 1 个缺失 expert，不选择第 5～7 名补成 4 个。
 
-如果 CPU writer 仍与 CPU expert forward 共用队列，第一版应在当前 CPU critical task 提交完成后再以低优先级执行 export，不能为了“异步”反而延长当前 CPU GEMM。
+MXFP4 CPU writer 使用独立、受限的 FIFO/WorkerPool，不能回退到主 CPUInfer 队列，否则 candidate 3 及以后会排在长 CPU GEMM 后形成串行尾部。辅助池默认每个 CPU TP/NUMA 仅 1 个 worker，并使用独立 core offset；若目标机器没有对应空闲核心，绑核可能降级为未绑定线程，必须通过日志和 trace 观测 CPU/DRAM 争抢。
 
 ### 10.3 生成 stream plan 与 promotion plan
 
@@ -939,16 +940,17 @@ EXEC_DONE
 optional persistent install or FREE
 ```
 
-V1.1 双 staging 的目标是让当前窗口前两个 missing candidates 尽早进入 GPU，而不是把更多候选排到 CPU GEMM 后形成串行尾部：
+V1.1 双 staging 是容量为 2 的滚动流水，承载当前窗口全部 `0..N_stream` 个 selected candidates：
 
 ```text
 staging 0: candidate 1 GPU wave 2
 staging 1: candidate 2 H2D/repack
-candidate 1/2 consumed -> unpublished install D2D 或 FREE
-candidate 3 及以后 -> 本窗口保持 CPU_CLAIMED
+candidate 1 consumed/install/release -> staging 0 复用给 candidate 3
+candidate 2 consumed/install/release -> staging 1 复用给 candidate 4
+依次滚动，直到 P 中全部 candidates GPU_DONE 或进入 late CPU fallback
 ```
 
-ready queue 的规则是“有一个可算一个；若多个 candidate 已同时 ready，则合成一个小 grouped GEMM”。`ready_group_size` 不得超过当前 staging pool depth；默认双 staging 时当前窗口 ready group 为 1～2 个。超过 2 个的 hot candidates 不在本轮复用 staging，而是保留在主 CPU task。未来具备独立 writer pool 后再恢复滚动复用。
+ready queue 的规则是“有一个可算一个；若多个 candidate 已同时 ready，则合成一个小 grouped GEMM”。`ready_group_size` 不得超过当前 staging pool depth；默认双 staging 时单个 ready group 为 1～2 个，但一个窗口可以通过复用 slots 连续执行多个 groups，累计最多处理 `N_stream` 个 missing candidates。staging depth 不得用于缩小 CPU/GPU ownership 集合。
 
 host 与 GPU staging 分别复用：host slot 在所有 TP ranks 完成该 shard H2D 并 release consensus 后即可复用；GPU raw/prepared slot 必须继续保留到最后一个读取权重的 wave 2 kernel 结束，并在需要 persistent install 时继续保留到 install D2D 完成。
 
@@ -1464,7 +1466,7 @@ staging allocation 在启动或首次启用时完成。运行时不能临时扩�
 - 使用按兼容签名分组的 staging pool 和 loader queue。
 - 为 writer 配置受限的独立 WorkerPool/NUMA 资源，或实现明确的 compute-idle 调度，不能只新增 future 后继续与 CPU MoE 无限制争抢同一 pool。
 - Router 后立即同时启动 resident GPU wave 1、CPU-only task 和 Stream-TopN missing loader。
-- V1.1 在共享 CPUInfer FIFO 中把双 staging 对应的 writer 先入队，主 CPU-only task 随后入队；writer completion 返回后立即启动 H2D/repack/wave 2，并与主 CPU GEMM 重叠。超出 staging 深度的候选保留在主 CPU task。若要让 host pack 与 CPU-only GEMM 本身并行，或让 `N_stream > 2` 全部参与当前窗口 wave 2，必须增加受限且验证过带宽隔离的 writer WorkerPool。
+- V1.1 为 MXFP4 建立独立 writer CPUInfer FIFO 和受限辅助 WorkerPool；双 staging 首批 writer 与主 CPU-only task 分别进入不同队列，writer completion 返回后立即启动 H2D/repack/wave 2，slot 释放后继续滚动激活 candidate 3 及以后。全部 `P` 从主 CPU task 排除并最多流式执行 `N_stream` 个；辅助池默认每个 CPU TP/NUMA 1 个 worker，后续根据 trace 决定是否需要自适应限速。
 - 实现“candidate 1 搬完即算 candidate 1，candidate 2 继续搬”的双 staging 流水；多个同时 ready 时允许小 grouped GEMM。
 - 当前 chunk GPU wave 2 完成后，再在 prefill safe boundary 提交 persistent promotion。
 - 在 prefill-to-decode finalization drain 有界的在途任务并冻结 mapping。
@@ -1574,7 +1576,7 @@ Phase 5A 只能缓解饥饿；它要求旧 decode 全部 quiesce 后才能发布
 18. 参数边界：默认 `None -> min(4, C)`；显式 `0`、`1`、`C` 正常，负数或大于 `C` 启动失败；静态 strategy 下显式配置启动失败。
 19. `N_stream=0`：继续记录统计，但 stream/promotion loader、H2D、wave 2 和 resident replacement 数量均为 0。
 20. mixed prefill+decode batch 只记录 prefill 统计，stream loader 数量严格为 0，non-resident prefill assignments 全部走普通 CPU-only，而不是 late CPU fallback。
-21. 双 staging + `N_stream>2`：只有前两个 missing candidates 获得当前窗口 GPU ownership；candidate 3 及以后保持 CPU ownership，不创建延迟 writer，三路 assignment 仍严格互斥且完整。
+21. 双 staging + `N_stream>2`：全部 missing candidates 获得当前窗口 GPU ownership并从主 CPU task 排除；任一时刻最多 2 个占用 staging，candidate 3 及以后随 slot 释放按确定性顺序滚动执行。正常路径全部由 wave 2 恰好完成一次，故障尾部合并为一次 late CPU fallback。
 22. 各 TP rank 的本地 ready 顺序不同，collective 仍按统一 candidate order 执行且不死锁。
 23. candidate 已 `CPU_CLAIMED`、但 loader 后续成功时，可以不等待 consumed event 而执行 persistent install。
 24. 主 CPU-only task 与 late fallback 使用独立 buffer，输出不互相覆盖。
@@ -1694,6 +1696,7 @@ Phase 5B 验证：
 | `all_resident_batches` | 所有 assignments 都命中 persistent resident 的 batch 数 |
 | `zero_cpu_only_batches` | 除 streaming candidates 外不需要普通 CPU expert 的 batch 数 |
 | `stream_candidate_count` | 本窗口按 hotset 顺序过滤 resident 后的 candidate 数，范围 `0..N_stream` |
+| `stream_staging_depth` / `stream_queue_depth` | 同时在途的 staging 容量与等待滚动执行的 candidate 数；前者不得改写本窗口 ownership 总数 |
 | `stream_gpu_success` / `stream_cpu_fallback` | candidate 当前 chunk 最终由 GPU/CPU 完成的数量 |
 | `promotions` / `evictions` | 实际提交次数 |
 | `rejected_promotions` | 因滞回、预算、过期或 backend 被拒绝 |
@@ -1810,12 +1813,12 @@ current_result=gpu persistent_commit=success
 
 ## 20. 风险与待决事项
 
-1. **CPUInfer 共享队列**：task-specific completion 已实现，但首版 writer 仍与 CPU MoE 共用 FIFO/WorkerPool，采用 compute-idle 调度。它避免带宽争抢，却不能让 host pack 与主 CPU GEMM 真正并行；独立受限 writer 资源仍是后续性能项。
+1. **Writer 与 CPU GEMM 的带宽争抢**：task-specific completion 和独立 writer FIFO/WorkerPool 已实现，避免了队列级串行；但两者仍共享 DRAM/L3。辅助池默认每个 CPU TP/NUMA 1 个 worker并采用主池之后的 core offset，仍需观测绑核是否成功以及 p95/p99 是否因带宽竞争恶化。
 2. **MXFP4 单槽 prepare**：DeepSeek V4 MXFP4 + KT Marlin 已实现单槽 raw-to-prepared；其他格式仍需各自的数值与布局验证。
 3. **第二批 GPU backend**：MXFP4 Marlin 已实现 staging-local remap、private output 和逐 candidate wave 2；其他 fused backend 仍不得复用该实现。
 4. **CPU transient exclusion**：首版已使用 per-call filtered `topk_ids` 保证 exact-once；deferred-expert 模式在接入相同 ownership 前继续 fail fast。
 5. **late CPU fallback**：首版已把失败尾部合并为一次 candidate-only fallback；仍需在目标 GPU 注入 writer/H2D/repack/wave 故障，验证异步错误与 fail-stop 边界。
-6. **内存带宽竞争**：compute-idle writer 降低了与 CPU expert 的直接争抢，但 host pack、H2D 和 GPU repack 的带宽影响仍必须实机观测。
+6. **内存带宽竞争**：独立 writer WorkerPool 消除了队列级串行，但 host export 与 CPU expert GEMM 会并发读取权重并共享 DRAM/L3；单 writer 的带宽影响和 Top-N 尾部仍必须实机观测。
 7. **小 GEMM 启动开销**：首版严格逐 expert 执行，可能浪费 GPU；后续可支持小 ready group，但不能等待全部 candidates。
 8. **staging 生命周期**：首版使用 ticket-owned event、slot generation、pending install commit 和全 rank host-DMA reuse fence；仍需 CUDA sanitizer/Nsight 验证不存在跨代提前复用。
 9. **TP collective 顺序**：首版 token 覆盖 transport、layer、namespace、epoch、ticket、slot、generation、operation 和 stage，错配直接 fail-stop。
@@ -1829,7 +1832,8 @@ current_result=gpu persistent_commit=success
 17. **未来预测模型偏差**：Phase 6 若引入预测，必须先用 trace 验证当前 chunk 与下一 chunk/decode 的相关性。
 18. **Global Spare 架构成本**：当前 per-layer 固定 tensor 无法零成本跨层借 slot，不能在首版假装支持。
 19. **TP 控制面开销**：首版为保正确性在关键阶段使用 CPU-group `all_gather_object` 校验完整 token。Top-N×多层可能累积明显延迟；必须 profile `tp_control_collective_ms`，后续改为固定 `int64` tensor token 并合并非关键阶段。
-20. **当前 Chunk 重叠上限**：共享 CPUInfer FIFO 下，writer 在主 CPU task 之后执行；当前 Chunk 的收益来自排除热点 CPU GEMM、GPU wave 1 并行和后续 H2D/repack/wave 2，而不是 host pack 与 CPU GEMM 的完全并行。真正的全重叠需要独立且限速的 writer 执行资源。
+20. **当前 Chunk 重叠上限**：独立 writer 队列消除了 candidate 3 及以后等待主 CPU FIFO 的问题，但双 staging 仍只允许两个 candidate 同时在途；host export 速度、逐 candidate TP 共识和 GPU wave 2 吞吐可能形成新的 exposed tail。需要记录 writer start/end、slot refill、H2D 和 wave 2 时间，按实测限制有效 `N_stream`。
+21. **进程内重建生命周期**：主 CPUInfer 与 writer CPUInfer 当前均为进程级 singleton，配置 key 不一致时 fail fast，线程在进程退出前保持存活。未来若支持同进程卸载并重建不同 CPU/NUMA 配置的 engine，必须增加“停止新 ticket → drain writer completion → 销毁 writer → 销毁 main”的显式 shutdown/reset 协议。
 
 ## 21. 实施检查清单
 
@@ -1933,7 +1937,7 @@ current_result=gpu persistent_commit=success
 
 - `--kt-num-gpu-layers L` 的既有语义不变：`layer_idx < L` 的前置层继续 native/full GPU，不进入 KT cache。
 - `--kt-num-gpu-experts` 只定义 `layer_idx >= L` 的后续 KT-managed MoE 层的固定物理 cache capacity。
-- `--kt-prefill-stream-top-n` 也只作用于这些后续 cache-managed MoE 层，控制每层每个 prefill chunk 的 hotset 上限；实际 candidates 为 hotset 中的 non-resident experts，不向后补位。
+- `--kt-prefill-stream-top-n` 也只作用于这些后续 cache-managed MoE 层，控制每层每个 prefill chunk 的 hotset 上限，并定义本窗口最多选择、流式执行的 missing 热点专家总数；实际 candidates 为 hotset 中的 non-resident experts，不向后补位，双 staging 只限制并发深度。
 - `decayed-lfu` 根据当前及历史 prefill 路由维护长期热度；当前窗口 Stream-TopN 直接来自本次 Router 计数，首版不实现显式下一 Chunk 预测。
 - 当前 active resident experts 立即进入 GPU wave 1；Stream-TopN 中缺失的 `0..N_stream` 个 experts 进入 streaming GPU wave 2；其余 non-resident experts 立即走 CPU-only。
 - Router 后不等待 H2D 才启动已有计算；candidate 进入独立 staging，与同层 GPU wave 1、CPU-only 重叠，某个 candidate ready 后立即计算，不等待其余 candidates。
