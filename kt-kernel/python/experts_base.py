@@ -644,9 +644,20 @@ class BaseMoEWrapper(_MoEBase, ABC):
         protected_ids = torch.gather(expert_ids, -1, protected_indices)
 
         protected_flag = torch.zeros((self.num_experts,), dtype=torch.int32, device=device)
-        protected_flag.scatter_(0, protected_ids.reshape(-1), 1)
+        protected_valid = (protected_ids >= 0) & (protected_ids < self.num_experts)
+        valid_protected_ids = protected_ids[protected_valid]
+        if valid_protected_ids.numel() > 0:
+            protected_flag.scatter_(
+                0,
+                valid_protected_ids.reshape(-1),
+                torch.ones_like(valid_protected_ids, dtype=torch.int32).reshape(-1),
+            )
 
-        protected_mask_flat = torch.gather(protected_flag, 0, expert_ids.reshape(-1)).ne(0)
+        valid = (expert_ids >= 0) & (expert_ids < self.num_experts)
+        safe_expert_ids = torch.where(valid, expert_ids, 0)
+        protected_mask_flat = valid.reshape(-1) & torch.gather(
+            protected_flag, 0, safe_expert_ids.reshape(-1)
+        ).ne(0)
         protected_mask = protected_mask_flat.view(batch, topk)
 
         immediate_ids = expert_ids.clone().masked_fill(~protected_mask, -1)

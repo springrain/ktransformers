@@ -20,6 +20,7 @@
 #include <cstring>
 
 #include "cpu_backend/cpuinfer.h"
+#include "gec_bindings.hpp"
 #include "cpu_backend/worker_pool.h"
 #if defined(KTRANSFORMERS_USE_ASCEND_NPU)
 #include "cpu_backend/ascend_callback_worker.h"
@@ -598,6 +599,7 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
 }
 
 PYBIND11_MODULE(kt_kernel_ext, m) {
+  kt::gec::bind_gec(m);
 #if defined(HAVE_AMX)
   m.attr("__cpu_variant__") = "amx";
   m.attr("__int8_kernel__") = "amx-int8";
