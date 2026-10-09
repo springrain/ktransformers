@@ -152,6 +152,9 @@ PY
   log_step "Installing custom_flashinfer $custom_flashinfer_version"
   python3 -m pip install \
     'setuptools>=77' \
+    'setuptools-rust>=1.11' \
+    'setuptools-scm>=8.0' \
+    wheel \
     'packaging>=24' \
     'apache-tvm-ffi==0.1.11'
 
@@ -174,10 +177,10 @@ PY
 
   if [ "$editable" = "1" ]; then
     log_info "Installing sglang in editable mode..."
-    python3 -m pip install -e "./python[all]"
+    python3 -m pip install --no-build-isolation -e "./python[all]"
   else
     log_info "Installing sglang..."
-    python3 -m pip install "./python[all]"
+    python3 -m pip install --no-build-isolation "./python[all]"
   fi
 
   python3 - "$custom_flashinfer_dir" "$custom_flashinfer_version" <<'PY'

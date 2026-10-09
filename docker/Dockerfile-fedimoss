@@ -42,6 +42,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.12-dev \
     python3-pip \
     build-essential \
+    libdw-dev \
+    libelf-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. 设置软链接, 让 python / python3 / pip 默认指向 Python 3.12
@@ -58,6 +60,11 @@ RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
 
 #  (可选) 验证安装
 RUN python --version && pip --version
+
+# DeepGEMM imports torch from setup.py during metadata generation. Install
+# it in this venv before install.sh invokes pip for SGLang, and use the CUDA
+# 13 wheel index to match the CUDA 13.4 base image.
+RUN --mount=type=cache,target=/root/.cache/pip pip install torch==2.13.0 
 
 # 恢复交互式环境变量 (可选) 
 ENV DEBIAN_FRONTEND=
