@@ -44,6 +44,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libdw-dev \
     libelf-dev \
+    cmake \
+    ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. 设置软链接, 让 python / python3 / pip 默认指向 Python 3.12
@@ -88,6 +90,9 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 COPY ./ /workspace/ktransformers
 
+
+# 先安装构建工具及 wheel-stub,还要安装cmake
+RUN --mount=type=cache,target=/root/.cache/pip pip install scikit-build-core wheel wheel-stub
 
 # 如果 install.sh 在里面, 给执行权限并运行
 ## https://github.com/NVIDIA/nccl/issues/2353   多卡卡死!!!
