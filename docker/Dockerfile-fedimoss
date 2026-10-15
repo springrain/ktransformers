@@ -70,7 +70,9 @@ WORKDIR /workspace
 ENV RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup
 ENV RUSTUP_UPDATE_ROOT=https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV CARGO_HOME=/root/.cargo
 ENV PATH="/root/.cargo/bin:${PATH}"
+ENV CARGO_TARGET_DIR=/root/.cargo/target
 
 
 ### git clone https://github.com/springrain/ktransformers.git
@@ -84,10 +86,13 @@ COPY ./ /workspace/ktransformers
 
 # 如果 install.sh 在里面, 给执行权限并运行
 ## https://github.com/NVIDIA/nccl/issues/2353   多卡卡死!!!
-RUN --mount=type=cache,target=/root/.cache/pip \
-chmod +x /workspace/ktransformers/install.sh \
-&& bash /workspace/ktransformers/install.sh \
-&& pip install nvidia-nccl-cu13==2.31.2 
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/root/.cargo/target \
+    --mount=type=cache,target=/root/.cache/pip \
+    chmod +x /workspace/ktransformers/install.sh \
+    && bash /workspace/ktransformers/install.sh \
+    && pip install nvidia-nccl-cu13==2.31.2
 
 # 默认进入 bash
 CMD ["/bin/bash"]
