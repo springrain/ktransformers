@@ -38,26 +38,11 @@ struct SchedulerCandidate {
 
 struct SchedulerDecision {
   // Top-N H2D admissions for this round: bounded only by the remaining
-  // admission budget (kt-layer-h2d-slots). The batch size does not limit how
-  // many experts may take the H2D path in a round (doc sections 5.3 and 15).
+  // admission budget (kt-layer-h2d-slots), so the whole round selection takes
+  // the H2D path at once (doc sections 5.3 and 15).
   std::vector<LogicalExpertId> h2d_selected;
   // Everything else: CPU fallback path.
   std::vector<LogicalExpertId> cpu_fallback;
-
-  // Splits the round selection into H2D batches of at most batch_size
-  // experts (kt-layer-h2d-batch-size). The final batch carries the remainder:
-  // batch = min(available, batch_size), never waits to be filled.
-  std::vector<std::vector<LogicalExpertId>> h2d_batches(int batch_size) const {
-    std::vector<std::vector<LogicalExpertId>> batches;
-    if (batch_size < 1) return batches;
-    const size_t cap = static_cast<size_t>(batch_size);
-    for (size_t begin = 0; begin < h2d_selected.size(); begin += cap) {
-      const size_t end = std::min(begin + cap, h2d_selected.size());
-      batches.emplace_back(h2d_selected.begin() + static_cast<ptrdiff_t>(begin),
-                           h2d_selected.begin() + static_cast<ptrdiff_t>(end));
-    }
-    return batches;
-  }
 };
 
 class H2DScheduler {

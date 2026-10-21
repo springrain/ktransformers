@@ -75,14 +75,16 @@ class TestGecContract(unittest.TestCase):
         self.assertIn('void gpu_complete(int buffer_id)', text)
         self.assertIn('if (buffer.state != BufferState::GpuInUse)', text)
 
-    def test_scheduler_batch_never_waits_to_fill(self):
+    def test_scheduler_admits_round_in_one_pass(self):
         text = (GEC_DIR / 'scheduler.hpp').read_text(encoding='utf-8')
         self.assertIn('h2d_selected', text)
-        self.assertIn('h2d_batches', text)
-        # Top-N admission is budget-bounded; batch size only chunks submits.
+        # Top-N admission is bounded only by the round budget; the whole
+        # selection takes the H2D path in a single pass.
         self.assertIn('std::min(eligible.size(), budget)', text)
+        self.assertNotIn('h2d_batches', text)
         pipeline = (GEC_DIR / 'pipeline.hpp').read_text(encoding='utf-8')
-        self.assertIn('h2d_batches', pipeline)
+        self.assertIn('decision.h2d_selected', pipeline)
+        self.assertNotIn('h2d_batches', pipeline)
 
     def test_telemetry_has_six_wait_reasons(self):
         text = (GEC_DIR / 'telemetry.hpp').read_text(encoding='utf-8')

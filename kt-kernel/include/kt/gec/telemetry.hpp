@@ -65,6 +65,28 @@ struct H2DTimeline {
   uint64_t gemm_latency_us() const { return gemm_end_us - gemm_start_us; }
 };
 
+struct StagingStats {
+  // Rounds that started a look-ahead pass (via advance()).
+  uint64_t begin_rounds = 0;
+  // Experts whose H2D was submitted by a look-ahead pass before their own
+  // layer started (prefetch_submits = copy_submits of those passes).
+  uint64_t prefetch_submits = 0;
+  // Experts served at consumption time without any submission of their own
+  // (already prefetched / inflight).
+  uint64_t consumed_from_prefetch = 0;
+  // Consumers that had to wait on the production round's release (the ring
+  // was out of depth and the previous generation had not been freed).
+  uint64_t stall_waits = 0;
+  // Staging rows that could not be placed (backpressure / deeper layers) and
+  // executed on CPU instead.
+  uint64_t fallbacks = 0;
+  // Cache HITs executed immediately when the layer had no staging window.
+  uint64_t direct_hits = 0;
+  // Look-ahead rows whose staging lease expired unobserved and that the
+  // frustum dropped before they became resident (FreeToken rollback).
+  uint64_t frustum_dropped = 0;
+};
+
 struct ReasonStats {
   uint64_t count = 0;
   uint64_t total_us = 0;
@@ -121,6 +143,32 @@ class TelemetryCollector {
     return h2d_timelines_.size();
   }
 
+  std::vector<H2DTimeline> h2d_timelines() const {
+    GecLockGuard lock(mutex_);
+    return h2d_timelines_;
+  }
+
+  std::vector<WaitRecord> waits() const {
+    GecLockGuard lock(mutex_);
+    return waits_;
+  }
+
+  StagingStats staging() const {
+    GecLockGuard lock(mutex_);
+    return staging_;
+  }
+
+  void record_staging(const StagingStats& delta) {
+    GecLockGuard lock(mutex_);
+    staging_.begin_rounds += delta.begin_rounds;
+    staging_.prefetch_submits += delta.prefetch_submits;
+    staging_.consumed_from_prefetch += delta.consumed_from_prefetch;
+    staging_.stall_waits += delta.stall_waits;
+    staging_.fallbacks += delta.fallbacks;
+    staging_.direct_hits += delta.direct_hits;
+    staging_.frustum_dropped += delta.frustum_dropped;
+  }
+
   std::string summary() const {
     std::array<ReasonStats, kWaitReasonCount> stats = aggregate();
     std::string out;
@@ -140,6 +188,7 @@ class TelemetryCollector {
   mutable GecMutex mutex_;
   std::vector<WaitRecord> waits_;
   std::vector<H2DTimeline> h2d_timelines_;
+  StagingStats staging_;
 };
 
 }  // namespace kt::gec

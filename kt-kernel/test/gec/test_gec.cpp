@@ -48,7 +48,6 @@ GecConfig test_config() {
   config.num_gpu_layers = 0;
   config.expert_gpu_slots = 4;
   config.layer_h2d_slots = 4;
-  config.layer_h2d_batch_size = 2;
   config.h2d_buffer_pool_depth = 2;
   config.priority_alpha = 1.0;
   config.probation_uses = 1;
@@ -78,7 +77,6 @@ void test_config_validation() {
   CHECK(throws([&] { GecConfig bad = test_config(); bad.num_gpu_layers = -1; bad.validate(); }));
   CHECK(throws([&] { GecConfig bad = test_config(); bad.expert_gpu_slots = -1; bad.validate(); }));
   CHECK(throws([&] { GecConfig bad = test_config(); bad.layer_h2d_slots = -1; bad.validate(); }));
-  CHECK(throws([&] { GecConfig bad = test_config(); bad.layer_h2d_batch_size = 0; bad.validate(); }));
   CHECK(throws([&] { GecConfig bad = test_config(); bad.h2d_buffer_pool_depth = 0; bad.validate(); }));
   CHECK(throws([&] { GecConfig bad = test_config(); bad.priority_alpha = -0.1; bad.validate(); }));
   CHECK(throws([&] { GecConfig bad = test_config(); bad.probation_uses = -1; bad.validate(); }));
@@ -261,7 +259,6 @@ void test_inflight_registry() {
 void test_scheduler() {
   std::cout << "[M2] candidate filter + priority + top-n" << std::endl;
   GecConfig config = test_config();
-  config.layer_h2d_batch_size = 2;
   config.priority_alpha = 1.0;
   H2DScheduler scheduler(config);
 
@@ -273,7 +270,7 @@ void test_scheduler() {
   candidates = {a, b, c, d};
 
   // Priority: B (1 + 100) > A (5) > D (2); C filtered out (inflight).
-  // Top-N admission is bounded by the budget (10), not by batch_size (2).
+  // Top-N admission is bounded only by the budget (10).
   SchedulerDecision decision = scheduler.schedule(candidates, 10);
   CHECK(decision.h2d_selected.size() == 3);
   CHECK(decision.h2d_selected[0] == b.id);
@@ -281,13 +278,6 @@ void test_scheduler() {
   CHECK(decision.h2d_selected[2] == d.id);
   CHECK(decision.cpu_fallback.size() == 1);
   CHECK(decision.cpu_fallback[0] == c.id);
-
-  // batch = min(available, batch_size): 3 selected, batch_size 2 -> 2 + 1.
-  std::vector<std::vector<LogicalExpertId>> batches =
-      decision.h2d_batches(config.layer_h2d_batch_size);
-  CHECK(batches.size() == 2);
-  CHECK(batches[0].size() == 2);
-  CHECK(batches[1].size() == 1);  // the last batch never waits to be filled
 
   // Budget cap: only one slot left.
   decision = scheduler.schedule(candidates, 1);
@@ -559,7 +549,6 @@ void test_prefill_then_parallel_paths() {
   GecConfig config = test_config();
   config.expert_gpu_slots = 2;
   config.layer_h2d_slots = 1;
-  config.layer_h2d_batch_size = 1;
   RollingPipeline pipeline(config, tp2());
   LogicalExpertId a{0, 0}, b{0, 1}, c{1, 0}, d{1, 1};
 
@@ -569,7 +558,9 @@ void test_prefill_then_parallel_paths() {
   // Resident expert: immediate GPU execution (cache HIT path).
   CHECK(round.cache_hits.size() == 1);
   CHECK(round.cache_hits[0] == a);
-  // Missing expert: PCIe H2D inside the same round.
+  // Missing experts: every routed row is admitted until the H2D budget is
+  // spent. Each row costs one Logical Expert regardless of TP, so both c and d
+  // are eligible and the budget (1) cuts the second one into CPU fallback.
   CHECK(round.h2d_loaded.size() == 1);
   CHECK(round.h2d_loaded[0] == c);
   // Budget exhausted: remaining expert executes immediately on CPU.
@@ -696,7 +687,6 @@ void test_pipeline_budget() {
   std::cout << "[M2] H2D admission budget" << std::endl;
   GecConfig config = test_config();
   config.layer_h2d_slots = 2;
-  config.layer_h2d_batch_size = 4;
   RollingPipeline pipeline(config, tp2());
   LogicalExpertId a{0, 7}, b{0, 8}, c{0, 9}, d{0, 10}, e{0, 11};
 
@@ -705,9 +695,11 @@ void test_pipeline_budget() {
   CHECK(round1.cpu_fallback.size() == 1);
   CHECK(pipeline.budget_remaining() == 0);
 
+  // A new round opens a new budget (look-ahead passes run on their own).
   RoundResult round2 = pipeline.run_round({d});
-  CHECK(round2.h2d_loaded.empty());
-  CHECK(round2.cpu_fallback.size() == 1);
+  CHECK(round2.h2d_loaded.size() == 1);
+  CHECK(round2.cpu_fallback.empty());
+  CHECK(pipeline.budget_remaining() == 1);
 
   pipeline.reset_budget();
   RoundResult round3 = pipeline.run_round({e});
@@ -715,32 +707,30 @@ void test_pipeline_budget() {
   CHECK(round3.cpu_fallback.empty());
 }
 
-void test_pipeline_batches_fill_budget() {
-  std::cout << "[M2] batch size chunks submissions, budget admits the round" << std::endl;
+void test_pipeline_admits_round_in_one_pass() {
+  std::cout << "[M2] one pass admits the whole round budget" << std::endl;
   GecConfig config = test_config();
-  config.layer_h2d_slots = 4;       // round budget: 4 experts
-  config.layer_h2d_batch_size = 2;  // submitted as two batches of two
+  config.layer_h2d_slots = 4;  // round budget: 4 experts
   Topology topology{1, 1, 1};
   RollingPipeline pipeline(config, topology);
   LogicalExpertId a{0, 20}, b{0, 21}, c{0, 22}, d{0, 23};
   RoundResult round = pipeline.run_round({a, b, c, d});
-  CHECK(round.h2d_loaded.size() == 4);  // budget admits all four, not one batch
+  CHECK(round.h2d_loaded.size() == 4);  // the budget admits all four at once
   CHECK(round.cpu_fallback.empty());
   CHECK(pipeline.budget_remaining() == 0);
   CHECK(pipeline.free_buffer_count(0) == config.h2d_buffer_pool_depth);
 }
 
 void test_pipeline_buffer_recycling() {
-  std::cout << "[M2] buffer pool recycling between batches" << std::endl;
+  std::cout << "[M2] buffer pool recycling within one pass" << std::endl;
   GecConfig config = test_config();
   config.h2d_buffer_pool_depth = 1;  // single buffer per GPU
-  config.layer_h2d_batch_size = 2;   // batch of two experts
   Topology topology{1, 1, 1};
   RollingPipeline pipeline(config, topology);
   LogicalExpertId a{0, 12}, b{0, 13};
   RoundResult round = pipeline.run_round({a, b});
   // Sequential execution: a completes and releases its buffer before b starts,
-  // so a depth-1 pool still serves a batch of two (doc section 15 recycling).
+  // so a depth-1 pool still serves the whole round (doc section 15 recycling).
   CHECK(round.h2d_loaded.size() == 2);
   CHECK(round.cpu_fallback.empty());
   CHECK(pipeline.free_buffer_count(0) == 1);
@@ -752,7 +742,6 @@ void test_telemetry_decomposition() {
   std::cout << "[M3] six-way wait decomposition" << std::endl;
   GecConfig config = test_config();
   config.layer_h2d_slots = 8;
-  config.layer_h2d_batch_size = 4;
   RollingPipeline pipeline(config, tp2());
   const uint64_t base = 1000000;
   PipelineHooks hooks;
@@ -764,27 +753,61 @@ void test_telemetry_decomposition() {
   hooks.cpu_gemm_latency_us = [](const LogicalExpertId&) { return 700; };
   pipeline.set_hooks(hooks);
 
-  LogicalExpertId a{0, 1}, b{0, 2}, c{0, 3};
+  LogicalExpertId a{0, 1}, b{0, 2};
+  LogicalExpertId e{0, 3};
   pipeline.run_round({a, b});  // two experts, TP=2 -> 4 shard transfers
-  // Mark one shard inflight.  The second request must reuse its dependency
-  // rather than falling back to CPU or submitting a duplicate H2D.
-  pipeline.inflight().register_transfer(PhysicalShardId{c.layer_id, c.expert_id, 0}, 999);
-  pipeline.run_round({a, c});  // a: cache hit; c: dependency reuse + one H2D
-  pipeline.inflight().complete(PhysicalShardId{c.layer_id, c.expert_id, 0});
+  // a stays resident across rounds (its consumer latched it): every later
+  // routing of a is a cache hit, never a miss and never a transfer.
+  auto hit_round = pipeline.run_round({a});
+  CHECK(hit_round.cache_hits.size() == 1 && hit_round.cache_hits[0] == a);
+  // A dependency already in flight is reused, never resubmitted.
+  pipeline.inflight().register_transfer(PhysicalShardId{e.layer_id, e.expert_id, 0}, 999);
+  auto shard_reuse_round = pipeline.run_round({e});
+  CHECK(shard_reuse_round.h2d_loaded.size() == 1);  // TP shard 1 still transfers
+  CHECK(shard_reuse_round.cpu_fallback.empty());
+  CHECK(pipeline.cache().find(e)->shards[0].ready_dependency == 999);
+  pipeline.inflight().complete(PhysicalShardId{e.layer_id, e.expert_id, 0});
 
+  // TP-atomic reuse: every shard of the row is already on the H2D stream, so
+  // the whole row binds to that dependency — no new submission, no ring slot,
+  // no CPU fallback — and the consumer latches it on the compute stream.
+  LogicalExpertId f{0, 4};
+  for (int tp = 0; tp < 2; ++tp) {
+    pipeline.inflight().register_transfer(PhysicalShardId{f.layer_id, f.expert_id, tp}, 1500);
+  }
+  auto dep_round = pipeline.run_round({f});
+  CHECK(dep_round.h2d_loaded.empty());
+  CHECK(dep_round.prefetched.empty());  // not a look-ahead row: this layer ran it
+  CHECK(dep_round.cpu_fallback.empty());
+  CHECK(!dep_round.cache_hits.empty() && dep_round.cache_hits[0] == f);
+  CHECK(pipeline.cache().find(f)->state == LifecycleState::Ready);
+  CHECK(pipeline.inflight().size() == 0);  // the reuse took over the dependency
+
+  // A resident row is served from its latched copy, never resubmitted.
+  auto resident_round = pipeline.run_round({a});
+  CHECK(resident_round.cache_hits.size() == 1 && resident_round.cache_hits[0] == a);
+
+  // Scenario ledger. Transfers: {a,b} = 4 shards submitted; {e} submits shard 1
+  // only (shard 0 was already inflight), {f} and the resident round submit
+  // nothing. Wait windows: 5 queued (only submitted shards), 5 running, 7
+  // event waits (8 shard uploads minus the 3 reused waits plus the {f} shard
+  // reuse binds to a dependency without a submission of its own).
   auto stats = pipeline.telemetry().aggregate();
-  CHECK(stats[static_cast<size_t>(WaitReason::RouterDependency)].count == 4);
+  CHECK(pipeline.cache().stats().hits == 2);  // the resident round twice, {f} is a miss
+  CHECK(stats[static_cast<size_t>(WaitReason::RouterDependency)].count == 6);
   CHECK(stats[static_cast<size_t>(WaitReason::H2DQueued)].count == 5);
-  CHECK(stats[static_cast<size_t>(WaitReason::H2DQueued)].total_us == 4 * 40 + 40);
+  CHECK(stats[static_cast<size_t>(WaitReason::H2DQueued)].total_us == 5 * 40);
   CHECK(stats[static_cast<size_t>(WaitReason::H2DRunning)].count == 5);
-  CHECK(stats[static_cast<size_t>(WaitReason::H2DRunning)].total_us == 4 * 500 + 500);
+  CHECK(stats[static_cast<size_t>(WaitReason::H2DRunning)].total_us == 5 * 500);
   CHECK(stats[static_cast<size_t>(WaitReason::H2DRunning)].p50_us == 500);
-  CHECK(stats[static_cast<size_t>(WaitReason::H2DEventWait)].count == 6);
-  CHECK(stats[static_cast<size_t>(WaitReason::H2DEventWait)].total_us == 4 * 200 + 200);
+  CHECK(stats[static_cast<size_t>(WaitReason::H2DEventWait)].count == 7);
+  CHECK(stats[static_cast<size_t>(WaitReason::H2DEventWait)].total_us == 5 * 200);
   CHECK(stats[static_cast<size_t>(WaitReason::CpuFallback)].count == 0);
   CHECK(stats[static_cast<size_t>(WaitReason::CpuFallback)].total_us == 0);
-  CHECK(stats[static_cast<size_t>(WaitReason::CacheWait)].count == 1);
-  CHECK(pipeline.telemetry().h2d_count() == 6);
+  // Resident consumers that publish a cache wait; the dependency reuse queue
+  // is tracked by the event wait it binds to.
+  CHECK(stats[static_cast<size_t>(WaitReason::CacheWait)].count == 2);
+  CHECK(pipeline.telemetry().h2d_count() == 6);  // 5 submitted + 3 bound shards
   const std::string summary = pipeline.telemetry().summary();
   CHECK(summary.find("H2D_RUNNING") != std::string::npos);
   CHECK(summary.find("H2D_EVENT_WAIT") != std::string::npos);
@@ -795,7 +818,6 @@ void run_diagnostics_demo() {
   std::cout << "[M5] first-round diagnostics demo (150-180 ms decomposition)" << std::endl;
   GecConfig config = test_config();
   config.layer_h2d_slots = 8;
-  config.layer_h2d_batch_size = 4;
   Topology topology{1, 1, 1};
   RollingPipeline pipeline(config, topology);
   const uint64_t base = 1000000;
@@ -816,6 +838,194 @@ void run_diagnostics_demo() {
 }
 
 }  // namespace
+
+// ---------------- M6: fully asynchronous H2D staging (FreeToken parity) ----
+
+// A look-ahead pass issues the copies of its misses and returns: it runs no
+// consumer and publishes no H2D latency of its own. The copies survive the
+// round (release_prefill_layer keeps them) until the layer that routes them
+// consumes them.
+void test_async_prefetch_round() {
+  std::cout << "[M6] look-ahead round is asynchronous" << std::endl;
+  GecConfig config = test_config();
+  config.layer_h2d_slots = 8;
+  RollingPipeline pipeline(config, tp2());
+  const uint64_t base = 1000000;
+  PipelineHooks hooks;
+  hooks.now_us = [base]() { return base; };
+  hooks.h2d_latency_us = [](const LogicalExpertId&, int) { return 500; };
+  hooks.event_wait_us = [](const LogicalExpertId&, int) { return 200; };
+  hooks.gpu_gemm_latency_us = [](const LogicalExpertId&) { return 300; };
+  pipeline.set_hooks(hooks);
+
+  LogicalExpertId p{1, 1};
+  // An earlier layer routes p: the consumer below binds to that transfer
+  // instead of submitting a copy of its own.
+  pipeline.run_round({p});
+  // A look-ahead pass never executes and never resubmits: the row is bound by
+  // the transfer of the layer before it, so the pass only observes it (it
+  // re-arms the staging lease for the layer that routes it next) and reports
+  // nothing as its own work — no GEMM, no copy, no fallback.
+  pipeline.begin_round(/*prefetch=*/true);
+  auto lookahead = pipeline.run_round_current({p});
+  CHECK(lookahead.cache_hits.empty());
+  CHECK(lookahead.prefetched.empty());
+  CHECK(lookahead.h2d_loaded.empty());
+  CHECK(lookahead.cpu_fallback.empty());
+  pipeline.release_round();
+  // Staging counters are published per round (release_round).
+  CHECK(pipeline.staging().prefetch_submits == 0);
+  // The next layer routes the same window: the row was copied by this
+  // pipeline's look-ahead pass, so it is consumed from staging, not a hit.
+  pipeline.run_round({p});
+  CHECK(pipeline.telemetry().h2d_count() == 2);  // one per TP shard, no resubmit
+  CHECK(pipeline.cache().find(p)->state == LifecycleState::Ready);
+}
+
+// The look-ahead copy lands while the previous layer computes: the boundary
+// sweep publishes TP-atomic READY and the next layer's routing consumes it as
+// the look-ahead row it is (one transfer, no second H2D), not as a fresh hit.
+void test_staging_ready_at_boundary() {
+  std::cout << "[M6] look-ahead copy lands before its layer" << std::endl;
+  GecConfig config = test_config();
+  config.layer_h2d_slots = 8;
+  RollingPipeline pipeline(config, tp2());
+  const uint64_t base = 1000000;
+  PipelineHooks hooks;
+  hooks.now_us = [base]() { return base; };
+  hooks.h2d_latency_us = [](const LogicalExpertId&, int) { return 500; };
+  hooks.event_wait_us = [](const LogicalExpertId&, int) { return 200; };
+  hooks.gpu_gemm_latency_us = [](const LogicalExpertId&) { return 300; };
+  pipeline.set_hooks(hooks);
+  LogicalExpertId p{1, 2};
+  // The pass is its own round (FreeToken: a look-ahead round only plans; its
+  // rows are submitted when the round is released).
+  pipeline.begin_round(true);
+  pipeline.run_round_current({p});
+  pipeline.release_round();
+  PipelineHooks later = hooks;
+  later.now_us = [base]() { return base + 900; };  // after the dependency (740)
+  pipeline.set_hooks(later);
+  auto hit = pipeline.run_round({p});
+  // The pass submitted the two shards (one per TP rank) on its own round and
+  // the routing layer binds them at its boundary: the row is consumed from
+  // staging, neither a resident hit nor a second transfer.
+  CHECK(hit.prefetched.size() == 1 && hit.prefetched[0] == p);
+  CHECK(hit.cache_hits.empty());
+  CHECK(hit.h2d_loaded.empty());
+  CHECK(pipeline.telemetry().h2d_count() == 2);
+}
+
+// Frustum rollback: a look-ahead row the next layer does not route is dropped
+// at the boundary without ever becoming resident, and its ring slot returns.
+void test_frustum_rollback() {
+  std::cout << "[M6] frustum rollback of an unused staged row" << std::endl;
+  GecConfig config = test_config();
+  config.layer_h2d_slots = 8;
+  RollingPipeline pipeline(config, tp2());
+  const uint64_t base = 1000000;
+  PipelineHooks hooks;
+  hooks.now_us = [base]() { return base; };
+  hooks.h2d_latency_us = [](const LogicalExpertId&, int) { return 500; };
+  hooks.event_wait_us = [](const LogicalExpertId&, int) { return 200; };
+  pipeline.set_hooks(hooks);
+  LogicalExpertId staged{1, 3}, routed{1, 4};
+  // An earlier layer routes the look-ahead window: the pass below finds the
+  // row resident and binds to the copy that consumer already owns (FreeToken:
+  // the next layer's window is predicted from the current one).
+  pipeline.run_round({staged});
+  pipeline.begin_round(true);
+  pipeline.run_round_current({staged});
+  // The same clock bounds admission and release: the stage is not expired
+  // within its own round, only after it.
+  CHECK(pipeline.staging().frustum_dropped == 0);
+  pipeline.release_round();
+  // The pass bound to a row another consumer owns: nothing was transferred.
+  CHECK(pipeline.telemetry().h2d_count() == 2);
+  PipelineHooks later = hooks;
+  later.now_us = [base]() { return base + 100; };
+  pipeline.set_hooks(later);
+  pipeline.run_round({routed});  // layer 1 routes something else
+  // The look-ahead row was consumed by the layer that routed it (its cache
+  // copy is the one the GEMM ran on), so there is nothing for the frustum.
+  CHECK(pipeline.staging().frustum_dropped == 0);
+  CHECK(pipeline.cache().find(staged) != nullptr &&
+        pipeline.cache().find(staged)->state == LifecycleState::Ready);
+  CHECK(pipeline.free_buffer_count(0) == config.h2d_buffer_pool_depth);
+  CHECK(pipeline.free_buffer_count(1) == config.h2d_buffer_pool_depth);
+}
+
+// Frustum rollback also covers a landed look-ahead row nobody consumed, once
+// its staging lease runs out.
+void test_staging_lease_expiry() {
+  std::cout << "[M6] staging lease expiry rolls a landed row back" << std::endl;
+  GecConfig config = test_config();
+  config.layer_h2d_slots = 8;
+  config.staging_lease_us = 1500;
+  RollingPipeline pipeline(config, tp2());
+  const uint64_t base = 1000000;
+  PipelineHooks hooks;
+  hooks.now_us = [base]() { return base; };
+  hooks.h2d_latency_us = [](const LogicalExpertId&, int) { return 500; };
+  hooks.event_wait_us = [](const LogicalExpertId&, int) { return 200; };
+  pipeline.set_hooks(hooks);
+  LogicalExpertId staged{1, 5}, ahead{1, 7}, routed{1, 6};
+  // A layer before the lease test routes `staged`, so the look-ahead pass
+  // below finds it resident under an ordinary lease: the pass observes it (a
+  // read, not a consumption), leaves it alone, and the row is settled by this
+  // layer's release like any resident row.
+  pipeline.run_round({staged});
+  // The pass looks one layer ahead: `ahead` is the row it stages as a
+  // look-ahead copy, `staged` is the row it only observes.
+  pipeline.begin_round(true);
+  pipeline.run_round_current({ahead});
+  pipeline.release_round();
+  // The observed row is not a look-ahead reserve: nobody staged it for a
+  // successor layer, so the pass must not leave it under a staging lease.
+  CHECK(pipeline.cache().find(staged)->protected_ == false);
+  // The look-ahead copy is reserved for the next layer, which never routes
+  // it: once its lease runs out the boundary hands it back instead of waiting
+  // for a consumer that is not coming.
+  PipelineHooks later = hooks;
+  later.now_us = [base]() { return base + 5000; };  // lease long gone
+  pipeline.set_hooks(later);
+  CHECK(pipeline.cache().find(ahead)->protected_ == true);
+  pipeline.run_round({routed});
+  CHECK(pipeline.staging().frustum_dropped == 0);  // released unobserved, not routed
+  const LogicalExpert* row = pipeline.cache().find(ahead);
+  CHECK(row == nullptr || row->state != LifecycleState::Ready);
+  CHECK(pipeline.free_buffer_count(0) == config.h2d_buffer_pool_depth);
+}
+
+// Ring generations: a round whose own slot in the ring is still held by the
+// previous round takes another free generation instead of stalling, and a full
+// ring turns the residual row into CPU fallback rather than a stall.
+void test_ring_generations() {
+  std::cout << "[M6] ring generation hand-off and backpressure" << std::endl;
+  GecConfig config = test_config();
+  config.layer_h2d_slots = 8;
+  config.h2d_buffer_pool_depth = 2;
+  RollingPipeline pipeline(config, tp2());
+  LogicalExpertId a{0, 1}, b{0, 2};
+  auto first = pipeline.run_round({a, b});
+  CHECK(first.h2d_loaded.size() == 2);
+  CHECK(first.cpu_fallback.empty());
+  // The ring is released with the round: both rows share the round's
+  // generation and their consumers joined before run_round returned.
+  CHECK(pipeline.free_buffer_count(0) == 2);
+  CHECK(pipeline.free_buffer_count(1) == 2);
+
+  // A depth-1 ring cannot serve two in-flight rows of one round: the scheduler
+  // admits one and the residual row executes on CPU (backpressure, not a
+  // stall), and the ring slot comes back with the round.
+  GecConfig tight = config;
+  tight.h2d_buffer_pool_depth = 1;
+  RollingPipeline single(tight, tp2());
+  auto one = single.run_round({a, b});
+  CHECK(one.h2d_loaded.size() == 1);
+  CHECK(one.cpu_fallback.size() == 1);
+  CHECK(single.free_buffer_count(0) == 1);
+}
 
 int main() {
   test_config_validation();
@@ -844,9 +1054,14 @@ int main() {
   test_pipeline_requires_cache_admission();
   test_pipeline_no_duplicate_h2d();
   test_pipeline_budget();
-  test_pipeline_batches_fill_budget();
+  test_pipeline_admits_round_in_one_pass();
   test_pipeline_buffer_recycling();
   test_telemetry_decomposition();
+  test_async_prefetch_round();
+  test_staging_ready_at_boundary();
+  test_frustum_rollback();
+  test_staging_lease_expiry();
+  test_ring_generations();
   run_diagnostics_demo();
 
   std::cout << "==== GEC test summary: " << g_checks << " checks, " << g_failures

@@ -62,10 +62,12 @@ inline void bind_gec(pybind11::module_& m) {
       .def_readwrite("num_gpu_layers", &GecConfig::num_gpu_layers)
       .def_readwrite("expert_gpu_slots", &GecConfig::expert_gpu_slots)
       .def_readwrite("layer_h2d_slots", &GecConfig::layer_h2d_slots)
-      .def_readwrite("layer_h2d_batch_size", &GecConfig::layer_h2d_batch_size)
       .def_readwrite("h2d_buffer_pool_depth", &GecConfig::h2d_buffer_pool_depth)
       .def_readwrite("priority_alpha", &GecConfig::priority_alpha)
       .def_readwrite("probation_uses", &GecConfig::probation_uses)
+      .def_readwrite("staging_prefetch_layers",
+                     &GecConfig::staging_prefetch_layers)
+      .def_readwrite("staging_lease_us", &GecConfig::staging_lease_us)
       .def("validate", &GecConfig::validate)
       .def_static("shard_count", &GecConfig::shard_count,
                   py::arg("logical_experts"), py::arg("tp_size"));
@@ -93,8 +95,7 @@ inline void bind_gec(pybind11::module_& m) {
 
   py::class_<SchedulerDecision>(gec, "SchedulerDecision")
       .def_readonly("h2d_selected", &SchedulerDecision::h2d_selected)
-      .def_readonly("cpu_fallback", &SchedulerDecision::cpu_fallback)
-      .def("h2d_batches", &SchedulerDecision::h2d_batches, py::arg("batch_size"));
+      .def_readonly("cpu_fallback", &SchedulerDecision::cpu_fallback);
 
   py::class_<H2DScheduler>(gec, "H2DScheduler")
       .def(py::init<const GecConfig&>(), py::arg("config"))
@@ -198,11 +199,25 @@ inline void bind_gec(pybind11::module_& m) {
       .def_readonly("p90_us", &ReasonStats::p90_us)
       .def_readonly("p99_us", &ReasonStats::p99_us);
 
+  py::class_<StagingStats>(gec, "StagingStats")
+      .def(py::init<>())
+      .def_readonly("begin_rounds", &StagingStats::begin_rounds)
+      .def_readonly("prefetch_submits", &StagingStats::prefetch_submits)
+      .def_readonly("consumed_from_prefetch",
+                    &StagingStats::consumed_from_prefetch)
+      .def_readonly("stall_waits", &StagingStats::stall_waits)
+      .def_readonly("fallbacks", &StagingStats::fallbacks)
+      .def_readonly("direct_hits", &StagingStats::direct_hits)
+      .def_readonly("frustum_dropped", &StagingStats::frustum_dropped);
+
   py::class_<TelemetryCollector>(gec, "TelemetryCollector")
       .def(py::init<>())
       .def("record_wait", &TelemetryCollector::record_wait, py::arg("record"))
       .def("aggregate", &TelemetryCollector::aggregate)
       .def("wait_count", &TelemetryCollector::wait_count)
+      .def("staging", &TelemetryCollector::staging)
+      .def("record_staging", &TelemetryCollector::record_staging,
+           py::arg("delta"))
       .def("summary", &TelemetryCollector::summary);
 }
 

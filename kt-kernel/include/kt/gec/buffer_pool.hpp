@@ -3,11 +3,16 @@
 // Buffers are temporary transfer resources, never counted as persistent cache.
 // A buffer may only return to FREE after GPU kernel completion; H2D completion
 // alone is not enough.
+//
+// The pool is a two-generation ring (doc section 15.3, mirroring FreeToken's
+// `buffer_id = layer_id % 2` prefill staging): acquire() rotates the cursor so
+// consecutive rounds land on different generations, and free_count()/reuse
+// waits expose when the ring is out of depth and a round has to stall on the
+// previous generation's release.
 #pragma once
 
 #include <cstdint>
 #include <stdexcept>
-#include <string>
 #include <vector>
 
 #include "kt/gec/gec_sync.hpp"
@@ -40,6 +45,10 @@ struct H2DBuffer {
   LogicalExpertId logical_expert;
   int tp_rank = -1;
   BufferState state = BufferState::Free;
+  // Round that acquired the buffer.  `round % depth` is the generation, so
+  // back-to-back rounds never reuse a buffer the previous round still holds.
+  // Round 0 is not a generation (rounds start at 1).
+  uint64_t round = 0;
   uint64_t ready_dependency = 0;
   uint64_t owner_request = 0;
 };
@@ -61,19 +70,54 @@ class H2DBufferPool {
   int gpu_id() const { return gpu_id_; }
   int depth() const { return static_cast<int>(buffers_.size()); }
 
-  // FREE -> H2D. Returns nullptr when no buffer is free (backpressure).
-  H2DBuffer* acquire(const LogicalExpertId& expert, int tp_rank, uint64_t owner_request) {
+  // Round-to-buffer mapping that keeps consecutive rounds on separate
+  // generations (FreeToken `layer_id % 2` generalised to any depth).
+  int generation_of(uint64_t round) const {
+    return static_cast<int>(round % static_cast<uint64_t>(buffers_.size()));
+  }
+
+  // FREE -> H2D. Returns nullptr when the ring has no free generation
+  // (backpressure). When the round's own generation is busy but another is
+  // free, the pool takes the other one rather than stalling.
+  H2DBuffer* acquire(const LogicalExpertId& expert, int tp_rank,
+                     uint64_t owner_request, uint64_t round = 0) {
     GecLockGuard lock(mutex_);
-    for (H2DBuffer& buffer : buffers_) {
-      if (buffer.state != BufferState::Free) continue;
-      buffer.logical_expert = expert;
-      buffer.tp_rank = tp_rank;
-      buffer.owner_request = owner_request;
-      buffer.ready_dependency = 0;
-      buffer.state = BufferState::H2D;
-      return &buffer;
+    const int preferred = generation_of(round);
+    if (buffers_[static_cast<size_t>(preferred)].state == BufferState::Free) {
+      return occupy_(buffers_[static_cast<size_t>(preferred)], expert, tp_rank,
+                     owner_request, round);
+    }
+    const size_t depth = buffers_.size();
+    for (size_t i = 1; i < depth; ++i) {
+      H2DBuffer& candidate = buffers_[(static_cast<size_t>(preferred) + i) % depth];
+      if (candidate.state == BufferState::Free) {
+        return occupy_(candidate, expert, tp_rank, owner_request, round);
+      }
     }
     return nullptr;
+  }
+
+  // The ring slot this round writes to. Rounds start at 1, so the slot a round
+  // owns is the one acquired by `round - depth` (FreeToken: layer L and layer
+  // L - 2 share a buffer; L waits for L - 2, not for L - 1). nullptr when
+  // nothing acquired the slot.
+  const H2DBuffer* at_generation(uint64_t round) const {
+    GecLockGuard lock(mutex_);
+    if (round <= buffers_.size()) return nullptr;
+    const H2DBuffer& buffer =
+        buffers_[static_cast<size_t>(round % static_cast<uint64_t>(buffers_.size()))];
+    return buffer.round == round - buffers_.size() ? &buffer : nullptr;
+  }
+
+  // Number of buffers still held by rounds older than `round` (excluding the
+  // ones this round already acquired itself).
+  int held_by_older_generations(uint64_t round) const {
+    GecLockGuard lock(mutex_);
+    int held = 0;
+    for (const H2DBuffer& buffer : buffers_) {
+      if (buffer.state != BufferState::Free && buffer.round < round) ++held;
+    }
+    return held;
   }
 
   // H2D -> READY_FOR_COMPUTE. Records the device-local dependency produced by
@@ -151,6 +195,17 @@ class H2DBufferPool {
   }
 
  private:
+  static H2DBuffer* occupy_(H2DBuffer& buffer, const LogicalExpertId& expert,
+                            int tp_rank, uint64_t owner_request, uint64_t round) {
+    buffer.logical_expert = expert;
+    buffer.tp_rank = tp_rank;
+    buffer.owner_request = owner_request;
+    buffer.round = round;
+    buffer.ready_dependency = 0;
+    buffer.state = BufferState::H2D;
+    return &buffer;
+  }
+
   H2DBuffer& at_(int buffer_id) {
     if (buffer_id < 0 || buffer_id >= static_cast<int>(buffers_.size())) {
       throw std::invalid_argument("buffer_id out of range");
