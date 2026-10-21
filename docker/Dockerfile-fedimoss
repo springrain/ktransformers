@@ -74,6 +74,16 @@ ENV CARGO_HOME=/root/.cargo
 ENV PATH="/root/.cargo/bin:${PATH}"
 ENV CARGO_TARGET_DIR=/root/.cargo/target
 
+# crates.io 直连在国内网络下容易超时(例如 tch), 使用 rsproxy 稀疏索引并放宽重试/超时.
+# 如需内网镜像, 可通过 --build-arg CARGO_REGISTRY_MIRROR=... 覆盖.
+ARG CARGO_REGISTRY_MIRROR=sparse+https://rsproxy.cn/index/
+ENV CARGO_NET_RETRY=10 \
+    CARGO_HTTP_TIMEOUT=180 \
+    CARGO_HTTP_LOW_SPEED_LIMIT=1
+RUN mkdir -p $CARGO_HOME && \
+    printf '[source.crates-io]\nreplace-with = '\''kt-cargo-mirror'\''\n\n[source.kt-cargo-mirror]\nregistry = '\''%s'\''\n' \
+        $CARGO_REGISTRY_MIRROR > $CARGO_HOME/config.toml
+
 
 ### git clone https://github.com/springrain/ktransformers.git
 ### git submodule update --init --force --recursive
