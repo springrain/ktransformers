@@ -68,7 +68,7 @@ Rootless Docker 内使用映射到普通宿主用户的容器 UID 0；rootful Do
 
 - 准备不持有发布凭据的专用 runner 账号，添加 `kt-model-e2e` 标签；不要直接给旧发布 runner 加标签。
 - 配置 `qj5090-model-e2e` environment 的人工审批和 main 分支限制；工作流也只接受从 KT main 触发。
-- 准备公开、固定 digest 的 CUDA 12.8 / Python 3.12 测试基础镜像。现有生产服务镜像不能直接作为最终验收工具链。
+- 准备公开、固定 digest 的 CUDA 13.0 / Python 3.12 测试基础镜像。现有生产服务镜像不能直接作为最终验收工具链。
 - 确认 Docker 支持 CDI 且 `nvidia-ctk cdi list` 包含 `nvidia.com/gpu=all`；rootless 不使用会触发 legacy BPF/cgroup 权限错误的 `--gpus all` 路径。
 - 在镜像 `/opt/kt-e2e-tooling/` 中准备 `requirements.txt`（全部带哈希）、`wheels/` 和 `provenance.json`，固定公开 LlamaFactory 及辅助依赖的来源。
 - **训练工具不能重新安装或覆盖 KT 五包、上游同名命名空间或 Torch**。安装前 dry-run 校验，安装后 `pip check` 和导入文件哈希复核；不能靠忽略依赖错误或旧实验的私有源码覆盖来通过。

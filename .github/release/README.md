@@ -75,7 +75,7 @@ Kimi 的[实测配置参考](examples/kimi-k25/README.md)保留原样。它不�
 - `carriers.py` 消费本次六个 raw wheels，保留 runtime 文件、许可证和 SM90
   对象；仅生成 payload 清单/分片及 `WHEEL`、`RECORD`，不改 METADATA 依赖和
   版本。SGL native wheel 是中间输入，不作为第六个公开发行包上传。
-- CPython 3.12、Linux x86-64、CUDA 12.8、Torch 2.9.1；全部 KT CPU variants，
+- CPython 3.12、Linux x86-64、CUDA 13.0、Torch 2.14.1；全部 KT CPU variants，
   CUDA `80;86;89;90;120`。auditwheel 修复到 manylinux_2_35 后检查 KT CUDA
   扩展和 SGL common_ops 的 SASS。编译/静态检查不等于每种显卡实测。
 - 每个最终 wheel 必须小于 104 MB。超限、缺架构、ABI 不兼容直接失败；不删除
@@ -94,7 +94,7 @@ Kimi 的[实测配置参考](examples/kimi-k25/README.md)保留原样。它不�
    公开 SFT 工具 wheelhouse、三个只读模型快照和可用下载通道。见
    [模型验收 README](../model-e2e/README.md)。不能直接给带发布密钥的旧 runner
    添加社区验收标签。
-3. 原生构建 runner 使用 `[self-hosted,linux,x64,gpu,kt-cpu]`，需要 CUDA 12.8、
+3. 原生构建 runner 使用 `[self-hosted,linux,x64,gpu,kt-cpu]`，需要 CUDA 13.0、
    C++ 工具链、足够空间和 manylinux_2_35 兼容的系统库。环境过新导致 ABI 不
    兼容时应修复环境，不跳过 auditwheel。
 4. 配置 `KT_MODEL_E2E_ENABLED=true`、`KT_FOUR_MAIN_RELEASE_ENABLED=true`；

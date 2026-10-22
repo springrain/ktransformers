@@ -28,13 +28,13 @@ conda activate kt-vlm-lora
 
 pip install \
   --extra-index-url https://download.pytorch.org/whl/cu130 \
-  torch==2.13.0 \
-  torchvision==0.28.0 \
+  torch==2.14.1 \
+  torchvision==0.29.1 \
   torchaudio==2.11.0
 ```
 
-KT SFT pins torch 2.13.0. Keep torchvision and torchaudio on the matching
-0.28.0/2.11.0 releases.
+KT SFT pins torch 2.14.1. Keep torchvision and torchaudio on the matching
+0.29.0/2.11.0 releases.
 
 ### 3. Install LLaMA-Factory and KT
 

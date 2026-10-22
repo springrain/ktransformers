@@ -45,7 +45,7 @@ df -h /data
 
 ### 1.2 安装环境
 
-推荐使用干净的 Python 3.11 环境。先固定 PyTorch 2.13.0，再安装 LlamaFactory；KT 依赖必须最后安装，避免标准版 `transformers` 或 `accelerate` 覆盖 KT 定制版本：
+推荐使用干净的 Python 3.11 环境。先固定 PyTorch 2.14.1，再安装 LlamaFactory；KT 依赖必须最后安装，避免标准版 `transformers` 或 `accelerate` 覆盖 KT 定制版本：
 
 ```bash
 conda create -n kt-sft python=3.11 -y
@@ -54,7 +54,7 @@ conda activate kt-sft
 git clone --depth 1 https://github.com/hiyouga/LlamaFactory.git
 cd LlamaFactory
 
-python -m pip install torch==2.13.0 torchaudio==2.11.0 torchvision==0.28.0
+python -m pip install torch==2.14.1 torchaudio==2.11.0 torchvision==0.29.1
 python -m pip install -e .
 python -m pip install "ktransformers[sft]==0.7.0"
 python -m pip install "sglang-kt==0.7.0"
@@ -95,7 +95,7 @@ PY
 
 ```text
 No broken requirements found.
-torch          2.13.0
+torch          2.14.1
 transformers   5.6.0
 accelerate     1.14.0
 kt_kernel      0.7.0

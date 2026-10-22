@@ -45,7 +45,7 @@ Confirm two requirements:
 
 ### 1.2 Install the environment
 
-Use a clean Python 3.11 environment. Pin PyTorch 2.13.0 before installing LlamaFactory, and install the KT dependencies last so standard `transformers` or `accelerate` packages do not overwrite the KT variants:
+Use a clean Python 3.11 environment. Pin PyTorch 2.14.1 before installing LlamaFactory, and install the KT dependencies last so standard `transformers` or `accelerate` packages do not overwrite the KT variants:
 
 ```bash
 conda create -n kt-sft python=3.11 -y
@@ -54,7 +54,7 @@ conda activate kt-sft
 git clone --depth 1 https://github.com/hiyouga/LlamaFactory.git
 cd LlamaFactory
 
-python -m pip install torch==2.13.0 torchaudio==2.11.0 torchvision==0.28.0
+python -m pip install torch==2.14.1 torchaudio==2.11.0 torchvision==0.29.1
 python -m pip install -e .
 python -m pip install "ktransformers[sft]==0.7.0"
 python -m pip install "sglang-kt==0.7.0"
@@ -95,7 +95,7 @@ The compatible environment should include these versions:
 
 ```text
 No broken requirements found.
-torch          2.13.0
+torch          2.14.1
 transformers   5.6.0
 accelerate     1.14.0
 kt_kernel      0.7.0

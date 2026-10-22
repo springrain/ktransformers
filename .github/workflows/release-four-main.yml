@@ -81,7 +81,7 @@ jobs:
     env:
       # Initial scope matches the proven CPython 3.12 release. Expand the
       # Python matrix only after each ABI gets its own installation/E2E gate.
-      CUDA_HOME: ${{ vars.KT_RELEASE_CUDA_HOME || '/usr/local/cuda-12.8' }}
+      CUDA_HOME: ${{ vars.KT_RELEASE_CUDA_HOME || '/usr/local/cuda-13.0' }}
       CMAKE_BUILD_PARALLEL_LEVEL: '4'
       MAX_JOBS: '4'
       PIP_DISABLE_PIP_VERSION_CHECK: '1'
@@ -144,14 +144,14 @@ jobs:
             setuptools==80.9.0 wheel==0.45.1 \
             scikit-build-core==0.11.6 cmake==3.31.6 pybind11==2.13.6 \
             ninja==1.11.1.4 twine==6.1.0 auditwheel==6.4.2 patchelf==0.17.2.4
-          python -m pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128
+          python -m pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
           python -m pip freeze --all > "$RELEASE_WORK/evidence/build-environment.txt"
           nvcc --version > "$RELEASE_WORK/evidence/nvcc.txt"
           gcc --version > "$RELEASE_WORK/evidence/gcc.txt"
           python -c 'import torch; print(torch.__version__, torch.version.cuda)' \
             > "$RELEASE_WORK/evidence/torch.txt"
-          python -c 'import torch; assert torch.version.cuda == "12.8", torch.version.cuda'
-          nvcc --version | grep -q 'release 12.8,'
+          python -c 'import torch; assert torch.version.cuda == "13.0", torch.version.cuda'
+          nvcc --version | grep -q 'release 13.0,'
       - name: Checkout the locked main commits
         run: |
           python ci-tools/.github/release/four_main.py checkout \

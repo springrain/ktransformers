@@ -22,8 +22,8 @@ requires-python = ">=3.11"
 dependencies = [
   # Core dependencies
   # Keep the KT and SGLang-KT stacks on one torch ABI.
-  "torch==2.13.0",
-  "torchvision==0.28.0",
+  "torch==2.14.1",
+  "torchvision==0.29.1",
   "torchaudio==2.11.0",
   "safetensors>=0.4.0",
   "numpy>=1.24.0",

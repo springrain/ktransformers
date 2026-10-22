@@ -16,12 +16,12 @@ MXFP4 and are computed by KT-Kernel's `LLAMAFILE` MoE. Follow the steps in order
 | CANN toolkit | 9.0.0 |
 | Driver | 25.5.1 |
 | Python | 3.11 |
-| torch / torch_npu | `torch==2.13.0` with a matching `torch_npu` build; validate against the selected CANN image |
+| torch / torch_npu | `torch==2.14.1` with a matching `torch_npu` build; validate against the selected CANN image |
 | GCC at `/usr/bin/gcc` | ≥ 11 |
 | System packages | `libhwloc-dev`, `libnuma-dev`, `pkg-config`, `cmake`, `patchelf` |
 
 KT-Kernel's own extension links no libtorch symbols, and Step 5 installs its wheel with
-`--no-deps`. The project stack is pinned to `torch==2.13.0`; the CANN image must provide a
+`--no-deps`. This Ascend NPU deployment path stays on `torch==2.14.1`; the CANN image must provide a
 `torch_npu` build for that exact Torch version.
 
 Disk: about 570 GB for the three weight artifacts.

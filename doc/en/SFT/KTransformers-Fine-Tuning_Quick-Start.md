@@ -10,7 +10,7 @@ This Quick Start is for LLaMA-Factory users who want to run KTransformers-backed
 - Training entry: LLaMA-Factory `src/train.py` and YAML configs
 - KT package entry: `ktransformers[sft]`
 - Example models: Qwen3 MoE / Qwen3.5 MoE
-- Recommended baseline: Python 3.11 and `torch==2.13.0`
+- Recommended baseline: Python 3.11 and `torch==2.14.1`
 
 KT inference uses a separate SGLang-KT package path. See [KT Inference Packages](#7-kt-inference-packages).
 
@@ -28,13 +28,13 @@ Install the PyTorch baseline:
 ```bash
 pip install \
   --extra-index-url https://download.pytorch.org/whl/cu130 \
-  torch==2.13.0 \
-  torchvision==0.28.0 \
+  torch==2.14.1 \
+  torchvision==0.29.1 \
   torchaudio==2.11.0
 ```
 
-If you already have a working `torch==2.13.0` environment, you can reuse it. Keep
-`torchvision==0.28.0` and `torchaudio==2.11.0` from the same release family.
+If you already have a working `torch==2.14.1` environment, you can reuse it. Keep
+`torchvision==0.29.1` and `torchaudio==2.11.0` from the same release family.
 
 ## 3. Install LLaMA-Factory and KT SFT
 
@@ -101,7 +101,7 @@ PY
 
 Expected values should be close to:
 
-- `torch = 2.13.0` with the CUDA build matching your runtime
+- `torch = 2.14.1` with the CUDA build matching your runtime
 - `transformers = 5.6.0`
 - `accelerate = 1.14.0`
 - `kt_kernel = 0.6.1`
