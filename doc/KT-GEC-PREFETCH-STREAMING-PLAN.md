@@ -12,7 +12,7 @@
 
 1. compact staging bank、uniform/shared-first resident 初始化、forward/chunk 边界更新已完成。
 2. resident/staging 统一 `StagingRowPool`、row-pool metadata-only promotion(decode 行另有 D2D 镜像)、bank 覆盖后的 pending 提交已完成。
-3. prepared-only 布局、模型级 raw H2D scratch、CPU canonical，以及 FreeToken 风格 fused D2D / `cudaMemcpyBatchAsync` 已完成；后者保留一次性能力探测和原有逐 expert/逐 run 回退。
+3. prepared-only 布局、模型级 raw H2D scratch、仅保留 shape/dtype 元数据（raw 字节只保留在 KT 原生 CPU 专家库），以及 FreeToken 风格 fused D2D / `cudaMemcpyBatchAsync` 已完成；后者保留一次性能力探测和原有逐 expert/逐 run 回退。
 
 ## 1. 目标与约束
 
@@ -129,10 +129,10 @@ threshold 即可启用（命令行校验接受这两种来源之一）。residen
 
 当前代码中的 staging pool 是一个模型级双 bank 管理器,不是每层、每请求各一套。
 
-- staging 选中后,每个 bank 的 GPU prepared pool 按 compact 几何 `R_max + S` 分配,raw 只保留 `S` 行 H2D scratch(prepared-only 默认；`SGLANG_KT_MXFP4_PREPARED_ONLY=0` 的 legacy 回退为 `R_max + S` 行 raw)。`R_max` 是所有 MoE 层中最大的生效 resident 数,`S` 是 `--kt-layer-h2d-slots` 窗口(夹到 N)。默认两个 bank 合计 `2 * (R_max + S)` 行 prepared + `2 * S` 行 raw scratch,不再是每 bank 一份 `R_max + S` 的 raw+prepared 双份。
-- prepared-only slot 布局默认随 `--kt-layer-h2d-slots > 0` 启用；对 `num_gpu_experts > 0` 且走 Marlin 后处理的层,checkpoint-native raw 张量会在 prepared 构建后尝试移到 CPU（迁移成功时才只保留 kernel-ready prepared 行；未执行时 raw 仍可能留在 GPU，逐层迁移异常则向上传播，见 §11.1）。诊断时可用 `SGLANG_KT_MXFP4_PREPARED_ONLY=0` 回退旧的 raw+prepared 双 bank 布局。
+- staging 选中后,每个 bank 的 GPU prepared pool 按 compact 几何 `R_max + S` 分配,raw 只保留 `S` 行 H2D scratch。`R_max` 是所有 MoE 层中最大的生效 resident 数,`S` 是 `--kt-layer-h2d-slots` 窗口(夹到 N)。两个 bank 合计 `2 * (R_max + S)` 行 prepared + `2 * S` 行 raw scratch,不再是每 bank 一份 `R_max + S` 的 raw+prepared 双份。
+- prepared-only slot 布局在 `--kt-expert-gpu-slots > 0` 或 `--kt-layer-h2d-slots > 0` 时启用；对 `num_gpu_experts > 0` 且走 Marlin 后处理的层,checkpoint-native raw 张量会在 prepared 构建后直接释放,不执行 D2H,只保留 shape/dtype 元数据,因此 GPU 上只留 kernel-ready prepared 行。`num_gpu_experts == 0` 的层没有 prepared image,不进入该释放分支。
 - 启动时 GEC 全局 resident 预算均匀分布到每个 MoE 层,余数放在前若干层；fused shared experts 处于 trailing logical ids,并在每层 resident 选择中优先保留。这样每层都有 resident floor,同时不会把预算集中到前几层。
-- 对 `num_gpu_experts > 0` 的 prepared-only 层,完整 N 行 raw canonical 在 Marlin 后处理后会尝试移到 CPU,作为 resident D2D/GEC/fallback 的权威字节源；只有迁移成功时才以 CPU 为权威副本。`num_gpu_experts == 0` 不进入该后处理分支,raw canonical 仍留在 GPU（该层没有 resident raw 行可复用）；迁移未执行时不能假定 raw 已离开 GPU，逐层迁移异常会向上传播（见 §11.1）。compact canonical 保持 resident row 顺序,并按 victim row 原地刷新。bank H2D 使用每个 bank 自己的 raw scratch；GEC/resident selected-row 更新使用 shared context shadow layer 上缓存的 raw scratch,不会为每个 decoder 层复制一份。
+- 对 `num_gpu_experts > 0` 的 prepared-only 层,Marlin 后处理完成后直接删除 `w13_weight` / `w13_weight_scale_inv` / `w2_weight` / `w2_weight_scale_inv` 四个 GPU 参数,不执行 D2H,也不保留 `_kt_mxfp4_raw_weights` 这份 Python CPU canonical；`_kt_mxfp4_raw_spec` 只记录 shape/dtype。raw 字节的唯一权威副本是启动时已加载的 KT 原生 CPU 专家库。`num_gpu_experts == 0` 的层没有 resident prepared 行,不进入该后处理分支；释放异常会向上传播（见 §11.1）。prepared pool 的 resident row 顺序保持不变,并按 victim row 原地刷新。bank H2D 使用每个 bank 自己的 raw scratch；GEC/resident selected-row 更新使用 shared context shadow layer 上缓存的 raw scratch,不会为每个 decoder 层复制一份。
 - 每个 bank 用 `StagingRowPool` 统一管理 resident/staging 物理 row。同一 `(layer, expert)` 只占一行,resident 与 staging 只是 row role；promotion 时 promoted row 原地升级为 resident,victim row 置为 free 并清空 mapping,不会把 victim 转成 staging。
 - 每次预取只把 `top-S` 个非 resident 专家写入 compact 物理行。当前层 GPU 计算集合仍是 `resident(L) + top-S staged(L)`,未覆盖专家走 CPU fallback。
 - 所有并发请求共享同一对 bank；bank 按 `layer_position % 2` 固定轮换。同一层跨 forward 仍使用同一 bank,但 bank 被其他层覆盖后 `_load_slot` 会调用 `pool.clear()`,per-layer mapping 不跨覆盖保留；此时 promotion 走 pending 路径。
@@ -192,18 +192,18 @@ cpu_experts(L)
 
 2. resident pool
    --kt-expert-gpu-slots 1024
-   每层 resident 的 kernel-ready prepared 行；raw canonical 默认在 CPU（有 resident GPU 行且 prepared-only 移动成功时）
+   每层 resident 的 kernel-ready prepared 行；raw 字节在 KT 原生 CPU 专家库,GPU 不保留 raw 参数
 
 3. staging pool
    2 个 bank
    每个 bank 分配 R_max + S 行 prepared pool
-   每个 bank 分配 S 行 raw H2D scratch(prepared-only；legacy 回退为 R_max+S 行)
-   默认不再保留 resident raw bank 或完整 N 行 GPU raw canonical；num_gpu_experts==0、迁移未执行或 full-context 迁移失败时仍可能保留（见 3.3.1）
+   每个 bank 分配 S 行 raw H2D scratch
+   默认不再保留 resident raw bank 或完整 N 行 GPU raw canonical；num_gpu_experts==0 的层没有 prepared image,不适用该释放路径（见 3.3.1）
    不进入 resident 逻辑容量
 
 4. temporary repack / scratch
    shared context raw scratch（GEC/resident selected-row 更新复用一份，按 min(窗口, resident 批量) 限宽）
-   首次初始化时临时 full-context raw N 行；bank 建好后尝试移到 CPU（失败时保留在 GPU）
+   首次初始化时临时 full-context raw N 行；bank 建好后直接释放（无 D2H；失败时保留在 GPU）
    MXFP4 postprocess 直接写入 prepared pool，不再分配 prepared scratch bank
 ```
 
@@ -218,7 +218,7 @@ L10–L39（30 层 MoE）：
     均匀分布后每层 34 或 35 个 resident,R_max = 35
     staging bank A = 35 + 128 = 163 行 prepared + 128 行 raw scratch
     staging bank B = 35 + 128 = 163 行 prepared + 128 行 raw scratch
-    CPU raw canonical = 384 行（prepared-only 移动成功时；不占 GPU）
+    CPU raw 数据 = 384 行（KT 原生专家库；不占 GPU,也不是额外 Python canonical）
     逻辑 staging 窗口 S = 128
 ```
 
@@ -226,7 +226,7 @@ L10–L39（30 层 MoE）：
 `_mxfp4_raw_slot_storage_nbytes()` 用模型实际的 hidden/intermediate 计算：
 两个 bank 的 prepared pool 随 `2 * (R_max + S)` 缩放,raw scratch 随 `2 * S`
 缩放；resident pool 的 1024 个 logical slot 按同一 per-expert prepared 大小
-另算。首次初始化还会临时分配 full-context raw N 行,bank 建好后尝试移到 CPU（失败时保留在 GPU）。
+另算。首次初始化还会临时分配 full-context raw N 行,bank 建好后直接释放（无 D2H；失败时保留在 GPU）,所以启动峰值仍包含这份临时 raw。
 旧稿的 2500-slot / 21.9 GiB 是另一组逻辑容量,已废弃；具体字节以启动日志
 `Reserving ... of the KV budget for lazy KT MXFP4 layerwise prefill slots` 为准。
 
@@ -326,7 +326,7 @@ bank = layer_position % 2
 
 ```text
 GPU prepared pool（R_max + S 行）
-GPU raw H2D scratch（S 行；legacy 回退为 R_max + S 行）
+GPU raw H2D scratch（S 行）
 raw_ready_event
 ready_event
 consumed_event
@@ -334,8 +334,8 @@ consumed_event
 
 当前物理布局：
 
-- 两个 bank 都按 `R_max + S` 行 prepared pool 分配；prepared-only 默认每个 bank 另配 `S` 行 raw H2D scratch,`SGLANG_KT_MXFP4_PREPARED_ONLY=0` 的 legacy 回退为 `R_max + S` 行。bank 按 `layer_position % 2` 轮换。
-- GPU 不再保留 resident raw bank；有 resident GPU 行的 prepared-only 层在移动成功后也不再保留完整 N 行 raw canonical（raw canonical 在 CPU，GPU raw 只作为一次性 H2D scratch）。`num_gpu_experts == 0` 或迁移未执行时 raw canonical 仍可能留在 GPU；逐层迁移异常没有本地 catch，会向上传播（见 §11.1）。
+- 两个 bank 都按 `R_max + S` 行 prepared pool 分配；每个 bank 另配 `S` 行 raw H2D scratch。bank 按 `layer_position % 2` 轮换。
+- GPU 不再保留 resident raw bank；有 resident GPU 行的 prepared-only 层在 Marlin 后处理后直接释放完整 N 行 raw 参数,不再复制到 CPU,也不保留 Python canonical。GPU raw 只作为一次性 H2D scratch；raw 字节由 KT 原生 CPU 专家库提供。`num_gpu_experts == 0` 的层没有 prepared image,不适用该释放路径；逐层释放异常没有本地 catch，会向上传播（见 §11.1）。
 - `StagingRowPool` 把 resident 和 staging 放进同一个物理 row 池。每个 row 只有一个 owner,role 为 `resident`、`staging` 或 `free`；promoted row 保留原 row 升级为 resident,victim row 变 free。`_load_slot` 在 bank 换层时调用 `pool.clear()`,per-layer mapping 不跨 bank 覆盖保留。
 - 当前层只计算 `resident(L) + top-S staged(L)`,其余 compact 行会被 mask。
 - 所有并发请求共享同一对 bank,不是每请求一套。
@@ -343,7 +343,7 @@ consumed_event
 代码入口：
 
 - `_Mxfp4LayerwisePrefillManager` 持有 `slots[0]` 和 `slots[1]` 两个 bank；`_acquire` 按 `layer_position % 2` 固定 bank,`_prefetch_successor` 预取下一层所在的另一 bank,`_advance_round` 在轮次回绕时推进 epoch 并失效旧 bank。
-- `_allocate_mxfp4_slot_storage` 为 bank 分配 `R_max + S` 行 prepared pool；raw 行数在 prepared-only 下是 `S`,在 legacy 回退下是 `R_max + S`。首次初始化临时 full-context raw 在 manager 建立后尝试移到 CPU（失败时保留在 GPU）。
+- `_allocate_mxfp4_slot_storage` 为 bank 分配 `R_max + S` 行 prepared pool；raw 行数是 `S`。首次初始化临时 full-context raw 在 manager 建立后直接释放（无 D2H；失败时保留在 GPU）。
 - `kt_prefill_staging.StagingRowPool` 维护 per-layer owner/role/mapping；`_load_slot` 通过 `configure` 建立 mapping,promotion 通过 `promote` 原地改变角色；bank 换层时 mapping 会被清空。
 - `kt_prefill_staging.effective_experts` 生成 `resident + staged` 的 effective 集合,写入 `slot.effective_ids` 和 `slot.partial`。
 - host slot 来自模型级共享 ring(第 7.5 节),不是每 bank 一个；每个 host slot 有自己的 `host_free_event`。
@@ -725,12 +725,12 @@ host_pinned_bytes =
     2 * S * per_expert_raw_bytes
 ```
 
-上述 `2 * S` raw 行是默认 prepared-only 布局；`SGLANG_KT_MXFP4_PREPARED_ONLY=0` 的 legacy 回退把每个 bank 的 raw 行数改为 `R_max + S`。
+上述 `2 * S` raw 行是 prepared-only 的固定布局：每个 bank 的 raw H2D scratch 为 `S` 行。
 
 其中：
 
-- `full_context_raw_n_temporary` 只在首次初始化 manager 时存在：它提供兼容的 slot/CPU ring 形状，bank 建好后尝试移到 CPU；该调用有本地 `try/except`，移动失败时只记 warning 并继续留在 GPU，不能把 steady-state 不占 GPU 当作绝对保证。逐层 `process_weights_after_loading` 的迁移没有本地 catch：`_v4_marlin_weights` 不存在时返回 0、raw 留在 GPU；真正迁移异常会向上传播。
-- `R_max` 是均匀分布后所有 MoE 层中的最大 resident 数,`S` 是夹到 N 的 staging 窗口。两个 bank 都按 `R_max + S` 行 prepared 分配；raw 行数在 prepared-only 下是 `S`,在 legacy 回退下是 `R_max + S`。
+- `full_context_raw_n_temporary` 只在首次初始化 manager 时存在：它提供兼容的 slot/CPU ring 形状，bank 建好后直接释放（无 D2H）。该调用有本地 `try/except`，释放失败时只记 warning 并继续留在 GPU，不能把 steady-state 不占 GPU 当作绝对保证；启动峰值仍包含这份临时 raw。逐层 `process_weights_after_loading` 的释放没有本地 catch：`_v4_marlin_weights` 不存在时返回 0、raw 留在 GPU；真正异常会向上传播。
+- `R_max` 是均匀分布后所有 MoE 层中的最大 resident 数,`S` 是夹到 N 的 staging 窗口。两个 bank 都按 `R_max + S` 行 prepared 分配；raw 行数是 `S`。
 - `raw_scratch_shared` 是 GEC/resident selected-row CPU→GPU 更新复用的 shared context raw scratch，按 `min(S, resident 批量)` 限宽；调用路径分别传 `src_layer` 或 `self.gpu_layer`,具体 owner 取决于路径,但不会按 decoder 层数复制。
 - `num_experts_per_layer` 是每层专家数(本文示例 256；第 16.2 节基线实测的 DeepSeek-V4.1-Flash 为 384,见 `[kt-mask] num_experts=384`),用于计算 `full_canonical_raw_n` 与 per-expert 字节数。
 - `host_pinned_bytes = 2 * S * per_expert_raw_bytes`(每 rank),`S` 就是 `--kt-layer-h2d-slots`(第 7.5 节)。它**同时是功能开关**:`S` 未设置时整个 layerwise staging 关闭,ring 深度退回 2 槽对,pinned 占用与历史默认路径完全一致。
@@ -1223,7 +1223,7 @@ ready_wait_ms         约 7.5
 
 交付：
 
-- 双 bank 资源,每 bank `R_max + S` 行 prepared + `S` 行 raw H2D scratch(prepared-only 默认；legacy 回退为 `R_max + S` 行 raw；host 侧为 `2 * S` 两代滚动 ring,S 即窗口,第 7.5 节)。
+- 双 bank 资源,每 bank `R_max + S` 行 prepared + `S` 行 raw H2D scratch(host 侧为 `2 * S` 两代滚动 ring,S 即窗口,第 7.5 节)。
 - 统一 `StagingRowPool`,resident/staging row role 可原地切换。
 - bank 状态机。
 - ready、raw_ready、consumed、host_free 事件。
@@ -1539,5 +1539,5 @@ L10–L39（30 层 MoE,实测配置）：
 
 一句话总结：
 
-> 双缓冲 prepared-only staging 负责跨层搬运,resident pool 负责长期常驻；L 层 attention 后发起 L+1 预取,L+1 使用自己的历史命中表；staging 不占 resident 逻辑容量。每个 bank 为 `R_max + S` 行 prepared + `S` 行 raw H2D scratch；prepared-only 且 `num_gpu_experts > 0` 的层 raw canonical 留在 CPU（迁移未执行或 `num_gpu_experts == 0` 时仍可能占 GPU）,resident/staging 共用统一 row pool,promotion 只在 forward/chunk 边界更新,并在同 bank 内把 promoted row D2D 镜像到原层 decode 行、把 victim row 释放为 free。resident D2D 与 staging H2D 均按 FreeToken 风格批量提交,不可用时自动回退到原逐行/逐 run 路径。TP=2 时两个 rank 使用同一 logical 布局,各自只持有自己的 TP 权重分片。
+> 双缓冲 prepared-only staging 负责跨层搬运,resident pool 负责长期常驻；L 层 attention 后发起 L+1 预取,L+1 使用自己的历史命中表；staging 不占 resident 逻辑容量。每个 bank 为 `R_max + S` 行 prepared + `S` 行 raw H2D scratch；prepared-only 且 `num_gpu_experts > 0` 的层在 Marlin 后处理后直接释放 raw 参数,不执行 D2H,raw 字节只保留在 KT 原生 CPU 专家库（`num_gpu_experts == 0` 的层没有 prepared image,不适用该路径）,resident/staging 共用统一 row pool,promotion 只在 forward/chunk 边界更新,并在同 bank 内把 promoted row D2D 镜像到原层 decode 行、把 victim row 释放为 free。resident D2D 与 staging H2D 均按 FreeToken 风格批量提交,不可用时自动回退到原逐行/逐 run 路径。TP=2 时两个 rank 使用同一 logical 布局,各自只持有自己的 TP 权重分片。
 
