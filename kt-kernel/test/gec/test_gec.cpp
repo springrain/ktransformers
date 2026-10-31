@@ -47,7 +47,7 @@ GecConfig test_config() {
   GecConfig config;
   config.num_gpu_layers = 0;
   config.expert_gpu_slots = 4;
-  config.layer_h2d_slots = 4;
+  config.h2d_round_budget = 4;
   config.h2d_buffer_pool_depth = 2;
   config.priority_alpha = 1.0;
   config.probation_uses = 1;
@@ -76,7 +76,7 @@ void test_config_validation() {
 
   CHECK(throws([&] { GecConfig bad = test_config(); bad.num_gpu_layers = -1; bad.validate(); }));
   CHECK(throws([&] { GecConfig bad = test_config(); bad.expert_gpu_slots = -1; bad.validate(); }));
-  CHECK(throws([&] { GecConfig bad = test_config(); bad.layer_h2d_slots = -1; bad.validate(); }));
+  CHECK(throws([&] { GecConfig bad = test_config(); bad.h2d_round_budget = -1; bad.validate(); }));
   CHECK(throws([&] { GecConfig bad = test_config(); bad.h2d_buffer_pool_depth = 0; bad.validate(); }));
   CHECK(throws([&] { GecConfig bad = test_config(); bad.priority_alpha = -0.1; bad.validate(); }));
   CHECK(throws([&] { GecConfig bad = test_config(); bad.probation_uses = -1; bad.validate(); }));
@@ -353,8 +353,8 @@ void test_buffer_lifecycle() {
 
 // ---------------- M4: cache policy ----------------
 
-void test_cache_eviction_lru() {
-  std::cout << "[M4] LRU eviction + whole-expert granularity" << std::endl;
+void test_cache_eviction_lfu() {
+  std::cout << "[M4] LFU eviction + whole-expert granularity" << std::endl;
   GecConfig config = test_config();
   config.expert_gpu_slots = 2;
   config.probation_uses = 1;
@@ -364,7 +364,7 @@ void test_cache_eviction_lru() {
   CHECK(cache.admit(b, 2));
   load_ready(cache, a, 3);
   load_ready(cache, b, 4);
-  // Touch a so b becomes the LRU victim.
+  // Add frequency to a so b becomes the LFU victim.
   CHECK(cache.lookup(a, 10) == GlobalExpertCache::LookupResult::Hit);
   cache.record_use(a, 10);
 
@@ -378,7 +378,7 @@ void test_cache_eviction_lru() {
   // Evicted expert misses; re-admission works.
   CHECK(cache.lookup(b, 12) == GlobalExpertCache::LookupResult::Miss);
   load_ready(cache, c, 12);
-  CHECK(cache.admit(b, 13));  // evicts a (LRU now)
+  CHECK(cache.admit(b, 13));  // evicts a (lower LFU count now)
   CHECK(cache.stats().evictions == 2);
 
   // Re-H2D tracking: b was admitted before, so a new H2D counts.
@@ -386,6 +386,197 @@ void test_cache_eviction_lru() {
   CHECK(cache.stats().reh2d == 1);
   cache.record_h2d(c);
   CHECK(cache.stats().reh2d == 2);
+}
+
+void test_lfu_prefers_frequency_over_recency() {
+  std::cout << "[M4] global LFU outranks recency" << std::endl;
+  GecConfig config = test_config();
+  config.expert_gpu_slots = 2;
+  config.probation_uses = 1;
+  GlobalExpertCache cache(config, tp2());
+  LogicalExpertId hot{1, 0}, recent{1, 1}, newcomer{1, 2};
+  CHECK(cache.admit(hot, 1));
+  CHECK(cache.admit(recent, 2));
+  load_ready(cache, hot, 3);
+  load_ready(cache, recent, 4);
+
+  // `hot` is older but receives much more effective router demand. `recent`
+  // is touched later, so an LRU policy would evict `hot`; LFU must evict
+  // `recent` instead.
+  cache.record_router_demand(hot, 64, 10);
+  CHECK(cache.lookup(recent, 100) == GlobalExpertCache::LookupResult::Hit);
+  CHECK(cache.admit(newcomer, 200));
+  CHECK(cache.find(hot)->state == LifecycleState::Ready);
+  CHECK(cache.find(recent)->state == LifecycleState::Absent);
+  CHECK(cache.snapshot(hot)->lfu_count == 65);
+  CHECK(cache.snapshot(recent)->lfu_count == 1);
+}
+
+void test_cpu_fallback_heat_survives_admission() {
+  std::cout << "[M4] CPU-fallback demand survives eviction" << std::endl;
+  GecConfig config = test_config();
+  config.expert_gpu_slots = 1;
+  config.probation_uses = 1;
+  GlobalExpertCache cache(config, tp2());
+  LogicalExpertId resident{2, 0}, cpu_hot{2, 7};
+
+  cache.record_router_demand(cpu_hot, 32, 1);
+  CHECK(cache.snapshot(cpu_hot)->state == LifecycleState::Absent);
+  CHECK(cache.snapshot(cpu_hot)->lfu_count == 32);
+  CHECK(cache.admit(resident, 2));
+  load_ready(cache, resident, 3);
+  CHECK(cache.admit(cpu_hot, 4));
+  CHECK(cache.find(resident)->state == LifecycleState::Absent);
+  CHECK(cache.find(cpu_hot)->state == LifecycleState::Scheduled);
+  CHECK(cache.snapshot(cpu_hot)->lfu_count == 32);
+}
+
+void test_lookup_prefetch_do_not_inflate_lfu() {
+  std::cout << "[M4] lookup/H2D/staging do not inflate LFU" << std::endl;
+  GecConfig config = test_config();
+  GlobalExpertCache cache(config, tp2());
+  LogicalExpertId id{3, 6};
+  CHECK(cache.admit(id, 1));
+  load_ready(cache, id, 2);
+  const uint64_t baseline = cache.snapshot(id)->lfu_count;
+  for (int k = 0; k < 8; ++k) {
+    CHECK(cache.lookup(id, 10 + k) == GlobalExpertCache::LookupResult::Hit);
+  }
+  cache.record_h2d(id);
+  cache.touch(id, 20);
+  CHECK(cache.snapshot(id)->lfu_count == baseline);
+  CHECK(cache.stats().lfu_events == baseline);
+}
+
+void test_pinned_and_lfu_aging() {
+  std::cout << "[M4] pinned experts + event-driven LFU aging" << std::endl;
+  GecConfig config = test_config();
+  config.expert_gpu_slots = 1;
+  config.probation_uses = 1;
+  config.lfu_aging_interval = 100;
+  GlobalExpertCache cache(config, tp2());
+  LogicalExpertId shared{1, 0}, routed{1, 1}, other{1, 2};
+  CHECK(cache.admit(shared, 1));
+  load_ready(cache, shared, 2);
+  CHECK(cache.set_pinned(shared, true));
+  CHECK(!cache.admit(routed, 3));  // no eviction candidate
+  CHECK(cache.set_pinned(shared, false));
+  CHECK(cache.admit(routed, 4));
+  load_ready(cache, routed, 5);
+
+  cache.record_router_demand(shared, 60, 6);
+  cache.record_router_demand(other, 80, 7);  // crosses 100 events -> halve
+  CHECK(cache.stats().lfu_aging_sweeps == 1);
+  CHECK(cache.snapshot(shared)->lfu_count == 30);
+  CHECK(cache.snapshot(other)->lfu_count == 40);
+}
+
+void test_pinned_row_survives_staging_expiry() {
+  std::cout << "[M4] pinned rows bypass staging-lease expiry" << std::endl;
+  GecConfig config = test_config();
+  config.expert_gpu_slots = 2;
+  config.staging_lease_us = 1;
+  GlobalExpertCache cache(config, tp2());
+  LogicalExpertId shared{1, 0}, staged{1, 1};
+  CHECK(cache.admit(shared, 0));
+  CHECK(cache.set_pinned(shared, true));
+  CHECK(cache.admit(staged, 1));
+  CHECK(cache.expire_stages(100) == 1);
+  CHECK(cache.find(shared)->state == LifecycleState::Scheduled);
+  CHECK(cache.snapshot(shared)->pinned);
+  CHECK(cache.find(staged)->state == LifecycleState::Evicting);
+}
+
+void test_current_router_round_protects_hits() {
+  std::cout << "[M4] current-round routed residents are not admission victims"
+            << std::endl;
+  GecConfig config = test_config();
+  config.expert_gpu_slots = 2;
+  config.probation_uses = 1;
+  GlobalExpertCache cache(config, tp2());
+  LogicalExpertId routed_now{1, 0}, older_hot{1, 1}, newcomer{1, 2},
+      other_newcomer{1, 3};
+  CHECK(cache.admit(routed_now, 1));
+  CHECK(cache.admit(older_hot, 2));
+  load_ready(cache, routed_now, 3);
+  load_ready(cache, older_hot, 4);
+  // The older row is hotter by LFU, so a normal LFU admission would evict the
+  // low-count row routed in this round. Round protection must pick the other
+  // resident instead: the current batch still needs this row on GPU.
+  cache.record_use(older_hot, 5, 100);
+  CHECK(cache.begin_router_round() == 1);
+  cache.record_router_demand(routed_now, 1, 6);
+  CHECK(cache.admit(newcomer, 7));
+  CHECK(cache.find(routed_now)->state == LifecycleState::Ready);
+  CHECK(cache.find(older_hot)->state == LifecycleState::Absent);
+
+  // If every cached victim is routed in the current round, admission is
+  // refused rather than recycling a row the batch is about to execute.
+  load_ready(cache, newcomer, 8);
+  CHECK(cache.begin_router_round() == 2);
+  cache.record_router_demand(routed_now, 1, 9);
+  cache.record_router_demand(newcomer, 1, 10);
+  CHECK(!cache.admit(other_newcomer, 10));
+  CHECK(cache.find(routed_now)->state == LifecycleState::Ready);
+  CHECK(cache.find(newcomer)->state == LifecycleState::Ready);
+
+  // A later round releases the transient guard; ordinary LFU can then evict
+  // a row that was protected in the previous round.
+  CHECK(cache.begin_router_round() == 3);
+  cache.record_router_demand(newcomer, 1, 11);
+  CHECK(cache.admit(other_newcomer, 12));
+  CHECK(cache.find(routed_now)->state == LifecycleState::Absent);
+  CHECK(cache.find(newcomer)->state == LifecycleState::Ready);
+}
+
+void test_layout_pools_are_static_and_isolated() {
+  std::cout << "[M4] multi-format Pools keep static capacity and victims"
+            << std::endl;
+  GecConfig config = test_config();
+  config.expert_gpu_slots = 2;
+  config.probation_uses = 1;
+  GlobalExpertCache cache(config, tp2());
+  cache.register_pool(1, 1);
+  cache.register_pool(2, 1);
+
+  LogicalExpertId a{1, 0}, b{1, 1}, c{1, 2}, d{1, 3};
+  cache.assign_layout(a, 1);
+  cache.assign_layout(c, 1);
+  cache.assign_layout(b, 2);
+  cache.assign_layout(d, 2);
+  CHECK(cache.admit(a, 1));
+  load_ready(cache, a, 2);
+  CHECK(cache.admit(b, 3));
+  load_ready(cache, b, 4);
+  CHECK(cache.admit(c, 5));
+  // The incoming layout-1 expert may recycle only the layout-1 victim.
+  CHECK(cache.find(a)->state == LifecycleState::Absent);
+  CHECK(cache.find(b)->state == LifecycleState::Ready);
+  load_ready(cache, c, 6);
+  CHECK(cache.admit(d, 7));
+  // Likewise, layout 2 never recycles the layout-1 resident.
+  CHECK(cache.find(b)->state == LifecycleState::Absent);
+  CHECK(cache.find(c)->state == LifecycleState::Ready);
+  CHECK(cache.pool_capacity(1) == 1);
+  CHECK(cache.pool_capacity(2) == 1);
+  CHECK(cache.pool_resident_size(1) == 1);
+  CHECK(cache.pool_resident_size(2) == 1);
+  CHECK(cache.slot_resident_size() == 2);
+  CHECK(cache.snapshot(c)->layout_id == 1);
+  CHECK(cache.snapshot(d)->layout_id == 2);
+
+  // A registered zero-capacity Pool cannot borrow a free global Slot.
+  cache.register_pool(3, 0);
+  LogicalExpertId blocked{1, 4};
+  cache.assign_layout(blocked, 3);
+  CHECK(!cache.admit(blocked, 8));
+  CHECK(cache.pool_resident_size(3) == 0);
+
+  // Pool capacity is static across the model-global K budget, and a resident
+  // expert cannot be silently moved to an incompatible physical layout.
+  CHECK(throws([&] { cache.register_pool(4, 1); }));
+  CHECK(throws([&] { cache.assign_layout(LogicalExpertId{1, 9}, 99); }));
+  CHECK(throws([&] { cache.assign_layout(c, 2); }));
 }
 
 void test_global_cross_layer_cache() {
@@ -548,7 +739,7 @@ void test_prefill_then_parallel_paths() {
   std::cout << "[M2] prefill + three parallel paths in one round" << std::endl;
   GecConfig config = test_config();
   config.expert_gpu_slots = 2;
-  config.layer_h2d_slots = 1;
+  config.h2d_round_budget = 1;
   RollingPipeline pipeline(config, tp2());
   LogicalExpertId a{0, 0}, b{0, 1}, c{1, 0}, d{1, 1};
 
@@ -658,7 +849,7 @@ void test_pipeline_requires_cache_admission() {
   std::cout << "[M2] H2D requires persistent cache admission" << std::endl;
   GecConfig config = test_config();
   config.expert_gpu_slots = 0;
-  config.layer_h2d_slots = 1;
+  config.h2d_round_budget = 1;
   RollingPipeline pipeline(config, tp2());
   LogicalExpertId a{0, 5};
   RoundResult round = pipeline.run_round({a});
@@ -686,7 +877,7 @@ void test_pipeline_no_duplicate_h2d() {
 void test_pipeline_budget() {
   std::cout << "[M2] H2D admission budget" << std::endl;
   GecConfig config = test_config();
-  config.layer_h2d_slots = 2;
+  config.h2d_round_budget = 2;
   RollingPipeline pipeline(config, tp2());
   LogicalExpertId a{0, 7}, b{0, 8}, c{0, 9}, d{0, 10}, e{0, 11};
 
@@ -710,7 +901,7 @@ void test_pipeline_budget() {
 void test_pipeline_admits_round_in_one_pass() {
   std::cout << "[M2] one pass admits the whole round budget" << std::endl;
   GecConfig config = test_config();
-  config.layer_h2d_slots = 4;  // round budget: 4 experts
+  config.h2d_round_budget = 4;  // round budget: 4 experts
   Topology topology{1, 1, 1};
   RollingPipeline pipeline(config, topology);
   LogicalExpertId a{0, 20}, b{0, 21}, c{0, 22}, d{0, 23};
@@ -741,7 +932,7 @@ void test_pipeline_buffer_recycling() {
 void test_telemetry_decomposition() {
   std::cout << "[M3] six-way wait decomposition" << std::endl;
   GecConfig config = test_config();
-  config.layer_h2d_slots = 8;
+  config.h2d_round_budget = 8;
   RollingPipeline pipeline(config, tp2());
   const uint64_t base = 1000000;
   PipelineHooks hooks;
@@ -817,7 +1008,7 @@ void test_telemetry_decomposition() {
 void run_diagnostics_demo() {
   std::cout << "[M5] first-round diagnostics demo (150-180 ms decomposition)" << std::endl;
   GecConfig config = test_config();
-  config.layer_h2d_slots = 8;
+  config.h2d_round_budget = 8;
   Topology topology{1, 1, 1};
   RollingPipeline pipeline(config, topology);
   const uint64_t base = 1000000;
@@ -848,7 +1039,7 @@ void run_diagnostics_demo() {
 void test_async_prefetch_round() {
   std::cout << "[M6] look-ahead round is asynchronous" << std::endl;
   GecConfig config = test_config();
-  config.layer_h2d_slots = 8;
+  config.h2d_round_budget = 8;
   RollingPipeline pipeline(config, tp2());
   const uint64_t base = 1000000;
   PipelineHooks hooks;
@@ -888,7 +1079,7 @@ void test_async_prefetch_round() {
 void test_staging_ready_at_boundary() {
   std::cout << "[M6] look-ahead copy lands before its layer" << std::endl;
   GecConfig config = test_config();
-  config.layer_h2d_slots = 8;
+  config.h2d_round_budget = 8;
   RollingPipeline pipeline(config, tp2());
   const uint64_t base = 1000000;
   PipelineHooks hooks;
@@ -921,7 +1112,7 @@ void test_staging_ready_at_boundary() {
 void test_frustum_rollback() {
   std::cout << "[M6] frustum rollback of an unused staged row" << std::endl;
   GecConfig config = test_config();
-  config.layer_h2d_slots = 8;
+  config.h2d_round_budget = 8;
   RollingPipeline pipeline(config, tp2());
   const uint64_t base = 1000000;
   PipelineHooks hooks;
@@ -960,7 +1151,7 @@ void test_frustum_rollback() {
 void test_staging_lease_expiry() {
   std::cout << "[M6] staging lease expiry rolls a landed row back" << std::endl;
   GecConfig config = test_config();
-  config.layer_h2d_slots = 8;
+  config.h2d_round_budget = 8;
   config.staging_lease_us = 1500;
   RollingPipeline pipeline(config, tp2());
   const uint64_t base = 1000000;
@@ -1003,7 +1194,7 @@ void test_staging_lease_expiry() {
 void test_ring_generations() {
   std::cout << "[M6] ring generation hand-off and backpressure" << std::endl;
   GecConfig config = test_config();
-  config.layer_h2d_slots = 8;
+  config.h2d_round_budget = 8;
   config.h2d_buffer_pool_depth = 2;
   RollingPipeline pipeline(config, tp2());
   LogicalExpertId a{0, 1}, b{0, 2};
@@ -1039,7 +1230,14 @@ int main() {
   test_inflight_registry();
   test_scheduler();
   test_buffer_lifecycle();
-  test_cache_eviction_lru();
+  test_cache_eviction_lfu();
+  test_lfu_prefers_frequency_over_recency();
+  test_cpu_fallback_heat_survives_admission();
+  test_lookup_prefetch_do_not_inflate_lfu();
+  test_pinned_and_lfu_aging();
+  test_pinned_row_survives_staging_expiry();
+  test_current_router_round_protects_hits();
+  test_layout_pools_are_static_and_isolated();
   test_global_cross_layer_cache();
   test_cache_snapshot_and_resident_ids();
   test_cache_probation_protection();

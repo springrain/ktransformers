@@ -61,10 +61,11 @@ inline void bind_gec(pybind11::module_& m) {
       .def(py::init<>())
       .def_readwrite("num_gpu_layers", &GecConfig::num_gpu_layers)
       .def_readwrite("expert_gpu_slots", &GecConfig::expert_gpu_slots)
-      .def_readwrite("layer_h2d_slots", &GecConfig::layer_h2d_slots)
+      .def_readwrite("h2d_round_budget", &GecConfig::h2d_round_budget)
       .def_readwrite("h2d_buffer_pool_depth", &GecConfig::h2d_buffer_pool_depth)
       .def_readwrite("priority_alpha", &GecConfig::priority_alpha)
       .def_readwrite("probation_uses", &GecConfig::probation_uses)
+      .def_readwrite("lfu_aging_interval", &GecConfig::lfu_aging_interval)
       .def_readwrite("staging_prefetch_layers",
                      &GecConfig::staging_prefetch_layers)
       .def_readwrite("staging_lease_us", &GecConfig::staging_lease_us)
@@ -108,6 +109,10 @@ inline void bind_gec(pybind11::module_& m) {
       .def_readonly("admissions", &GlobalExpertCache::Stats::admissions)
       .def_readonly("evictions", &GlobalExpertCache::Stats::evictions)
       .def_readonly("reh2d", &GlobalExpertCache::Stats::reh2d)
+      .def_readonly("lfu_events", &GlobalExpertCache::Stats::lfu_events)
+      .def_readonly("lfu_aging_sweeps",
+                    &GlobalExpertCache::Stats::lfu_aging_sweeps)
+      .def_readonly("router_rounds", &GlobalExpertCache::Stats::router_rounds)
       .def("hit_rate", &GlobalExpertCache::Stats::hit_rate);
 
   py::class_<GlobalExpertCache::ExpertSnapshot>(gec, "ExpertSnapshot")
@@ -115,14 +120,22 @@ inline void bind_gec(pybind11::module_& m) {
       .def_readonly("state", &GlobalExpertCache::ExpertSnapshot::state)
       .def_readonly("refcount", &GlobalExpertCache::ExpertSnapshot::refcount)
       .def_readonly("hit_count", &GlobalExpertCache::ExpertSnapshot::hit_count)
-      .def_readonly("use_count", &GlobalExpertCache::ExpertSnapshot::use_count)
+      .def_readonly("lfu_count", &GlobalExpertCache::ExpertSnapshot::lfu_count)
+      .def_property_readonly(
+          "use_count",
+          [](const GlobalExpertCache::ExpertSnapshot& snapshot) {
+            return snapshot.lfu_count;
+          })
       .def_readonly("last_used", &GlobalExpertCache::ExpertSnapshot::last_used)
       .def_readonly("logical_ready_dependency",
                     &GlobalExpertCache::ExpertSnapshot::logical_ready_dependency)
       .def_readonly("in_flight", &GlobalExpertCache::ExpertSnapshot::in_flight)
       .def_readonly("protected_", &GlobalExpertCache::ExpertSnapshot::protected_)
+      .def_readonly("pinned", &GlobalExpertCache::ExpertSnapshot::pinned)
       .def_readonly("admission_state",
-                    &GlobalExpertCache::ExpertSnapshot::admission_state);
+                    &GlobalExpertCache::ExpertSnapshot::admission_state)
+      .def_readonly("layout_id",
+                    &GlobalExpertCache::ExpertSnapshot::layout_id);
 
   py::enum_<GlobalExpertCache::LookupResult>(gec, "LookupResult")
       .value("HIT", GlobalExpertCache::LookupResult::Hit)
@@ -155,12 +168,30 @@ inline void bind_gec(pybind11::module_& m) {
       .def("release", &GlobalExpertCache::release, py::arg("id"))
       .def("refcount", &GlobalExpertCache::refcount, py::arg("id"))
       .def("record_use", &GlobalExpertCache::record_use, py::arg("id"),
-           py::arg("now_us") = 0)
+           py::arg("now_us") = 0, py::arg("weight") = 1)
+      .def("record_router_demand", &GlobalExpertCache::record_router_demand,
+           py::arg("id"), py::arg("token_count"), py::arg("now_us") = 0)
+      .def("begin_router_round", &GlobalExpertCache::begin_router_round)
+      .def("router_epoch", &GlobalExpertCache::router_epoch)
+      .def("end_startup_protection",
+           &GlobalExpertCache::end_startup_protection, py::arg("id"))
+      .def("set_pinned", &GlobalExpertCache::set_pinned, py::arg("id"),
+           py::arg("pinned") = true)
+      .def("is_pinned", &GlobalExpertCache::is_pinned, py::arg("id"))
       .def("record_h2d", &GlobalExpertCache::record_h2d, py::arg("id"))
       .def("snapshot", &GlobalExpertCache::snapshot, py::arg("id"))
       .def("resident_ids", &GlobalExpertCache::resident_ids)
       .def("resident_size", &GlobalExpertCache::resident_size)
       .def("slot_resident_size", &GlobalExpertCache::slot_resident_size)
+      .def("register_pool", &GlobalExpertCache::register_pool,
+           py::arg("layout_id"), py::arg("capacity"))
+      .def("assign_layout", &GlobalExpertCache::assign_layout,
+           py::arg("id"), py::arg("layout_id"))
+      .def("layout_of", &GlobalExpertCache::layout_of, py::arg("id"))
+      .def("pool_capacity", &GlobalExpertCache::pool_capacity,
+           py::arg("layout_id"))
+      .def("pool_resident_size", &GlobalExpertCache::pool_resident_size,
+           py::arg("layout_id"))
       .def("stats", &GlobalExpertCache::stats,
            py::return_value_policy::reference_internal);
 

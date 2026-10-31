@@ -117,7 +117,7 @@ class RollingPipeline {
       : cache_(std::move(config), std::move(topology)),
         scheduler_(cache_.config()) {
     set_hooks(hooks);
-    budget_remaining_ = cache_.config().layer_h2d_slots;
+    budget_remaining_ = cache_.config().h2d_round_budget;
     ensure_pools_();
   }
 
@@ -170,7 +170,7 @@ class RollingPipeline {
   const InflightRegistry& inflight() const { return inflight_; }
 
   // Resets the per-layer / per-round H2D admission budget.
-  void reset_budget() { budget_remaining_ = cache_.config().layer_h2d_slots; }
+  void reset_budget() { budget_remaining_ = cache_.config().h2d_round_budget; }
   int budget_remaining() const { return budget_remaining_; }
 
   // Startup warm start: sequentially fills the persistent cache with ordered
@@ -352,7 +352,7 @@ class RollingPipeline {
       candidate.id = id;
       candidate.current_demand = weight;
       const LogicalExpert* known = cache_.find(id);
-      candidate.historical_hit_count = known ? known->hit_count : 0;
+      candidate.historical_hit_count = known ? known->use_count : 0;
       candidate.inflight = candidate_buffers_inflight(id);
       candidate.reuse_inflight = candidate.inflight;
       candidate.evicting = known && known->state == LifecycleState::Evicting;
@@ -854,7 +854,7 @@ class RollingPipeline {
     stage_index_.erase(id);
     owning_round_.erase(id);
     // The landing now has a consumer: the staging lease it was held under ends
-    // with this consumption, so the resident copy goes back to ordinary LRU.
+    // with this consumption, so the resident copy goes back to ordinary LFU.
     cache_.set_protected(id, false);
     // A row landed by the look-ahead is consumed here; one this round bound to
     // its own transfer is the ordinary H2D path.

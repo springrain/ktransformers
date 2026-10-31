@@ -143,7 +143,7 @@ See [KT-Kernel Parameters](https://github.com/kvcache-ai/ktransformers/tree/main
 | `--kt-num-gpu-experts` | Number of experts kept on GPU for decoding. |
 | `--kt-gpu-prefill-token-threshold` | Token threshold for layerwise prefill strategy. |
 | `--kt-enable-dynamic-expert-update` | Enable dynamic expert placement on GPU based on routing statistics. |
-| `--kt-expert-placement-strategy` | Expert placement strategy. Default: `uniform`. See [Expert Scheduling Tutorial](experts-sched-Tutorial.md) for other options. |
+| `--kt-expert-placement-strategy` | Expert placement strategy. Default: `front-loading`. See [Expert Scheduling Tutorial](experts-sched-Tutorial.md) for other options. |
 | `--chunked-prefill-size` | Maximum tokens per prefill batch. |
 | `--max-total-tokens` | Maximum total tokens in KV cache. |
 | `--tool-call-parser` | Tool call parser for function calling support (use `qwen3_coder`). |

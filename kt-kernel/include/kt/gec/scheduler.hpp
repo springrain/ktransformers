@@ -17,6 +17,9 @@ namespace kt::gec {
 struct SchedulerCandidate {
   LogicalExpertId id;
   uint64_t current_demand = 0;
+  // Historical global-LFU count. The field keeps its old name because it is
+  // part of the Python ABI, but it now carries effective Router demand, never
+  // cache lookup hits or prefetch events.
   uint64_t historical_hit_count = 0;
 
   // Candidate Filter inputs (doc section 12). Any true flag disqualifies the
@@ -38,8 +41,8 @@ struct SchedulerCandidate {
 
 struct SchedulerDecision {
   // Top-N H2D admissions for this round: bounded only by the remaining
-  // admission budget (kt-layer-h2d-slots), so the whole round selection takes
-  // the H2D path at once (doc sections 5.3 and 15).
+  // admission budget, so the whole round selection takes the H2D path at once
+  // (doc sections 5.3 and 15).
   std::vector<LogicalExpertId> h2d_selected;
   // Everything else: CPU fallback path.
   std::vector<LogicalExpertId> cpu_fallback;
@@ -51,7 +54,7 @@ class H2DScheduler {
     config_.validate();
   }
 
-  // Priority = current_demand + alpha * historical_hit_count. Current demand
+  // Priority = current_demand + alpha * historical LFU count. Current demand
   // dominates; history only orders misses against each other (doc section 13).
   static double priority(const SchedulerCandidate& candidate, double alpha) {
     return static_cast<double>(candidate.current_demand) +

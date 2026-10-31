@@ -99,9 +99,9 @@ The system provides four expert placement strategies:
 
 | Strategy | Description | Use Case |
 |----------|-------------|----------|
-| `uniform` | Distributes GPU experts evenly across all MoE layers | Default, no prior statistics needed |
+| `uniform` | Distributes GPU experts evenly across all MoE layers | Even baseline when no routing statistics are available |
 | `frequency` | Places most frequently activated experts on GPU | Best performance when activation statistics are available |
-| `front-loading` | Fills GPU experts from the first layer onwards | Testing or specific workload patterns |
+| `front-loading` | Fills complete MoE layers in order | Default; prioritizes complete early-GPU layers |
 | `random` | Randomly selects experts with fixed seed (42) | Baseline comparison |
 
 **Using Frequency Strategy (Recommended for best performance):**
@@ -132,7 +132,7 @@ python -m sglang.launch_server \
 |-----------|-------------|
 | `--kt-num-gpu-experts` | Number of GPU experts per MoE layer. Internally multiplied by the number of MoE layers to get the total GPU experts. Ignored if `--kt-gpu-experts-ratio` is set. |
 | `--kt-gpu-experts-ratio` | Ratio of total experts to place on GPU (0.0-1.0). If set, overrides `--kt-num-gpu-experts`. Example: 0.1 means 10% of all experts across all layers will be on GPU. |
-| `--kt-expert-placement-strategy` | Expert placement strategy: `frequency`, `uniform`, `front-loading`, or `random`. Default: `uniform`. |
+| `--kt-expert-placement-strategy` | Expert placement strategy: `frequency`, `uniform`, `front-loading`, or `random`. Default: `front-loading`. |
 | `--init-expert-location` | Path to activation statistics file (`.pt`) for `frequency` strategy. |
 | `--kt-enable-dynamic-expert-update` | Enable dynamic expert update during inference. |
 | `--kt-gpu-prefill-token-threshold` | Token threshold for triggering dynamic expert redistribution during prefill. |

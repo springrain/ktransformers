@@ -141,10 +141,17 @@ struct LogicalExpert {
   std::atomic<int> refcount{0};
   bool in_flight = false;
   bool protected_ = false;
+  // Pinned experts (for example fused shared experts) stay resident and are
+  // never selected by the ordinary global LFU eviction gate.
+  bool pinned = false;
   uint64_t last_used = 0;
   uint64_t logical_ready_dependency = 0;
   uint64_t hit_count = 0;
   uint64_t use_count = 0;
+  // Transient protection for the routing round that observed this expert.
+  // It is not part of the persistent LFU score and must not be confused with
+  // the staging lease in protected_.
+  uint64_t last_routed_epoch = 0;
   AdmissionState admission_state = AdmissionState::NotAdmitted;
 
   LogicalExpert() = default;
@@ -158,10 +165,12 @@ struct LogicalExpert {
         refcount(other.refcount.load()),
         in_flight(other.in_flight),
         protected_(other.protected_),
+        pinned(other.pinned),
         last_used(other.last_used),
         logical_ready_dependency(other.logical_ready_dependency),
         hit_count(other.hit_count),
         use_count(other.use_count),
+        last_routed_epoch(other.last_routed_epoch),
         admission_state(other.admission_state) {}
   LogicalExpert& operator=(LogicalExpert&& other) noexcept {
     if (this != &other) {
@@ -172,10 +181,12 @@ struct LogicalExpert {
                      std::memory_order_relaxed);
       in_flight = other.in_flight;
       protected_ = other.protected_;
+      pinned = other.pinned;
       last_used = other.last_used;
       logical_ready_dependency = other.logical_ready_dependency;
       hit_count = other.hit_count;
       use_count = other.use_count;
+      last_routed_epoch = other.last_routed_epoch;
       admission_state = other.admission_state;
     }
     return *this;
@@ -196,7 +207,8 @@ inline bool is_logical_ready(const LogicalExpert& expert) {
 // Eviction gate (doc section 18). Every condition must hold.
 inline bool can_evict(const LogicalExpert& expert) {
   return expert.state == LifecycleState::Ready &&
-         expert.refcount.load(std::memory_order_acquire) == 0 && !expert.in_flight && !expert.protected_;
+         expert.refcount.load(std::memory_order_acquire) == 0 && !expert.in_flight &&
+         !expert.protected_ && !expert.pinned;
 }
 
 inline std::string to_string(const LogicalExpertId& id) {

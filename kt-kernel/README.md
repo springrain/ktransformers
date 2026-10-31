@@ -573,9 +573,9 @@ python -m sglang.launch_server \
   - See [Expert Scheduling Tutorial](../doc/en/kt-kernel/experts-sched-Tutorial.md) for benchmarks and details.
 
 - **`kt-expert-placement-strategy`**: Determines which experts are placed on GPU at server startup.
-  - `uniform`: Distributes GPU experts evenly across all MoE layers. Default option, no prior statistics needed.
+  - `uniform`: Distributes GPU experts evenly across all MoE layers. Even baseline when no routing statistics are available.
   - `frequency`: Places the most frequently activated experts on GPU. Best performance when activation statistics are available; requires `--init-expert-location` pointing to a `.pt` statistics file.
-  - `front-loading`: Fills GPU experts from the first MoE layer onwards.
+  - `front-loading`: Fills complete MoE layers in order. Default option.
   - `random`: Randomly selects experts with a fixed seed (42).
   - See [Expert Scheduling Tutorial](../doc/en/kt-kernel/experts-sched-Tutorial.md) for strategy comparison.
 

@@ -95,8 +95,8 @@ class TestGecContract(unittest.TestCase):
 
     def test_h2d_requires_cache_admission(self):
         text = (GEC_DIR / 'pipeline.hpp').read_text(encoding='utf-8')
-        self.assertIn('cache_.admit(id, round_start)', text)
-        self.assertIn('if (!cache_.admit(id, round_start)) return H2DOutcome::Fallback;', text)
+        self.assertIn('if (!cache_.admit(id, start)) return H2DOutcome::Fallback;', text)
+        self.assertIn('cache_.admit(id, cached_now_.value_or(prepared_now_));', text)
         self.assertIn('FromCache', text)
         self.assertNotIn('admit_on_h2d', text)
 
@@ -108,6 +108,35 @@ class TestGecContract(unittest.TestCase):
         self.assertIn('num_gpu_layers onwards', cache)
         pipeline = (GEC_DIR / 'pipeline.hpp').read_text(encoding='utf-8')
         self.assertIn('prefill_sequential', pipeline)
+
+    def test_lfu_pool_and_binding_contract(self):
+        cache = (GEC_DIR / 'expert_cache.hpp').read_text(encoding='utf-8')
+        for marker in (
+            'record_router_demand',
+            'begin_router_round',
+            'lfu_aging_sweeps',
+            'set_pinned',
+            'expert.pinned = it->second.pinned',
+            'register_pool',
+            'assign_layout',
+            'layout_of_locked_(expert.id) != layout_id',
+            'pool_capacity_locked_',
+            'pool_resident_size_locked_',
+        ):
+            self.assertIn(marker, cache)
+        bindings = (KT_KERNEL / 'gec_bindings.hpp').read_text(encoding='utf-8')
+        for binding in (
+            'record_router_demand',
+            'begin_router_round',
+            'set_pinned',
+            'is_pinned',
+            'layout_id',
+            'register_pool',
+            'assign_layout',
+            'pool_capacity',
+            'pool_resident_size',
+        ):
+            self.assertIn(binding, bindings)
 
     def test_cpp_suite_passes(self):
         result = subprocess.run([sys.executable, str(RUNNER)],

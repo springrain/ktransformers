@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <unordered_map>
@@ -33,6 +34,9 @@ class GlobalExpertCache {
     uint64_t evictions = 0;
     uint64_t reh2d = 0;  // transfers of experts previously seen (evicted before)
     uint64_t reuses = 0;  // consumers bound to an H2D dependency already in flight
+    uint64_t lfu_events = 0;  // effective router-token events seen by the cache
+    uint64_t lfu_aging_sweeps = 0;
+    uint64_t router_rounds = 0;
 
     double hit_rate() const {
       uint64_t total = hits + misses;
@@ -85,8 +89,16 @@ class GlobalExpertCache {
       return true;  // already admitted
     }
     const bool permanent = id.layer_id < config_.num_gpu_layers;
-    if (!permanent && slot_resident_size_() >= static_cast<size_t>(config_.expert_gpu_slots)) {
-      if (!evict_one_locked_()) return false;
+    const int layout_id = layout_of_locked_(id);
+    if (!permanent) {
+      const bool global_full =
+          slot_resident_size_() >= static_cast<size_t>(config_.expert_gpu_slots);
+      const bool pool_full =
+          pool_resident_size_locked_(layout_id) >=
+          static_cast<size_t>(pool_capacity_locked_(layout_id));
+      if ((global_full || pool_full) && !evict_one_locked_(layout_id)) {
+        return false;
+      }
     }
     int slot = -1;
     if (!permanent) {
@@ -110,9 +122,19 @@ class GlobalExpertCache {
     expert.state = LifecycleState::Scheduled;
     expert.shards = std::move(placement);
     expert.last_used = now_us;
+    // Re-admission must not reset the global LFU history. The row may have
+    // spent time as an absent CPU-fallback expert, and that demand is exactly
+    // what decides whether this admission should survive the next eviction.
+    if (it != experts_.end()) {
+      expert.hit_count = it->second.hit_count;
+      expert.use_count = it->second.use_count;
+      expert.last_routed_epoch = it->second.last_routed_epoch;
+      expert.pinned = it->second.pinned;
+    }
     if (permanent) {
       expert.admission_state = AdmissionState::Cached;
       expert.protected_ = true;  // never evicted
+      expert.pinned = true;
     } else {
       expert.admission_state = AdmissionState::Probation;
       expert.protected_ = true;  // probation protection (doc section 19)
@@ -225,7 +247,7 @@ class GlobalExpertCache {
   }
 
   // Promotes a slot-filling probation resident to the normal cached state so
-  // that LRU eviction may reclaim it. Startup prefill fills `expert_gpu_slots`
+  // that LFU eviction may reclaim it. Startup prefill fills `expert_gpu_slots`
   // on probation (doc section 19); without this the first layer routed after
   // prefill can never admit a miss, although the newly routed rows are exactly
   // the ones the prefill was filling slots for. Returns false when the expert
@@ -342,7 +364,10 @@ class GlobalExpertCache {
   bool evict(const LogicalExpertId& id) {
     GecLockGuard lock(mutex_);
     auto it = experts_.find(id);
-    if (it == experts_.end() || !can_evict(it->second)) return false;
+    if (it == experts_.end() || !can_evict(it->second) ||
+        round_protected_locked_(it->second)) {
+      return false;
+    }
     it->second.state = LifecycleState::Evicting;
     it->second.admission_state = AdmissionState::NotAdmitted;
     recycle_slot_locked_(it->second);
@@ -473,18 +498,54 @@ class GlobalExpertCache {
     return require_(id).refcount.load(std::memory_order_acquire);
   }
 
-  // Records a real use of the expert (GEMM). Promotes probation to cached
-  // after config().probation_uses uses.
-  void record_use(const LogicalExpertId& id, uint64_t now_us = 0) {
+  // Records a real use of the expert (GEMM) with an optional event weight.
+  // Promotes probation to cached after config().probation_uses uses.
+  void record_use(const LogicalExpertId& id, uint64_t now_us = 0,
+                  uint64_t weight = 1) {
     GecLockGuard lock(mutex_);
     LogicalExpert& expert = require_(id);
-    ++expert.use_count;
-    expert.last_used = now_us;
-    if (expert.admission_state == AdmissionState::Probation &&
-        expert.use_count >= static_cast<uint64_t>(config_.probation_uses)) {
-      expert.admission_state = AdmissionState::Cached;
-      if (id.layer_id >= config_.num_gpu_layers) expert.protected_ = false;
+    record_lfu_locked_(expert, weight, now_us);
+  }
+
+  // Records effective Router demand for a logical expert. This is the hotness
+  // signal of the global LFU policy: prefetch, H2D completion, lookup hits and
+  // staging leases must not call it. Unlike record_use(), this also creates an
+  // absent entry, so an expert served from CPU fallback keeps accumulating
+  // frequency and does not lose its history when it is later admitted.
+  void record_router_demand(const LogicalExpertId& id, uint64_t token_count,
+                            uint64_t now_us = 0) {
+    if (token_count == 0) return;
+    GecLockGuard lock(mutex_);
+    auto it = experts_.find(id);
+    if (it == experts_.end()) {
+      it = experts_.emplace(id, LogicalExpert(id)).first;
     }
+    it->second.last_routed_epoch = router_epoch_;
+    record_lfu_locked_(it->second, token_count, now_us);
+  }
+
+  // Opens a new routing round. Every record_router_demand() after this call is
+  // visibly needed by the batch being planned, so admission must not recycle
+  // that row to make room for a miss from the same round. The next round
+  // advances the epoch and naturally releases the transient protection.
+  //
+  // This is intentionally separate from protected_: that field carries a
+  // staging/consumer lease and is cleared by a different lifecycle.
+  uint64_t begin_router_round() {
+    GecLockGuard lock(mutex_);
+    ++router_epoch_;
+    if (router_epoch_ == 0) {
+      // uint64 wrap: old epochs are no longer meaningful, so restart them.
+      for (auto& entry : experts_) entry.second.last_routed_epoch = 0;
+      router_epoch_ = 1;
+    }
+    ++stats_.router_rounds;
+    return router_epoch_;
+  }
+
+  uint64_t router_epoch() const {
+    GecLockGuard lock(mutex_);
+    return router_epoch_;
   }
 
   // Stage expiry (FreeToken frustum rollback). A row staged for a later layer
@@ -504,6 +565,7 @@ class GlobalExpertCache {
     std::vector<LogicalExpertId> expired;
     for (auto& entry : experts_) {
       LogicalExpert& expert = entry.second;
+      if (expert.pinned) continue;
       if (!expert.protected_) continue;
       if (expert.state != LifecycleState::Scheduled &&
           expert.state != LifecycleState::Loading &&
@@ -547,12 +609,14 @@ class GlobalExpertCache {
     LifecycleState state = LifecycleState::Absent;
     int refcount = 0;
     uint64_t hit_count = 0;
-    uint64_t use_count = 0;
+    uint64_t lfu_count = 0;
     uint64_t last_used = 0;
     uint64_t logical_ready_dependency = 0;
     bool in_flight = false;
     bool protected_ = false;
+    bool pinned = false;
     AdmissionState admission_state = AdmissionState::NotAdmitted;
+    int layout_id = 0;
   };
 
   std::optional<ExpertSnapshot> snapshot(const LogicalExpertId& id) const {
@@ -560,6 +624,7 @@ class GlobalExpertCache {
     auto it = experts_.find(id);
     if (it == experts_.end()) return std::nullopt;
     const LogicalExpert& expert = it->second;
+    const int layout_id = layout_of_locked_(id);
     return ExpertSnapshot{expert.id,
                           expert.state,
                           expert.refcount.load(std::memory_order_acquire),
@@ -569,7 +634,9 @@ class GlobalExpertCache {
                           expert.logical_ready_dependency,
                           expert.in_flight,
                           expert.protected_,
-                          expert.admission_state};
+                          expert.pinned,
+                          expert.admission_state,
+                          layout_id};
   }
 
   // All resident logical expert ids, sorted (layer_id, expert_id). A resident
@@ -605,6 +672,23 @@ class GlobalExpertCache {
     it->second.protected_ = protected_;
   }
 
+  // Pins a resident expert outside the global LFU eviction policy. Fused
+  // shared experts use this; staging's temporary protected_ lease is separate
+  // and may be cleared without unpinning.
+  bool set_pinned(const LogicalExpertId& id, bool pinned) {
+    GecLockGuard lock(mutex_);
+    auto it = experts_.find(id);
+    if (it == experts_.end() || !is_resident_(it->second)) return false;
+    it->second.pinned = pinned;
+    return true;
+  }
+
+  bool is_pinned(const LogicalExpertId& id) const {
+    GecLockGuard lock(mutex_);
+    auto it = experts_.find(id);
+    return it != experts_.end() && it->second.pinned;
+  }
+
   // Starts or refreshes the staging lease of a row (origin of the lease).
   void touch(const LogicalExpertId& id, uint64_t now_us) {
     GecLockGuard lock(mutex_);
@@ -628,7 +712,99 @@ class GlobalExpertCache {
     return slot_resident_size_();
   }
 
+  // Register the logical-expert capacity of one physical-layout Pool. Pools
+  // are static: their capacities must fit the global K budget and cannot
+  // borrow rows from each other. Unknown layouts fail closed once a registry
+  // exists, so a format mismatch can never fall back to a shared Slot.
+  void register_pool(int layout_id, int capacity) {
+    if (layout_id < 0) {
+      throw std::invalid_argument("layout_id must be >= 0");
+    }
+    if (capacity < 0) {
+      throw std::invalid_argument("pool capacity must be >= 0");
+    }
+    GecLockGuard lock(mutex_);
+    size_t total = static_cast<size_t>(capacity);
+    for (const auto& entry : pool_capacities_) {
+      if (entry.first != layout_id) {
+        total += static_cast<size_t>(entry.second);
+      }
+    }
+    if (total > static_cast<size_t>(config_.expert_gpu_slots)) {
+      throw std::invalid_argument(
+          "sum of pool capacities exceeds expert_gpu_slots");
+    }
+    if (pool_resident_size_locked_(layout_id) >
+        static_cast<size_t>(capacity)) {
+      throw std::invalid_argument(
+          "pool capacity is below its current resident count");
+    }
+    pool_capacities_[layout_id] = capacity;
+  }
+
+  // Bind one logical expert to a compatible physical layout. Resident experts
+  // may not be silently moved between physical formats.
+  void assign_layout(const LogicalExpertId& id, int layout_id) {
+    if (layout_id < 0) {
+      throw std::invalid_argument("layout_id must be >= 0");
+    }
+    GecLockGuard lock(mutex_);
+    if (!pool_capacities_.empty() &&
+        pool_capacities_.find(layout_id) == pool_capacities_.end()) {
+      throw std::invalid_argument("layout_id is not registered");
+    }
+    auto expert = experts_.find(id);
+    if (expert != experts_.end() && is_resident_(expert->second)) {
+      throw std::invalid_argument("cannot move a resident expert to another Pool");
+    }
+    expert_layouts_[id] = layout_id;
+  }
+
+  int layout_of(const LogicalExpertId& id) const {
+    GecLockGuard lock(mutex_);
+    return layout_of_locked_(id);
+  }
+
+  int pool_capacity(int layout_id) const {
+    GecLockGuard lock(mutex_);
+    return pool_capacity_locked_(layout_id);
+  }
+
+  size_t pool_resident_size(int layout_id) const {
+    GecLockGuard lock(mutex_);
+    return pool_resident_size_locked_(layout_id);
+  }
+
  private:
+  static uint64_t saturating_add_(uint64_t value, uint64_t delta) {
+    const uint64_t limit = std::numeric_limits<uint64_t>::max();
+    return delta > limit - value ? limit : value + delta;
+  }
+
+  // Shared LFU update for real uses and router demand. Aging is driven only by
+  // these effective events, never by wall-clock time or prefetch activity.
+  void record_lfu_locked_(LogicalExpert& expert, uint64_t weight,
+                          uint64_t now_us) {
+    if (weight == 0) return;
+    expert.use_count = saturating_add_(expert.use_count, weight);
+    expert.last_used = now_us;
+    stats_.lfu_events = saturating_add_(stats_.lfu_events, weight);
+    lfu_events_since_aging_ = saturating_add_(lfu_events_since_aging_, weight);
+    if (expert.admission_state == AdmissionState::Probation &&
+        expert.use_count >= static_cast<uint64_t>(config_.probation_uses)) {
+      expert.admission_state = AdmissionState::Cached;
+      if (expert.id.layer_id >= config_.num_gpu_layers) {
+        expert.protected_ = false;
+      }
+    }
+    if (config_.lfu_aging_interval > 0 &&
+        lfu_events_since_aging_ >= config_.lfu_aging_interval) {
+      for (auto& entry : experts_) entry.second.use_count /= 2;
+      lfu_events_since_aging_ = 0;
+      ++stats_.lfu_aging_sweeps;
+    }
+  }
+
   LogicalExpert& require_(const LogicalExpertId& id) const {
     auto it = experts_.find(id);
     if (it == experts_.end()) {
@@ -666,15 +842,22 @@ class GlobalExpertCache {
     return count;
   }
 
-  // LRU eviction among eligible experts. Whole-expert (all TP shards) only.
-  bool evict_one_locked_() {
+  // Global LFU eviction among eligible experts. Frequency is compared first;
+  // last use is only a deterministic tie-break for equal-frequency experts.
+  // Whole-expert (all TP shards) only.
+  bool evict_one_locked_(int layout_id) {
     auto victim = experts_.end();
     for (auto it = experts_.begin(); it != experts_.end(); ++it) {
       const LogicalExpert& expert = it->second;
+      if (layout_of_locked_(expert.id) != layout_id) continue;
       if (!is_resident_(expert) || !can_evict(expert)) continue;
+      if (round_protected_locked_(expert)) continue;
       if (expert.admission_state == AdmissionState::Probation) continue;  // protected
-      bool better = victim == experts_.end() || expert.last_used < victim->second.last_used ||
-                    (expert.last_used == victim->second.last_used && expert.id < victim->second.id);
+      const LogicalExpert* current = victim == experts_.end() ? nullptr : &victim->second;
+      bool better = current == nullptr || expert.use_count < current->use_count ||
+                    (expert.use_count == current->use_count &&
+                     (expert.last_used < current->last_used ||
+                      (expert.last_used == current->last_used && expert.id < current->id)));
       if (better) {
         victim = it;
       }
@@ -693,12 +876,46 @@ class GlobalExpertCache {
     return true;
   }
 
+  bool round_protected_locked_(const LogicalExpert& expert) const {
+    return router_epoch_ != 0 && expert.last_routed_epoch == router_epoch_;
+  }
+
+  int layout_of_locked_(const LogicalExpertId& id) const {
+    auto it = expert_layouts_.find(id);
+    return it == expert_layouts_.end() ? 0 : it->second;
+  }
+
+  int pool_capacity_locked_(int layout_id) const {
+    auto it = pool_capacities_.find(layout_id);
+    if (it != pool_capacities_.end()) return it->second;
+    // Legacy/single-Pool caches have no registry: layout 0 owns all of K.
+    // Once a registry exists every Pool must be explicit; unknown layouts
+    // receive zero capacity instead of borrowing another format's rows.
+    return pool_capacities_.empty() ? config_.expert_gpu_slots : 0;
+  }
+
+  size_t pool_resident_size_locked_(int layout_id) const {
+    size_t count = 0;
+    for (const auto& entry : experts_) {
+      if (is_resident_(entry.second) &&
+          entry.first.layer_id >= config_.num_gpu_layers &&
+          layout_of_locked_(entry.first) == layout_id) {
+        ++count;
+      }
+    }
+    return count;
+  }
+
   GecConfig config_;
   PlacementPlanner planner_;
   Stats stats_;
   int next_slot_ = 0;
   std::vector<int> reusable_slots_;
   std::unordered_set<LogicalExpertId, LogicalExpertIdHash> ever_h2d_;
+  std::unordered_map<int, int> pool_capacities_;
+  std::unordered_map<LogicalExpertId, int, LogicalExpertIdHash> expert_layouts_;
+  uint64_t lfu_events_since_aging_ = 0;
+  uint64_t router_epoch_ = 0;
   mutable GecMutex mutex_;
   mutable std::unordered_map<LogicalExpertId, LogicalExpert, LogicalExpertIdHash> experts_;
 };

@@ -3,6 +3,7 @@
 // All capacity parameters count Logical Experts, never Physical Shards.
 #pragma once
 
+#include <cstdint>
 #include <stdexcept>
 
 namespace kt::gec {
@@ -14,8 +15,8 @@ struct GecConfig {
   // Global persistent cache capacity, in Logical Experts.
   int expert_gpu_slots = 0;
 
-  // Per-layer / per-round H2D admission budget, in Logical Experts.
-  int layer_h2d_slots = 0;
+  // Per-round H2D admission budget, in Logical Experts.
+  int h2d_round_budget = 0;
 
   // Number of H2D buffers per GPU (the staging ring depth). Temporary
   // resource, independent of the persistent cache. Depth 2 = two generations,
@@ -47,11 +48,17 @@ struct GecConfig {
   // never surface as a cache hit one layer too late.
   static constexpr int kLandedLeaseWindows = 2;
 
-  // Priority = current_demand + alpha * historical_hit_count.
+  // Priority = current_demand + alpha * historical LFU demand count.
   double priority_alpha = 1.0;
 
   // Uses before a probationary expert becomes a normal cached expert.
   int probation_uses = 1;
+
+  // Effective router-token events between two global LFU aging sweeps. An
+  // aging sweep halves every logical expert's LFU count, so a formerly hot
+  // expert eventually yields its row without relying on wall-clock time or on
+  // prefetch/H2D traffic. 0 disables aging.
+  uint64_t lfu_aging_interval = 1u << 20;
 
   void validate() const {
     if (num_gpu_layers < 0) {
@@ -60,8 +67,8 @@ struct GecConfig {
     if (expert_gpu_slots < 0) {
       throw std::invalid_argument("kt-expert-gpu-slots must be >= 0");
     }
-    if (layer_h2d_slots < 0) {
-      throw std::invalid_argument("kt-layer-h2d-slots must be >= 0");
+    if (h2d_round_budget < 0) {
+      throw std::invalid_argument("h2d_round_budget must be >= 0");
     }
     if (h2d_buffer_pool_depth < 1) {
       throw std::invalid_argument("h2d-buffer-pool-depth must be >= 1");
